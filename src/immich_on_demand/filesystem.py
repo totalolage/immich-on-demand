@@ -237,8 +237,8 @@ class ImmichFilesystem(pyfuse3.Operations):
                     try:
                         os.ftruncate(staged.descriptor, 0)
                     except OSError as error:
-                        raise pyfuse3.FUSEError(error.errno or errno.EIO) from error
-                    staged.failure_errno = None
+                        staged.failure_errno = error.errno or errno.EIO
+                        raise pyfuse3.FUSEError(staged.failure_errno) from error
                 handle = self._handle()
                 staged.open_handles += 1
                 self._staged_handles[handle] = _StagedHandle(
@@ -479,17 +479,19 @@ class ImmichFilesystem(pyfuse3.Operations):
             self._remote(inode)
             raise pyfuse3.FUSEError(errno.EROFS)
         if fields.update_uid and attr.st_uid != os.getuid():
+            staged.failure_errno = errno.EPERM
             raise pyfuse3.FUSEError(errno.EPERM)
         if fields.update_gid and attr.st_gid != os.getgid():
+            staged.failure_errno = errno.EPERM
             raise pyfuse3.FUSEError(errno.EPERM)
         if fields.update_size and staged_handle is not None and not staged_handle.writable:
+            staged.failure_errno = errno.EBADF
             raise pyfuse3.FUSEError(errno.EBADF)
 
         async with staged.lock:
             try:
                 if fields.update_size:
                     os.ftruncate(staged.descriptor, attr.st_size)
-                    staged.failure_errno = None
                 if fields.update_atime or fields.update_mtime:
                     current = os.fstat(staged.descriptor)
                     os.utime(
@@ -502,7 +504,8 @@ class ImmichFilesystem(pyfuse3.Operations):
                 if fields.update_mode:
                     os.fchmod(staged.descriptor, 0o600)
             except OSError as error:
-                raise pyfuse3.FUSEError(error.errno or errno.EIO) from error
+                staged.failure_errno = error.errno or errno.EIO
+                raise pyfuse3.FUSEError(staged.failure_errno) from error
             return self._attributes(staged.inode)
 
     async def rename(self, *args: object) -> None:

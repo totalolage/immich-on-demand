@@ -285,8 +285,9 @@ class FilesystemTest(unittest.TestCase):
 
     def test_staged_setattr_is_private_and_remote_setattr_is_read_only(self) -> None:
         async def scenario(root: Path) -> None:
+            library = FakeLibrary()
             filesystem = ImmichFilesystem(
-                FakeLibrary(), root / "recovery"  # type: ignore[arg-type]
+                library, root / "recovery"  # type: ignore[arg-type]
             )
             info, attributes = await filesystem.create(
                 pyfuse3.ROOT_INODE,
@@ -348,8 +349,11 @@ class FilesystemTest(unittest.TestCase):
                 )
             self.assertEqual(remote.exception.errno, errno.EROFS)
 
-            with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
-                await filesystem.release(info.fh)
+            with self.assertLogs("immich_on_demand.filesystem", level="ERROR"):
+                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                    await filesystem.release(info.fh)
+            self.assertEqual(library.uploads, [])
+            self.assertTrue(staged.exists())
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -530,6 +534,162 @@ class FilesystemTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
+
+    def test_failed_open_truncate_prevents_upload(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            recovery = root / "recovery"
+            filesystem = ImmichFilesystem(library, recovery)  # type: ignore[arg-type]
+            info, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"truncate.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(info.fh, 0, b"complete")
+
+            with patch(
+                "immich_on_demand.filesystem.os.ftruncate",
+                side_effect=OSError(errno.ENOSPC, "no space"),
+            ):
+                with self.assertRaises(pyfuse3.FUSEError) as failed:
+                    await filesystem.open(
+                        attributes.st_ino,
+                        os.O_WRONLY | os.O_TRUNC,
+                        None,  # type: ignore[arg-type]
+                    )
+            self.assertEqual(failed.exception.errno, errno.ENOSPC)
+            with self.assertRaises(pyfuse3.FUSEError) as sticky:
+                await filesystem.flush(info.fh)
+            self.assertEqual(sticky.exception.errno, errno.ENOSPC)
+
+            with self.assertLogs("immich_on_demand.filesystem", level="ERROR"):
+                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                    await filesystem.release(info.fh)
+
+            self.assertEqual(library.uploads, [])
+            self.assertEqual(next(recovery.rglob("truncate.jpg")).read_bytes(), b"complete")
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_failed_setattr_prevents_upload(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            recovery = root / "recovery"
+            filesystem = ImmichFilesystem(library, recovery)  # type: ignore[arg-type]
+            info, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"metadata-failure.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(info.fh, 0, b"complete")
+            requested = pyfuse3.EntryAttributes()
+            requested.st_size = 0
+            fields = SimpleNamespace(
+                update_size=True,
+                update_mode=False,
+                update_uid=False,
+                update_gid=False,
+                update_atime=False,
+                update_mtime=False,
+                update_ctime=False,
+            )
+
+            with patch(
+                "immich_on_demand.filesystem.os.ftruncate",
+                side_effect=OSError(errno.ENOSPC, "no space"),
+            ):
+                with self.assertRaises(pyfuse3.FUSEError) as failed:
+                    await filesystem.setattr(
+                        attributes.st_ino,
+                        requested,
+                        fields,
+                        info.fh,
+                        None,  # type: ignore[arg-type]
+                    )
+            self.assertEqual(failed.exception.errno, errno.ENOSPC)
+            with self.assertRaises(pyfuse3.FUSEError) as sticky:
+                await filesystem.flush(info.fh)
+            self.assertEqual(sticky.exception.errno, errno.ENOSPC)
+
+            with self.assertLogs("immich_on_demand.filesystem", level="ERROR"):
+                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                    await filesystem.release(info.fh)
+
+            self.assertEqual(library.uploads, [])
+            self.assertEqual(
+                next(recovery.rglob("metadata-failure.jpg")).read_bytes(), b"complete"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_successful_truncate_does_not_clear_an_earlier_write_failure(self) -> None:
+        async def scenario(root: Path, via_setattr: bool) -> None:
+            library = FakeLibrary()
+            recovery = root / ("setattr" if via_setattr else "open")
+            filesystem = ImmichFilesystem(library, recovery)  # type: ignore[arg-type]
+            info, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"sticky.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(info.fh, 0, b"complete")
+            with patch(
+                "immich_on_demand.filesystem.os.pwrite",
+                side_effect=OSError(errno.ENOSPC, "no space"),
+            ):
+                with self.assertRaises(pyfuse3.FUSEError):
+                    await filesystem.write(info.fh, 8, b"missing")
+
+            if via_setattr:
+                requested = pyfuse3.EntryAttributes()
+                requested.st_size = 0
+                fields = SimpleNamespace(
+                    update_size=True,
+                    update_mode=False,
+                    update_uid=False,
+                    update_gid=False,
+                    update_atime=False,
+                    update_mtime=False,
+                    update_ctime=False,
+                )
+                await filesystem.setattr(
+                    attributes.st_ino,
+                    requested,
+                    fields,
+                    info.fh,
+                    None,  # type: ignore[arg-type]
+                )
+            else:
+                truncating = await filesystem.open(
+                    attributes.st_ino,
+                    os.O_WRONLY | os.O_TRUNC,
+                    None,  # type: ignore[arg-type]
+                )
+                await filesystem.release(truncating.fh)
+
+            with self.assertRaises(pyfuse3.FUSEError) as sticky:
+                await filesystem.flush(info.fh)
+            self.assertEqual(sticky.exception.errno, errno.ENOSPC)
+            with self.assertLogs("immich_on_demand.filesystem", level="ERROR"):
+                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                    await filesystem.release(info.fh)
+
+            self.assertEqual(library.uploads, [])
+            self.assertEqual(next(recovery.rglob("sticky.jpg")).read_bytes(), b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for via_setattr in (False, True):
+                with self.subTest(via_setattr=via_setattr):
+                    trio.run(scenario, root, via_setattr)
 
     def test_unlink_uses_remote_trash_guard_and_rejects_other_mutations(self) -> None:
         async def scenario(root: Path) -> None:
