@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 import httpx
 import trio
@@ -96,5 +98,56 @@ class ImmichClientTest(unittest.TestCase):
             ) as client:
                 with self.assertRaisesRegex(ImmichError, "unexpected permissions: asset.delete"):
                     await client.validate()
+
+        trio.run(scenario)
+
+    def test_upload_checks_duplicates_before_sending_bytes(self) -> None:
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.url.path)
+            if request.url.path == "/api/assets/bulk-upload-check":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": "photo.jpg",
+                                "action": "reject",
+                                "reason": "duplicate",
+                                "assetId": ASSET_ID,
+                                "isTrashed": False,
+                            }
+                        ]
+                    },
+                )
+            raise AssertionError(request.url.path)
+
+        async def scenario(path: Path) -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                result = await client.upload(path, frozenset({".jpg"}))
+                self.assertEqual(result.asset_id, ASSET_ID)
+                self.assertFalse(result.created)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "photo.jpg"
+            path.write_bytes(b"content")
+            trio.run(scenario, path)
+        self.assertEqual(requests, ["/api/assets/bulk-upload-check"])
+
+    def test_trash_never_requests_permanent_deletion(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, "/api/assets")
+            self.assertEqual(request.method, "DELETE")
+            self.assertEqual(request.read(), b'{"ids":["12345678-1234-4234-8234-123456789abc"],"force":false}')
+            return httpx.Response(204)
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                await client.trash(ASSET_ID, trash_enabled=True)
 
         trio.run(scenario)

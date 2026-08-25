@@ -3,11 +3,16 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import base64
+import hashlib
 import logging
+from pathlib import Path
 from urllib.parse import urljoin
 from uuid import UUID
 
 import httpx
+import trio
 
 from .model import Asset
 
@@ -27,6 +32,12 @@ class ServerSession:
     version: str
     media_types: frozenset[str]
     trash_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class UploadResult:
+    asset_id: str
+    created: bool
 
 
 class ImmichClient:
@@ -152,6 +163,62 @@ class ImmichClient:
             raise ImmichError("Immich preview exceeds 32 MiB")
         return response.content, response.headers.get("content-type", "application/octet-stream")
 
+    async def asset(self, asset_id: str) -> Asset:
+        UUID(asset_id)
+        return Asset.from_api(await self._json("GET", f"assets/{asset_id}"))
+
+    async def upload(self, path: Path, media_types: frozenset[str]) -> UploadResult:
+        extension = path.suffix.lower()
+        if extension not in media_types:
+            raise ImmichError(f"Immich does not accept the {extension or 'extensionless'} file type")
+        checksum = await trio.to_thread.run_sync(_sha1, path)
+        token = path.name
+        check = await self._json(
+            "POST",
+            "assets/bulk-upload-check",
+            json={"assets": [{"id": token, "checksum": checksum.hex()}]},
+        )
+        results = check.get("results")
+        if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+            raise ImmichError("Immich returned an invalid bulk upload check")
+        result = results[0]
+        if result.get("action") == "reject":
+            existing_id = result.get("assetId")
+            if result.get("reason") != "duplicate" or not isinstance(existing_id, str):
+                raise ImmichError(f"Immich rejected upload: {result.get('reason', 'unknown reason')}")
+            UUID(existing_id)
+            return UploadResult(existing_id, False)
+
+        stats = path.stat()
+        created = datetime.fromtimestamp(stats.st_ctime, timezone.utc).isoformat()
+        modified = datetime.fromtimestamp(stats.st_mtime, timezone.utc).isoformat()
+        with path.open("rb") as stream:
+            response = await self._request(
+                "POST",
+                "assets",
+                headers={"x-immich-checksum": base64.b64encode(checksum).decode("ascii")},
+                data={"fileCreatedAt": created, "fileModifiedAt": modified},
+                files={"assetData": (path.name, stream, "application/octet-stream")},
+            )
+        value = response.json()
+        if not isinstance(value, dict) or not isinstance(value.get("id"), str):
+            raise ImmichError("Immich returned an invalid upload response")
+        asset_id = value["id"]
+        UUID(asset_id)
+        return UploadResult(asset_id, response.status_code == 201)
+
+    async def trash(self, asset_id: str, *, trash_enabled: bool) -> None:
+        UUID(asset_id)
+        if not trash_enabled:
+            raise ImmichError("Immich trash is disabled; refusing remote deletion")
+        await self._request("DELETE", "assets", json={"ids": [asset_id], "force": False})
+
+    async def restore(self, asset_id: str) -> None:
+        UUID(asset_id)
+        value = await self._json("POST", "trash/restore/assets", json={"ids": [asset_id]})
+        if value.get("count") != 1:
+            raise ImmichError("Immich did not restore the requested asset")
+
     @asynccontextmanager
     async def original(self, asset_id: str) -> AsyncIterator[httpx.Response]:
         UUID(asset_id)
@@ -165,3 +232,11 @@ class ImmichClient:
                     f"Immich original download failed with {response.status_code}"
                 ) from error
             yield response
+
+
+def _sha1(path: Path) -> bytes:
+    digest = hashlib.sha1(usedforsecurity=False)
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.digest()
