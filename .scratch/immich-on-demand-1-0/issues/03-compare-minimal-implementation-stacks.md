@@ -10,4 +10,4 @@ Which language and already-available libraries give the smallest maintainable im
 
 ## Answer
 
-[Minimal implementation stack](../../../docs/research/minimal-implementation-stack.md) recommends one Python package using pyfuse3 with Trio, HTTPX, stdlib SQLite, SecretStorage, newline-delimited JSON over a Unix socket, and a thin nautilus-python adapter.
+[Minimal implementation stack](../../../docs/research/minimal-implementation-stack.md) recommends one Python package using pyfuse3 with Trio, HTTPX, stdlib SQLite, SecretStorage, and newline-delimited JSON over a Unix socket. The final implementation writes the FreeDesktop thumbnail cache directly and needs no desktop-specific extension.

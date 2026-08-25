@@ -10,7 +10,7 @@ The mount contains one file for each visible asset. The first asset with a given
 
 Existing assets are immutable. Applications can list, open, read, and copy them. They cannot overwrite, truncate, rename, link, or change their metadata.
 
-Creating a new file uploads it when the application flushes or closes the file. Version 1.0 does not queue writes while offline. A failed upload returns an I/O error and keeps a private recovery copy outside the mount.
+Creating a new file stages private local bytes. Flush syncs those bytes but does not upload them. The last close makes one upload attempt. FUSE cannot report an error from release, so an upload failure is logged and the recovery copy stays outside the mount. A successful upload removes the staged copy. Version 1.0 does not queue writes or retry uploads while offline.
 
 By default, unlink is disabled. If you enable remote deletion, unlink moves an owned asset to Immich trash. The client refuses deletion when the server has disabled trash, and it never requests permanent deletion. Cache eviction is a separate local operation and never changes Immich.
 
@@ -88,6 +88,8 @@ The first `auth-check` validates Immich 3.0.3 and the exact read-only permission
 
 The service creates a missing mount directory. An existing mount directory must be empty, owned by the current user, and not a symbolic link.
 
+Startup deliberately requires Immich to be online. Before mounting, the service validates the configured keys, refreshes the catalog, and prepares Preview suppression. If Immich becomes unavailable later, the running mount keeps its catalog and continues to serve cached originals. Reads of uncached originals fail until Immich returns.
+
 To enable remote deletion, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.delete`. The service fails closed if either key has unexpected permissions.
 
 Start the filesystem as a systemd user service:
@@ -133,7 +135,7 @@ Immich On-Demand follows the XDG base-directory variables. Without overrides, it
 
 Original downloads use a private temporary file. The cache publishes the file only after its byte count and available checksum pass validation. An interrupted or invalid download never replaces a complete cache entry.
 
-A successful upload removes its staged copy. A failed upload or duplicate-content rejection keeps the file below `uploads/` with mode `0600` in a directory with mode `0700`. The service does not retry it. Copy the recovery file to a safe location, then copy it into the mount again when you are ready to retry. Delete the recovery copy only after the new asset appears in Immich.
+The last close makes one upload attempt. A successful upload removes its staged copy. A failed upload or duplicate-content rejection is written to the service log and keeps the file below `uploads/` with mode `0600` in a directory with mode `0700`. FUSE release has no error return, so the application that closed the file cannot detect this failure. The service does not retry it. Copy the recovery file to a safe location, then copy it into the mount again when you are ready to retry. Delete the recovery copy only after the new asset appears in Immich.
 
 ## Test against an Immich library
 
