@@ -3,6 +3,7 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -98,6 +99,44 @@ class ThumbnailTest(unittest.TestCase):
 
             self.assertTrue(failed_thumbnail_is_current(source, 42, 1234, cache_home=cache))
             self.assertFalse(failed_thumbnail_is_current(source, 43, 1234, cache_home=cache))
+
+    def test_rejects_a_symlinked_thumbnail_root_without_touching_its_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            cache.mkdir()
+            target = root / "target"
+            target.mkdir(mode=0o755)
+            (cache / "thumbnails").symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(PermissionError, "thumbnail cache root"):
+                install_failed_thumbnail(root / "photo.jpg", 1, 1, cache_home=cache)
+
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_rejects_a_non_directory_thumbnail_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "thumbnails").write_text("keep")
+
+            with self.assertRaisesRegex(PermissionError, "thumbnail cache root"):
+                install_failed_thumbnail(root / "photo.jpg", 1, 1, cache_home=cache)
+
+    def test_rejects_a_thumbnail_root_not_owned_by_the_user(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            thumbnail_root = cache / "thumbnails"
+            thumbnail_root.mkdir(parents=True)
+
+            with patch(
+                "immich_on_demand.thumbnails.os.getuid",
+                return_value=thumbnail_root.stat().st_uid + 1,
+            ), self.assertRaisesRegex(PermissionError, "thumbnail cache root"):
+                install_failed_thumbnail(root / "photo.jpg", 1, 1, cache_home=cache)
 
     def test_recognizes_only_a_matching_cached_thumbnail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

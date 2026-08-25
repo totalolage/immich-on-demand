@@ -1,5 +1,6 @@
 import contextlib
 import io
+import logging
 from pathlib import Path
 import tempfile
 import unittest
@@ -141,12 +142,22 @@ class CliTest(unittest.TestCase):
 
     def test_mount_routes_through_the_service(self) -> None:
         configured = Settings("https://photos.example.test", Path("/Photos"))
+        events: list[str] = []
         with (
             patch("immich_on_demand.cli.load", return_value=configured),
-            patch("immich_on_demand.cli.trio.run", return_value=None) as run,
+            patch(
+                "immich_on_demand.cli.logging.basicConfig",
+                side_effect=lambda **kwargs: events.append("logging"),
+            ) as configure_logging,
+            patch(
+                "immich_on_demand.cli.trio.run",
+                side_effect=lambda *args: events.append("service"),
+            ) as run,
         ):
             self.assertEqual(main(["mount"]), 0)
+        configure_logging.assert_called_once_with(level=logging.INFO)
         run.assert_called_once_with(run_service, configured)
+        self.assertEqual(events, ["logging", "service"])
 
     def test_network_failure_is_a_concise_cli_error(self) -> None:
         configured = Settings("https://photos.example.test", Path("/Photos"))

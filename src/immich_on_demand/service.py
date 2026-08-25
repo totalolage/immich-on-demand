@@ -47,6 +47,17 @@ def _prepare_mountpoint(path: Path) -> None:
     _check_mountpoint(path)
 
 
+def _prepare_cache_root(path: Path) -> None:
+    try:
+        path.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        pass
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise PermissionError("cache root must be a directory owned by this user")
+    os.chmod(path, 0o700)
+
+
 def _evict_to_limits(content_cache: ContentCache, settings: Settings) -> list[str]:
     return content_cache.evict_to_limits(
         max_age_seconds=settings.cache_max_age_seconds,
@@ -78,13 +89,19 @@ async def _refresh_worker(
     async for _ in requests:
         try:
             await refresh_catalog(catalog, read_client, read_session, catalog_lock)
-            try:
-                _evict_to_limits(content_cache, settings)
-            except Exception as error:
-                LOGGER.warning("background cache eviction failed: %s", error)
-            await populate_previews(library.list(), read_client, settings.mount_path)
         except Exception as error:
             LOGGER.warning("background refresh failed: %s", error)
+            continue
+        try:
+            _evict_to_limits(content_cache, settings)
+        except Exception as error:
+            LOGGER.warning("background cache eviction failed: %s", error)
+        try:
+            await populate_previews(library.list(), read_client, settings.mount_path)
+        except Exception as error:
+            LOGGER.error("preview suppression failed; terminating mount: %s", error)
+            pyfuse3.terminate()
+            return
 
 
 async def _periodic_refresh(
@@ -104,6 +121,8 @@ def _missing_mutation_key(error: RuntimeError) -> bool:
 
 async def run_service(settings: Settings) -> None:
     _prepare_mountpoint(settings.mount_path)
+    cache_root = cache_path()
+    _prepare_cache_root(cache_root)
     read_client = ImmichClient(settings.server_url, load_api_key(settings, purpose="read-only"))
     mutation_client: ImmichClient | None = None
     try:
@@ -124,7 +143,6 @@ async def run_service(settings: Settings) -> None:
                 raise RuntimeError("read-only and mutation keys belong to different Immich users")
 
         state_root = state_path()
-        cache_root = cache_path()
         with Catalog(state_root / "catalog.db") as catalog:
             catalog_lock = trio.Lock()
             content_cache = ContentCache(

@@ -1,4 +1,5 @@
 import argparse
+import logging
 from pathlib import Path
 import secrets
 import sys
@@ -77,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "auth-check":
             return trio.run(_auth_check, load(arguments.config), arguments.mutation)
         if arguments.command == "mount":
+            logging.basicConfig(level=logging.INFO)
             trio.run(run_service, load(arguments.config))
             return 0
         if arguments.command in {"refresh", "status", "evict"}:

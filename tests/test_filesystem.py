@@ -151,9 +151,15 @@ class FilesystemTest(unittest.TestCase):
             info = await filesystem.open(2, os.O_RDONLY, None)  # type: ignore[arg-type]
 
             self.assertEqual(library.content_cache.acquired, [ASSET_ID])
+            self.assertFalse(info.keep_cache)
             self.assertEqual(await filesystem.read(info.fh, 1, 3), b"ell")
             await filesystem.release(info.fh)
             self.assertEqual(library.content_cache.released, [ASSET_ID])
+            reopened = await filesystem.open(2, os.O_RDONLY, None)  # type: ignore[arg-type]
+            self.assertFalse(reopened.keep_cache)
+            await filesystem.release(reopened.fh)
+            self.assertEqual(library.content_cache.acquired, [ASSET_ID, ASSET_ID])
+            self.assertEqual(library.content_cache.released, [ASSET_ID, ASSET_ID])
             with self.assertRaises(pyfuse3.FUSEError) as denied:
                 await filesystem.open(2, os.O_WRONLY, None)  # type: ignore[arg-type]
             self.assertEqual(denied.exception.errno, errno.EROFS)
@@ -435,12 +441,16 @@ class FilesystemTest(unittest.TestCase):
                 None,  # type: ignore[arg-type]
             )
             await filesystem.write(info.fh, 0, b"hello")
-            with self.assertLogs("immich_on_demand.filesystem", level="ERROR") as logs:
-                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
-                    await filesystem.release(info.fh)
+            with (
+                self.assertLogs("immich_on_demand.filesystem", level="ERROR") as logs,
+                patch("immich_on_demand.filesystem.pyfuse3.terminate") as terminate,
+                patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"),
+            ):
+                await filesystem.release(info.fh)
 
             self.assertIsNotNone(library.lookup("committed.jpg"))
             self.assertEqual(list(recovery.rglob("committed.jpg")), [])
+            terminate.assert_called_once_with()
             self.assertIn("post-upload callback failed", "\n".join(logs.output))
 
         with tempfile.TemporaryDirectory() as directory:

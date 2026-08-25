@@ -94,7 +94,7 @@ class ImmichFilesystem(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EIO) from error
         handle = self._handle()
         self._reads[handle] = entry
-        return pyfuse3.FileInfo(fh=handle, keep_cache=True)
+        return pyfuse3.FileInfo(fh=handle, keep_cache=False)
 
     @staticmethod
     def _name(value: bytes) -> str:
@@ -435,6 +435,7 @@ class ImmichFilesystem(pyfuse3.Operations):
                     await self._on_uploaded(uploaded)
                 except Exception as error:
                     LOGGER.error("post-upload callback failed for %s: %s", staged.name, error)
+                    pyfuse3.terminate()
             try:
                 staged.path.unlink()
                 staged.directory.rmdir()

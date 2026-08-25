@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -27,10 +28,12 @@ class ServiceFakes:
         mutation: bool = True,
         mutation_owner: str = OWNER_ID,
         block_preview: bool = True,
+        preview_error_call: int | None = None,
     ) -> None:
         self.root = root
         self.mutation = mutation
         self.block_preview = block_preview
+        self.preview_error_call = preview_error_call
         self.events: list[str] = []
         self.clients: list[ServiceFakes.Client] = []
         self.handlers: dict[str, object] = {}
@@ -38,6 +41,7 @@ class ServiceFakes:
         self.preview_gate = trio.Event()
         self.main_started = trio.Event()
         self.stop_main = trio.Event()
+        self.terminated = trio.Event()
         self.second_refresh = trio.Event()
         self.background_done = trio.Event()
         self.on_uploaded: object = None
@@ -154,6 +158,8 @@ class ServiceFakes:
         task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
     ) -> object:
         self.events.append("suppress")
+        if self.events.count("suppress") == self.preview_error_call:
+            raise OSError("thumbnail cache unavailable")
         task_status.started()
         self.events.append("fetch")
         if self.block_preview and self.events.count("fetch") == 1:
@@ -188,6 +194,11 @@ class ServiceFakes:
     def fuse_close(self, *, unmount: bool) -> None:
         self.events.append(f"fuse-close:{unmount}")
 
+    def fuse_terminate(self) -> None:
+        self.events.append("fuse-terminate")
+        self.terminated.set()
+        self.stop_main.set()
+
     def patches(self) -> ExitStack:
         stack = ExitStack()
         replacements = {
@@ -209,6 +220,9 @@ class ServiceFakes:
         stack.enter_context(patch("immich_on_demand.service.pyfuse3.init", self.fuse_init))
         stack.enter_context(patch("immich_on_demand.service.pyfuse3.main", self.fuse_main))
         stack.enter_context(patch("immich_on_demand.service.pyfuse3.close", self.fuse_close))
+        stack.enter_context(
+            patch("immich_on_demand.service.pyfuse3.terminate", self.fuse_terminate)
+        )
         return stack
 
 
@@ -299,7 +313,35 @@ class ServiceTest(unittest.TestCase):
             self.assertIn("catalog-close", fakes.events)
             self.assertIn("close:read", fakes.events)
             self.assertIn("close:mutation", fakes.events)
+            self.assertNotIn("fuse-terminate", fakes.events)
             self.assertEqual(fakes.clients[1].validations, [UPLOAD_PERMISSIONS])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_runtime_preview_suppression_failure_terminates_the_mount(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(root, block_preview=False, preview_error_call=2)
+            settings = Settings(
+                "https://photos.example.test", root / "mount", refresh_seconds=3600
+            )
+
+            with fakes.patches(), self.assertLogs(
+                "immich_on_demand.service", level="ERROR"
+            ) as logs:
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    refresh = fakes.handlers["refresh"]
+                    self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
+                    with trio.fail_after(0.1):
+                        await fakes.terminated.wait()
+
+            self.assertLess(
+                fakes.events.index("fuse-terminate"),
+                fakes.events.index("fuse-close:True"),
+            )
+            self.assertIn("preview suppression failed", "\n".join(logs.output))
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -430,6 +472,24 @@ class ServiceTest(unittest.TestCase):
             ):
                 with self.assertRaises(PermissionError):
                     await run_service(Settings("https://photos.example.test", foreign))
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_refuses_a_symlinked_cache_root_before_credentials(self) -> None:
+        async def scenario(root: Path) -> None:
+            target = root / "cache-target"
+            target.mkdir(mode=0o755)
+            (root / "cache").symlink_to(target, target_is_directory=True)
+            fakes = ServiceFakes(root, block_preview=False)
+
+            with fakes.patches(), self.assertRaisesRegex(PermissionError, "cache root"):
+                await run_service(
+                    Settings("https://photos.example.test", root / "mount")
+                )
+
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+            self.assertEqual(fakes.clients, [])
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

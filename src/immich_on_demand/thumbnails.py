@@ -4,6 +4,7 @@ from hashlib import md5
 from io import BytesIO
 import os
 from pathlib import Path
+import stat
 import tempfile
 import warnings
 
@@ -105,12 +106,28 @@ def _metadata(path: Path, mtime: int, original_size: int) -> PngImagePlugin.PngI
 
 def _private_cache_directory(destination: Path) -> None:
     thumbnail_root = next(parent for parent in destination.parents if parent.name == "thumbnails")
-    thumbnail_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        thumbnail_root.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        pass
+    info = os.lstat(thumbnail_root)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise PermissionError(
+            "thumbnail cache root must be a directory owned by this user"
+        )
     current = thumbnail_root
     os.chmod(current, 0o700)
     for part in destination.parent.relative_to(thumbnail_root).parts:
         current /= part
-        current.mkdir(mode=0o700, exist_ok=True)
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        info = os.lstat(current)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError(
+                "thumbnail cache directory must be owned by this user"
+            )
         os.chmod(current, 0o700)
 
 

@@ -1,7 +1,7 @@
 # Nautilus 50 thumbnail route
 
-Status: decision-ready research  
-Date: 2026-08-25  
+Status: decision-ready research
+Date: 2026-08-25
 Examined baseline: Nautilus 50.2.2 (`c6592e9c`), GLib/GIO 2.89.4 (`fa41d356`), and libgnome-desktop 44.5 (`c214a5f3`)
 
 ## Decision
