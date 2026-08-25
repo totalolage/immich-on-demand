@@ -20,5 +20,12 @@ class SettingsTest(unittest.TestCase):
             self.assertNotIn("api", json.loads(path.read_text()))
 
     def test_rejects_an_unsafe_server_url(self) -> None:
-        with self.assertRaises(ValueError):
-            Settings("http://photos.example.test", Path("/tmp/Photos"))
+        for server_url in (
+            "http://photos.example.test",
+            "https://user:password@photos.example.test",
+            "https://@photos.example.test",
+            "https://photos.example.test/immich",
+            "https://photos.example.test?key=value",
+        ):
+            with self.subTest(server_url=server_url), self.assertRaises(ValueError):
+                Settings(server_url, Path("/tmp/Photos"))

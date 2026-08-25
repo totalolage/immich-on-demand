@@ -28,7 +28,15 @@ class Settings:
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.server_url)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
             raise ValueError("server_url must be an HTTPS origin without credentials, query, or fragment")
         if not self.mount_path.is_absolute():
             raise ValueError("mount_path must be absolute")
