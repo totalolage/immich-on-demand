@@ -17,6 +17,7 @@ def _require_owned_directory(path: Path) -> None:
     info = os.lstat(path)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise PermissionError("catalog state directory must be owned by this user")
+    os.chmod(path, 0o700)
 
 
 def _prepare_database(path: Path) -> None:

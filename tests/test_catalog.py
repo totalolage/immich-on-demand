@@ -127,6 +127,7 @@ class CatalogTest(unittest.TestCase):
     def test_creates_a_private_catalog_and_state_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
+            state.mkdir(mode=0o755)
             database = state / "catalog.db"
 
             with Catalog(database):
