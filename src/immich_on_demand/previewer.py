@@ -34,6 +34,7 @@ async def populate_previews(
     cache_home: Path | None = None,
     concurrency: int = 4,
     size: str = "large",
+    task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> PreviewStats:
     """Suppress desktop fallbacks, then populate supported previews concurrently."""
     if concurrency < 1:
@@ -54,6 +55,7 @@ async def populate_previews(
 
     installed = [False] * len(jobs)
     limiter = trio.CapacityLimiter(concurrency)
+    task_status.started()
 
     async def fetch(index: int, job: tuple[CatalogAsset, Path, int, int]) -> None:
         entry, source_path, mtime, original_size = job

@@ -1,4 +1,5 @@
 from io import BytesIO
+from functools import partial
 from pathlib import Path
 import tempfile
 import unittest
@@ -45,6 +46,33 @@ def preview_bytes() -> bytes:
 
 
 class PreviewerTest(unittest.TestCase):
+    def test_signals_ready_after_suppression_and_before_fetch_completion(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                item = entry(1)
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        await trio.sleep_forever()
+
+                async with trio.open_nursery() as nursery:
+                    await nursery.start(
+                        partial(
+                            populate_previews,
+                            [item],
+                            Client(),  # type: ignore[arg-type]
+                            root / "mount",
+                            cache_home=root / "cache",
+                        )
+                    )
+                    self.assertTrue(
+                        failed_thumbnail_path(root / "mount" / item.name, root / "cache").exists()
+                    )
+                    nursery.cancel_scope.cancel()
+
+        trio.run(scenario)
+
     def test_installs_every_failure_record_before_first_network_call(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
