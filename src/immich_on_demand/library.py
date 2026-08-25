@@ -37,6 +37,10 @@ class Library:
     def list(self) -> list[CatalogAsset]:
         return self._catalog.list_visible()
 
+    @property
+    def mutation_enabled(self) -> bool:
+        return self._mutation_client is not None and self._mutation_session is not None
+
     def lookup(self, identity: str | int) -> CatalogAsset | None:
         entry = (
             self._catalog.by_inode(identity)
@@ -47,6 +51,12 @@ class Library:
 
     async def read(self, entry: CatalogAsset, offset: int, size: int) -> bytes:
         return await self._content_cache.read(entry.asset, offset, size)
+
+    def acquire(self, entry: CatalogAsset) -> None:
+        self._content_cache.acquire(entry.asset.id)
+
+    def release(self, entry: CatalogAsset) -> None:
+        self._content_cache.release(entry.asset.id)
 
     async def upload_new(self, staged_path: Path, requested_name: str) -> CatalogAsset:
         if safe_filename(requested_name, str(UUID(int=0))) != requested_name:

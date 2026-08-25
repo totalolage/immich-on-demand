@@ -81,6 +81,16 @@ class MutationClient:
 
 
 class Cache:
+    def __init__(self) -> None:
+        self.acquired: list[str] = []
+        self.released: list[str] = []
+
+    def acquire(self, asset_id: str) -> None:
+        self.acquired.append(asset_id)
+
+    def release(self, asset_id: str) -> None:
+        self.released.append(asset_id)
+
     async def read(self, item: Asset, offset: int, size: int) -> bytes:
         return b"hello"[offset : offset + size]
 
@@ -111,10 +121,15 @@ class LibraryTest(unittest.TestCase):
                 entry = catalog.add_uploaded(asset(), "photo.jpg")
                 mounted = library(catalog, root)
 
+                self.assertFalse(mounted.mutation_enabled)
                 self.assertEqual(mounted.list(), [entry])
                 self.assertEqual(mounted.lookup("photo.jpg"), entry)
                 self.assertEqual(mounted.lookup(entry.inode), entry)
                 self.assertEqual(await mounted.read(entry, 1, 3), b"ell")
+                mounted.acquire(entry)
+                mounted.release(entry)
+                self.assertEqual(mounted._content_cache.acquired, [ASSET_ID])
+                self.assertEqual(mounted._content_cache.released, [ASSET_ID])
                 self.assertFalse(hasattr(mounted, "overwrite"))
                 self.assertFalse(hasattr(mounted, "rename"))
 
