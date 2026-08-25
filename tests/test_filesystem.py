@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -197,10 +198,250 @@ class FilesystemTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(recovery.stat().st_mode), 0o700)
             await filesystem.flush(info.fh)
             await filesystem.flush(info.fh)
+            self.assertEqual(library.uploads, [])
+            self.assertTrue(staged.exists())
+            self.assertEqual(attributes.st_size, 0)
+            with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                await filesystem.release(info.fh)
             self.assertEqual(library.uploads, [("new.jpg", b"hello")])
             self.assertFalse(staged.exists())
-            self.assertEqual(attributes.st_size, 0)
-            await filesystem.release(info.fh)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_reopened_staged_file_uploads_after_final_release(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            filesystem = ImmichFilesystem(
+                library, root / "recovery"  # type: ignore[arg-type]
+            )
+            creator, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"shared.jpg",
+                0o600,
+                os.O_RDWR,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(creator.fh, 0, b"first")
+            reopened = await filesystem.open(
+                attributes.st_ino, os.O_RDWR, None  # type: ignore[arg-type]
+            )
+
+            self.assertEqual(await filesystem.read(reopened.fh, 0, 5), b"first")
+            await filesystem.flush(creator.fh)
+            await filesystem.release(creator.fh)
+            self.assertEqual(library.uploads, [])
+            await filesystem.write(reopened.fh, 5, b"-second")
+            with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                await filesystem.release(reopened.fh)
+
+            self.assertEqual(library.uploads, [("shared.jpg", b"first-second")])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_staged_reopen_honors_truncate_and_append(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            filesystem = ImmichFilesystem(
+                library, root / "recovery"  # type: ignore[arg-type]
+            )
+            creator, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"flags.jpg",
+                0o600,
+                os.O_RDWR,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(creator.fh, 0, b"abcdef")
+            truncating = await filesystem.open(
+                attributes.st_ino,
+                os.O_WRONLY | os.O_TRUNC,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(truncating.fh, 0, b"X")
+            appending = await filesystem.open(
+                attributes.st_ino,
+                os.O_WRONLY | os.O_APPEND,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(appending.fh, 0, b"-A")
+            self.assertEqual(await filesystem.read(creator.fh, 0, 16), b"X-A")
+
+            await filesystem.release(truncating.fh)
+            await filesystem.release(appending.fh)
+            with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                await filesystem.release(creator.fh)
+            self.assertEqual(library.uploads, [("flags.jpg", b"X-A")])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_staged_setattr_is_private_and_remote_setattr_is_read_only(self) -> None:
+        async def scenario(root: Path) -> None:
+            filesystem = ImmichFilesystem(
+                FakeLibrary(), root / "recovery"  # type: ignore[arg-type]
+            )
+            info, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"metadata.jpg",
+                0o644,
+                os.O_RDWR,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(info.fh, 0, b"abcdef")
+            requested = pyfuse3.EntryAttributes()
+            requested.st_size = 3
+            requested.st_mode = stat.S_IFREG | 0o644
+            requested.st_uid = os.getuid()
+            requested.st_gid = os.getgid()
+            requested.st_atime_ns = 1_700_000_000_000_000_000
+            requested.st_mtime_ns = 1_700_000_001_000_000_000
+            fields = SimpleNamespace(
+                update_size=True,
+                update_mode=True,
+                update_uid=True,
+                update_gid=True,
+                update_atime=True,
+                update_mtime=True,
+                update_ctime=False,
+            )
+
+            result = await filesystem.setattr(
+                attributes.st_ino, requested, fields, info.fh, None  # type: ignore[arg-type]
+            )
+            staged = next((root / "recovery").rglob("metadata.jpg"))
+            self.assertEqual(staged.read_bytes(), b"abc")
+            self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(result.st_mode), 0o600)
+            self.assertEqual(result.st_mtime_ns, requested.st_mtime_ns)
+
+            requested.st_uid = os.getuid() + 1
+            with self.assertRaises(pyfuse3.FUSEError) as foreign:
+                await filesystem.setattr(
+                    attributes.st_ino,
+                    requested,
+                    fields,
+                    info.fh,
+                    None,  # type: ignore[arg-type]
+                )
+            self.assertEqual(foreign.exception.errno, errno.EPERM)
+
+            remote_fields = SimpleNamespace(
+                update_size=False,
+                update_mode=False,
+                update_uid=False,
+                update_gid=False,
+                update_atime=False,
+                update_mtime=True,
+                update_ctime=False,
+            )
+            with self.assertRaises(pyfuse3.FUSEError) as remote:
+                await filesystem.setattr(
+                    2, requested, remote_fields, None, None  # type: ignore[arg-type]
+                )
+            self.assertEqual(remote.exception.errno, errno.EROFS)
+
+            with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                await filesystem.release(info.fh)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_statfs_reports_private_staging_filesystem_capacity(self) -> None:
+        async def scenario(root: Path) -> None:
+            recovery = root / "recovery"
+            filesystem = ImmichFilesystem(
+                FakeLibrary(), recovery  # type: ignore[arg-type]
+            )
+            expected = os.statvfs(recovery)
+
+            result = await filesystem.statfs(None)  # type: ignore[arg-type]
+
+            self.assertEqual(result.f_bsize, expected.f_bsize)
+            self.assertEqual(result.f_frsize, expected.f_frsize)
+            self.assertEqual(result.f_blocks, expected.f_blocks)
+            self.assertEqual(result.f_bavail, expected.f_bavail)
+            self.assertEqual(result.f_namemax, min(expected.f_namemax, 255))
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_upload_callback_precedes_promotion_and_invalidates_staged_name(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            seen: list[CatalogAsset] = []
+
+            async def on_uploaded(entry: CatalogAsset) -> None:
+                self.assertIs(library.lookup(entry.name), entry)
+                staged = await filesystem.lookup(
+                    pyfuse3.ROOT_INODE,
+                    entry.name.encode("utf-8"),
+                    None,  # type: ignore[arg-type]
+                )
+                self.assertGreaterEqual(staged.st_ino, 1 << 63)
+                seen.append(entry)
+
+            filesystem = ImmichFilesystem(
+                library,
+                root / "recovery",  # type: ignore[arg-type]
+                on_uploaded=on_uploaded,
+            )
+            info, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"callback.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(info.fh, 0, b"hello")
+            with patch(
+                "immich_on_demand.filesystem.pyfuse3.invalidate_entry"
+            ) as invalidate:
+                await filesystem.release(info.fh)
+
+            self.assertEqual([entry.name for entry in seen], ["callback.jpg"])
+            invalidate.assert_called_once_with(
+                pyfuse3.ROOT_INODE,
+                b"callback.jpg",
+                attributes.st_ino,
+            )
+            promoted = await filesystem.lookup(
+                pyfuse3.ROOT_INODE, b"callback.jpg", None  # type: ignore[arg-type]
+            )
+            self.assertEqual(promoted.st_ino, 3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_callback_failure_does_not_retain_a_retry_copy_after_commit(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+
+            async def broken_callback(entry: CatalogAsset) -> None:
+                raise OSError("preview cache unavailable")
+
+            recovery = root / "recovery"
+            filesystem = ImmichFilesystem(
+                library,  # type: ignore[arg-type]
+                recovery,
+                on_uploaded=broken_callback,
+            )
+            info, _ = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"committed.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(info.fh, 0, b"hello")
+            with self.assertLogs("immich_on_demand.filesystem", level="ERROR") as logs:
+                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                    await filesystem.release(info.fh)
+
+            self.assertIsNotNone(library.lookup("committed.jpg"))
+            self.assertEqual(list(recovery.rglob("committed.jpg")), [])
+            self.assertIn("post-upload callback failed", "\n".join(logs.output))
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -216,13 +457,14 @@ class FilesystemTest(unittest.TestCase):
             )
             await filesystem.write(info.fh, 0, b"recover me")
 
-            with self.assertRaises(pyfuse3.FUSEError) as failed:
-                await filesystem.flush(info.fh)
-            self.assertEqual(failed.exception.errno, errno.EIO)
-            await filesystem.release(info.fh)
+            await filesystem.flush(info.fh)
+            with self.assertLogs("immich_on_demand.filesystem", level="ERROR") as logs:
+                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                    await filesystem.release(info.fh)
             staged = next(recovery.rglob("recover.jpg"))
             self.assertEqual(staged.read_bytes(), b"recover me")
             self.assertEqual(library.uploads, [("recover.jpg", b"recover me")])
+            self.assertIn(str(staged), "\n".join(logs.output))
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -245,7 +487,6 @@ class FilesystemTest(unittest.TestCase):
             for operation in (
                 filesystem.rename(1, b"a", 1, b"b", 0, None),  # type: ignore[arg-type]
                 filesystem.symlink(1, b"a", b"target", None),  # type: ignore[arg-type]
-                filesystem.setattr(2, None, None, None, None),  # type: ignore[arg-type]
             ):
                 with self.assertRaises(pyfuse3.FUSEError) as rejected:
                     await operation
