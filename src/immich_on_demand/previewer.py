@@ -5,8 +5,15 @@ from dataclasses import dataclass
 from itertools import batched
 import logging
 from pathlib import Path
+import warnings
 
+import gi
 import trio
+
+gi.require_version("Gio", "2.0")
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", gi.PyGIDeprecationWarning)
+    from gi.repository import Gio, GLib
 
 from .catalog import CatalogAsset
 from .immich import ImmichClient
@@ -20,6 +27,57 @@ PREVIEW_MIME_TYPES = frozenset(
     {"image/jpeg", "image/png", "image/gif", "video/mp4", "video/quicktime", "video/x-m4v"}
 )
 LOGGER = logging.getLogger(__name__)
+_SORT_BY = "metadata::nautilus-icon-view-sort-by"
+_SORT_REVERSED = "metadata::nautilus-icon-view-sort-reversed"
+
+
+def _read_nautilus_sort(mount_path: Path) -> tuple[str, bool] | None:
+    try:
+        info = Gio.File.new_for_path(str(mount_path)).query_info(
+            f"{_SORT_BY},{_SORT_REVERSED}",
+            Gio.FileQueryInfoFlags.NONE,
+            None,
+        )
+    except GLib.Error:
+        return None
+    attribute = info.get_attribute_string(_SORT_BY)
+    reversed_value = info.get_attribute_string(_SORT_REVERSED)
+    return (attribute, reversed_value == "true") if attribute else None
+
+
+async def _sort_for_nautilus(
+    entries: tuple[CatalogAsset, ...], mount_path: Path
+) -> tuple[CatalogAsset, ...]:
+    metadata = await trio.to_thread.run_sync(_read_nautilus_sort, mount_path)
+    if metadata is None:
+        return entries
+    attribute, descending = metadata
+    filename_key = lambda entry: GLib.utf8_collate_key_for_filename(entry.name, -1)
+    modified_key = lambda entry: (entry.asset.modified_ns, filename_key(entry))
+    created_key = lambda entry: (entry.asset.created_ns, filename_key(entry))
+    key = {
+        "name": filename_key,
+        "size": lambda entry: (entry.asset.size, filename_key(entry)),
+        "type": lambda entry: (
+            GLib.utf8_collate_key(
+                Gio.content_type_get_description(entry.asset.mime_type), -1
+            ),
+            GLib.utf8_collate_key(entry.asset.mime_type, -1),
+            filename_key(entry),
+        ),
+        "date_modified": modified_key,
+        "modification date": modified_key,
+        "date_created": created_key,
+        "creation date": created_key,
+    }.get(attribute)
+    if key is None:
+        return entries
+    LOGGER.info(
+        "preview queue follows Nautilus %s sort (%s)",
+        attribute,
+        "descending" if descending else "ascending",
+    )
+    return tuple(sorted(entries, key=key, reverse=descending))
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +103,7 @@ async def populate_previews(
     entries = tuple(entries)
     if any(entry.asset.size is None for entry in entries):
         raise ValueError("visible catalog entries must have a size")
+    entries = await _sort_for_nautilus(entries, mount_path)
 
     jobs: list[tuple[CatalogAsset, Path, int, int]] = []
     current_count = 0

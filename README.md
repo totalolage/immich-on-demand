@@ -14,7 +14,7 @@ Creating a new file stages private local bytes. Flush syncs those bytes but does
 
 By default, unlink is disabled. If you enable remote deletion, unlink moves an owned asset to Immich trash. The client refuses deletion when the server has disabled trash, and it never requests permanent deletion. Cache eviction is a separate local operation and never changes Immich.
 
-Previews are supported for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Other previews, albums, people, favorites, date views, and hardlinks between views are future work.
+Previews are supported for JPEG, PNG, GIF, MP4, MOV, and M4V assets. The initial missing-preview queue follows the sort saved for this folder by Nautilus; restart the service after changing that sort. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Other previews, albums, people, favorites, date views, and hardlinks between views are future work.
 
 ## Build and install the Arch package
 

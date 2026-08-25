@@ -11,6 +11,7 @@ depends=(
   'python'
   'python-httpx'
   'python-pillow'
+  'python-gobject'
   'python-pyfuse3'
   'python-secretstorage'
   'python-trio'

@@ -13,6 +13,7 @@ authors = [{ name = "Immich On-Demand contributors" }]
 dependencies = [
   "httpx>=0.28,<1",
   "Pillow>=11,<13",
+  "PyGObject>=3.50,<4",
   "pyfuse3>=3.4,<4",
   "SecretStorage>=3.3,<4",
   "trio>=0.30,<1",

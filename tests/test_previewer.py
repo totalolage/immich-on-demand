@@ -3,15 +3,20 @@ from inspect import signature
 from io import BytesIO
 from pathlib import Path
 import tempfile
+from threading import Event
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 import trio
 
 from immich_on_demand.catalog import CatalogAsset
 from immich_on_demand.model import Asset
-from immich_on_demand.previewer import PreviewStats, populate_previews
+from immich_on_demand.previewer import (
+    PreviewStats,
+    _read_nautilus_sort,
+    populate_previews,
+)
 from immich_on_demand.thumbnails import (
     THUMBNAIL_SIZES,
     failed_thumbnail_path,
@@ -21,7 +26,11 @@ from immich_on_demand.thumbnails import (
 )
 
 
-def entry(index: int, mime_type: str = "image/jpeg") -> CatalogAsset:
+def entry(
+    index: int,
+    mime_type: str = "image/jpeg",
+    modified_ns: int = 4_999_999_999,
+) -> CatalogAsset:
     asset_id = f"{index:08d}-1234-4234-8234-123456789abc"
     return CatalogAsset(
         Asset(
@@ -31,7 +40,7 @@ def entry(index: int, mime_type: str = "image/jpeg") -> CatalogAsset:
             mime_type,
             123 + index,
             1,
-            4_999_999_999,
+            modified_ns,
             "2026-08-25T12:00:00Z",
             "abc=",
             "timeline",
@@ -51,6 +60,21 @@ def preview_bytes() -> bytes:
 
 
 class PreviewerTest(unittest.TestCase):
+    def test_reads_nautilus_sort_metadata_as_strings(self) -> None:
+        info = Mock()
+        info.get_attribute_string.side_effect = ["date_modified", "true"]
+        location = Mock()
+        location.query_info.return_value = info
+
+        with patch(
+            "immich_on_demand.previewer.Gio.File.new_for_path",
+            return_value=location,
+        ):
+            self.assertEqual(
+                _read_nautilus_sort(Path("/mount")),
+                ("date_modified", True),
+            )
+
     def test_preview_size_is_fixed_by_the_previewer(self) -> None:
         self.assertNotIn("size", signature(populate_previews).parameters)
 
@@ -104,6 +128,80 @@ class PreviewerTest(unittest.TestCase):
 
                 self.assertEqual(client.calls, 1)
                 self.assertEqual(stats, PreviewStats(2, 1, 0, 1))
+
+        trio.run(scenario)
+
+    def test_fetches_missing_previews_in_saved_nautilus_sort_order(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entries = [
+                    entry(1, modified_ns=1),
+                    entry(2, modified_ns=3),
+                    entry(3, modified_ns=2),
+                ]
+                fetched: list[str] = []
+                read_started = Event()
+                release_read = Event()
+
+                def read_sort(_: Path) -> tuple[str, bool] | None:
+                    read_started.set()
+                    return ("date_modified", True) if release_read.wait(0.1) else None
+
+                async def allow_read() -> None:
+                    while not read_started.is_set():
+                        await trio.sleep(0)
+                    release_read.set()
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        fetched.append(asset_id)
+                        return preview_bytes(), "image/jpeg"
+
+                with patch("immich_on_demand.previewer._read_nautilus_sort", read_sort):
+                    async with trio.open_nursery() as nursery:
+                        nursery.start_soon(allow_read)
+                        await populate_previews(
+                            entries,
+                            Client(),  # type: ignore[arg-type]
+                            root / "mount",
+                            cache_home=root / "cache",
+                            concurrency=1,
+                        )
+                        nursery.cancel_scope.cancel()
+
+                self.assertEqual(
+                    fetched,
+                    [entries[1].asset.id, entries[2].asset.id, entries[0].asset.id],
+                )
+
+        trio.run(scenario)
+
+    def test_name_sort_uses_nautilus_filename_collation(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entries = [entry(10), entry(2)]
+                fetched: list[str] = []
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        fetched.append(asset_id)
+                        return preview_bytes(), "image/jpeg"
+
+                with patch(
+                    "immich_on_demand.previewer._read_nautilus_sort",
+                    return_value=("name", False),
+                ):
+                    await populate_previews(
+                        entries,
+                        Client(),  # type: ignore[arg-type]
+                        root / "mount",
+                        cache_home=root / "cache",
+                        concurrency=1,
+                    )
+
+                self.assertEqual(fetched, [entries[1].asset.id, entries[0].asset.id])
 
         trio.run(scenario)
 

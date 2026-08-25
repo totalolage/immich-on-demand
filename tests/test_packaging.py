@@ -16,6 +16,7 @@ class PackagingTests(unittest.TestCase):
             "org.freedesktop.secrets",
             "python-httpx",
             "python-pillow",
+            "python-gobject",
             "python-pyfuse3",
             "python-secretstorage",
             "python-trio",
