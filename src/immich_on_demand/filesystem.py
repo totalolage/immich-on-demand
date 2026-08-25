@@ -391,6 +391,8 @@ class ImmichFilesystem(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EBADF)
         staged = staged_handle.staged
         async with staged.lock:
+            if staged.failure_errno is not None:
+                raise pyfuse3.FUSEError(staged.failure_errno)
             try:
                 if datasync and hasattr(os, "fdatasync"):
                     os.fdatasync(staged.descriptor)

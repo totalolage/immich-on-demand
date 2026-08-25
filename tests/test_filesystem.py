@@ -535,6 +535,39 @@ class FilesystemTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_fsync_reports_an_earlier_write_failure(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            filesystem = ImmichFilesystem(library, root / "recovery")  # type: ignore[arg-type]
+            info, _ = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"failed.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+
+            with patch(
+                "immich_on_demand.filesystem.os.pwrite",
+                side_effect=OSError(errno.ENOSPC, "no space"),
+            ):
+                with self.assertRaises(pyfuse3.FUSEError):
+                    await filesystem.write(info.fh, 0, b"data")
+
+            with patch("immich_on_demand.filesystem.os.fsync") as fsync:
+                with self.assertRaises(pyfuse3.FUSEError) as sticky:
+                    await filesystem.fsync(info.fh, False)
+            self.assertEqual(sticky.exception.errno, errno.ENOSPC)
+            fsync.assert_not_called()
+
+            with self.assertLogs("immich_on_demand.filesystem", level="ERROR"):
+                with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                    await filesystem.release(info.fh)
+            self.assertEqual(library.uploads, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_failed_open_truncate_prevents_upload(self) -> None:
         async def scenario(root: Path) -> None:
             library = FakeLibrary()
