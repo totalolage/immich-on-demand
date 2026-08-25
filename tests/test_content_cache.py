@@ -49,9 +49,11 @@ class Response:
     def __init__(self, chunks: list[bytes], gate: trio.Event | None = None) -> None:
         self.chunks = chunks
         self.gate = gate
+        self.yielded = 0
 
     async def aiter_bytes(self):  # type annotation omitted to keep the fake small
         for chunk in self.chunks:
+            self.yielded += 1
             if self.gate is not None:
                 await self.gate.wait()
             yield chunk
@@ -63,15 +65,61 @@ class Client:
         self.gate = gate
         self.calls = 0
         self.started = trio.Event()
+        self.response: Response | None = None
 
     @asynccontextmanager
     async def original(self, asset_id: str):
         self.calls += 1
         self.started.set()
-        yield Response(self.chunks, self.gate)
+        self.response = Response(self.chunks, self.gate)
+        yield self.response
 
 
 class ContentCacheTest(unittest.TestCase):
+    def test_rejects_a_symlink_cache_root_without_touching_its_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "target"
+            target.mkdir(mode=0o755)
+            victim = target / ASSET_ID
+            victim.write_bytes(b"not cache data")
+            root = base / "originals"
+            root.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(PermissionError, "cache root"):
+                ContentCache(root, Client([]))  # type: ignore[arg-type]
+
+            self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(victim.read_bytes(), b"not cache data")
+
+    def test_rejects_a_cache_root_not_owned_by_the_user(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch(
+                "immich_on_demand.content_cache.os.getuid", return_value=os.getuid() + 1
+            ):
+                with self.assertRaisesRegex(PermissionError, "owned by this user"):
+                    ContentCache(root, Client([]))  # type: ignore[arg-type]
+
+    def test_initialization_removes_only_safe_stale_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = root / f".{ASSET_ID}.stale"
+            stale.write_bytes(b"partial")
+            unrelated = root / ".unrelated"
+            unrelated.write_bytes(b"keep")
+            target = root / "target"
+            target.write_bytes(b"keep")
+            unsafe = root / f".{OTHER_ID}.symlink"
+            unsafe.symlink_to(target)
+
+            ContentCache(root, Client([]))  # type: ignore[arg-type]
+
+            self.assertFalse(stale.exists())
+            self.assertEqual(unrelated.read_bytes(), b"keep")
+            self.assertTrue(unsafe.is_symlink())
+            self.assertEqual(target.read_bytes(), b"keep")
+
     def test_hydrates_once_and_reads_cached_bytes(self) -> None:
         content = b"complete original"
 
@@ -131,6 +179,53 @@ class ContentCacheTest(unittest.TestCase):
                 with self.assertRaises(CacheIntegrityError):
                     await cache.hydrate(item)
                 self.assertEqual(list(root.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_stops_downloading_before_a_chunk_exceeds_expected_size(self) -> None:
+        async def scenario(root: Path) -> None:
+            client = Client([b"too large", b"must not be consumed"])
+            cache = ContentCache(root, client)  # type: ignore[arg-type]
+            item = replace(asset(b"x"), size=1)
+
+            with self.assertRaisesRegex(CacheIntegrityError, "exceeds its expected"):
+                await cache.hydrate(item)
+
+            assert client.response is not None
+            self.assertEqual(client.response.yielded, 1)
+            self.assertEqual(list(root.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_read_blocks_eviction_until_the_file_is_opened(self) -> None:
+        content = b"cached"
+
+        async def scenario(root: Path) -> None:
+            item = asset(content)
+            cache = ContentCache(root, Client([]))  # type: ignore[arg-type]
+            (root / item.id).write_bytes(content)
+            started = trio.Event()
+            proceed = trio.Event()
+            original_open = trio.open_file
+
+            async def delayed_open(*args: object, **kwargs: object):
+                started.set()
+                await proceed.wait()
+                return await original_open(*args, **kwargs)
+
+            result: list[bytes] = []
+            with patch("immich_on_demand.content_cache.trio.open_file", delayed_open):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(self._read_into, cache, item, result)
+                    await started.wait()
+                    with self.assertRaises(CacheBusyError):
+                        cache.evict(item.id)
+                    proceed.set()
+
+            self.assertEqual(result, [content])
+            self.assertTrue(cache.evict(item.id))
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -204,6 +299,12 @@ class ContentCacheTest(unittest.TestCase):
             self.assertEqual(removed, [ASSET_ID, THIRD_ID])
             self.assertTrue((root / OTHER_ID).exists())
             self.assertTrue((root / ".incomplete").exists())
+
+    @staticmethod
+    async def _read_into(
+        cache: ContentCache, item: Asset, result: list[bytes]
+    ) -> None:
+        result.append(await cache.read(item, 0, item.size or 0))
 
 
 if __name__ == "__main__":
