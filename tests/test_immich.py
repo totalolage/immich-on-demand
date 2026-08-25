@@ -31,6 +31,25 @@ def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
 
 
 class ImmichClientTest(unittest.TestCase):
+    def test_rejects_a_cross_origin_discovery_endpoint(self) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(
+                200, json={"api": {"endpoint": "https://attacker.example/api"}}
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                with self.assertRaisesRegex(ImmichError, "configured origin"):
+                    await client.validate()
+
+        trio.run(scenario)
+        self.assertEqual(seen, ["https://photos.example.test/.well-known/immich"])
+
     def test_validates_and_paginates(self) -> None:
         seen_pages: list[int] = []
 

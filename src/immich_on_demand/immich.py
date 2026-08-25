@@ -8,7 +8,7 @@ import base64
 import hashlib
 import logging
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from uuid import UUID
 
 import httpx
@@ -98,7 +98,12 @@ class ImmichClient:
         endpoint = discovery.json().get("api", {}).get("endpoint")
         if not isinstance(endpoint, str):
             raise ImmichError("Immich discovery response has no API endpoint")
-        self._api_root = f"{urljoin(self._origin, endpoint).rstrip('/')}/"
+        api_root = urljoin(self._origin, endpoint)
+        origin = urlsplit(self._origin)
+        discovered = urlsplit(api_root)
+        if (discovered.scheme, discovered.netloc) != (origin.scheme, origin.netloc):
+            raise ImmichError("Immich discovery API endpoint is not on the configured origin")
+        self._api_root = f"{api_root.rstrip('/')}/"
 
         version_value = await self._json("GET", "server/version")
         version = ".".join(str(version_value[name]) for name in ("major", "minor", "patch"))
