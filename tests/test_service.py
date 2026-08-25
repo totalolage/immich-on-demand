@@ -157,6 +157,9 @@ class ServiceFakes:
             def list(self) -> list[object]:
                 return []
 
+            def lookup(self, identity: str | int) -> CatalogAsset | None:
+                return upload_entry() if identity == "new.jpg" else None
+
         class Filesystem:
             def __init__(self, library: object, path: Path, *, on_uploaded: object) -> None:
                 outer.on_uploaded = on_uploaded
@@ -416,8 +419,21 @@ class ServiceTest(unittest.TestCase):
                     self.assertEqual(
                         await evict({"asset": ASSET_ID}), {"evicted": True}  # type: ignore[operator]
                     )
+                    self.assertEqual(
+                        await evict(
+                            {"uri": (root / "mount" / "new.jpg").as_uri()}
+                        ),
+                        {"evicted": True},
+                    )  # type: ignore[operator]
                     with self.assertRaises(ValueError):
                         await evict({"asset": "not-a-uuid"})  # type: ignore[operator]
+                    for uri in (
+                        (root / "outside.jpg").as_uri(),
+                        "https://photos.example.test/new.jpg",
+                        (root / "mount" / "folder" / "new.jpg").as_uri(),
+                    ):
+                        with self.subTest(uri=uri), self.assertRaises(ValueError):
+                            await evict({"uri": uri})  # type: ignore[operator]
 
                     fakes.preview_gate.set()
                     await fakes.second_refresh.wait()
@@ -452,7 +468,7 @@ class ServiceTest(unittest.TestCase):
                 {"max_age_seconds": 0, "max_bytes": 0, "minimum_free_bytes": 0},
             )
             self.assertTrue(all(call == expected_limits for call in fakes.cache.limit_calls[2:]))
-            self.assertEqual(fakes.cache.asset_evictions, [ASSET_ID])
+            self.assertEqual(fakes.cache.asset_evictions, [ASSET_ID, ASSET_ID])
             self.assertIn("fuse-close:True", fakes.events)
             self.assertIn("control-close", fakes.events)
             self.assertIn("cache-policy:11:33", fakes.events)

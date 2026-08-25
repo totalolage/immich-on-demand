@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 from typing import Any
+from urllib.parse import unquote_to_bytes, urlsplit
 from uuid import UUID
 
 import pyfuse3
@@ -161,6 +162,21 @@ def _missing_mutation_key(error: RuntimeError) -> bool:
     return "expected one mutation API key" in str(error) and str(error).endswith("found 0")
 
 
+def _library_name_from_uri(uri: object, mount_path: Path) -> str:
+    if not isinstance(uri, str):
+        raise ValueError("evict URI must identify a mounted file")
+    parsed = urlsplit(uri)
+    if parsed.scheme != "file" or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError("evict URI must identify a mounted file")
+    try:
+        candidate = Path(unquote_to_bytes(parsed.path).decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ValueError("evict URI must identify a mounted file") from error
+    if candidate.parent != mount_path or candidate.name in {"", ".", ".."}:
+        raise ValueError("evict URI must identify a mounted file")
+    return candidate.name
+
+
 async def run_service(settings: Settings) -> None:
     _prepare_mountpoint(settings.mount_path)
     cache_root = cache_path()
@@ -262,10 +278,17 @@ async def run_service(settings: Settings) -> None:
                             )
                         )
                     }
-                if set(params) != {"asset"} or not isinstance(params["asset"], str):
-                    raise ValueError("evict accepts only an optional asset UUID")
-                asset_id = params["asset"]
-                UUID(asset_id)
+                if set(params) == {"asset"} and isinstance(params["asset"], str):
+                    asset_id = params["asset"]
+                    UUID(asset_id)
+                elif set(params) == {"uri"}:
+                    name = _library_name_from_uri(params["uri"], settings.mount_path)
+                    entry = library.lookup(name)
+                    if entry is None:
+                        raise ValueError("unknown library entry")
+                    asset_id = entry.asset.id
+                else:
+                    raise ValueError("evict accepts an asset UUID or mounted file URI")
                 return {"evicted": content_cache.evict(asset_id)}
 
             async with requests, refreshes, trio.open_nursery() as nursery:
