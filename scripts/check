@@ -4,5 +4,10 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
-python3 -m compileall -q src tests
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+check_python=python3
+if [[ -x .venv/bin/python ]]; then
+  check_python=.venv/bin/python
+fi
+
+"$check_python" -m compileall -q src tests
+PYTHONPATH=src "$check_python" -m unittest discover -s tests -v
