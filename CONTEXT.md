@@ -16,6 +16,10 @@ _Avoid_: MVP, prototype, read-only release
 The single mounted directory containing one entry for every visible Immich asset. Version 1.0 has no album, person, favorite, or date-based views.
 _Avoid_: Timeline, virtual views
 
+**View**:
+A directory hierarchy that presents a selected set of assets. When one asset appears in several Views, every entry refers to the same file identity and original bytes.
+_Avoid_: Copy, duplicate library
+
 **Library name**:
 The stable filename assigned to one asset in the Flat library. The first deterministic occurrence keeps its sanitized original filename; a collision adds the complete asset ID before the extension.
 _Avoid_: Original filename, server path
@@ -32,6 +36,10 @@ _Avoid_: Delete, trash
 Creating a new Immich asset from a new file written to the Flat library. Upload never replaces an existing asset.
 _Avoid_: Update, overwrite, synchronization
 
+**Asset replacement**:
+A future operation that creates a new Immich asset from changed bytes and resolves the old asset separately. Immich On-Demand never overwrites an original in place.
+_Avoid_: Update, overwrite, synchronization
+
 **Remote deletion**:
 Moving an Immich asset to Immich trash after the user has explicitly enabled destructive operations. It never means Eviction.
 _Avoid_: Free up space, eviction
@@ -39,6 +47,18 @@ _Avoid_: Free up space, eviction
 **Preview**:
 An Immich-generated thumbnail displayed without Hydrating the asset. Version 1.0 promises Previews only for its small common-media allowlist.
 _Avoid_: Original, hydration
+
+**Pin**:
+A local instruction to keep an asset's original Hydrated and exempt from Eviction. A Pin does not change Immich metadata.
+_Avoid_: Favorite, download
+
+**Favorite**:
+Immich metadata that marks an asset for the user's Favorite View. A Favorite does not keep the original Hydrated.
+_Avoid_: Pin, starred local file
+
+**Profile**:
+One Immich server, one authenticated Immich user, one mount, and their local state. Version 1.0 supports one Profile.
+_Avoid_: Account, instance
 
 **Protected library**:
 Every Immich asset that existed before mutation testing began. Tests may read these assets but must never change or delete them.

@@ -31,10 +31,11 @@ Ship a personal 1.0 Arch package for the Reference system. Its Flat library prev
 - [Choose the cache policy](issues/11-choose-the-cache-policy.md): use explicit access time, LRU age/size/free-space limits, atomic complete files, and busy-asset exclusion.
 - [Set the component boundaries](issues/12-set-the-component-boundaries.md): keep policy in the library and service while FUSE, CLI, control, catalog, cache, and Preview modules stay narrow.
 - Reference-system acceptance on 2026-08-25: Nautilus followed its saved sort with zero browsing Hydration; explicit image and video opens hydrated once; one isolated fixture passed upload, byte-for-byte readback, and guarded trash.
+- Release cut on 2026-08-25: the public `v1.0.0` tag, verified wheel, pinned Arch source checksum, package install, systemd user service, and mounted status all passed.
 
-## Not yet specified
+## Result
 
-- Release cut: replace the Arch source checksum, build and install the tagged package, and verify install, upgrade, service restart, and uninstall on the Reference system.
+Version 1.0.0 is released. The [post-1.0 map](../immich-on-demand-post-1-0/map.md) owns every deferred feature below.
 
 ## Out of scope
 

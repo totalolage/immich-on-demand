@@ -154,9 +154,11 @@ scripts/check
 
 ## Future work
 
-Version 1.0 does not publish to the AUR. AUR publication is a later release task.
+Version 1.0 is available on GitHub but is not published to the AUR.
 
 Albums, people, dates, and other views are also deferred. A future version may expose paths such as `{Albums,People,All,by Date}/asset.ext` and hardlink repeated views of the same asset.
+
+The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) tracks AUR publication, Pinning, desktop controls, offline behavior, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
 
 ## License
 

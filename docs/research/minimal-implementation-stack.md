@@ -1,6 +1,6 @@
 # Minimal implementation stack
 
-- Status: recommendation
+- Status: implemented; the Nautilus adapter recommendation was superseded by [ADR 0002](../adr/0002-populate-the-freedesktop-thumbnail-cache.md)
 - Researched: 2026-08-25
 - Scope: the Arch Linux, FUSE 3, Nautilus 50 target in the [problem statement](../../PROBLEM_STATEMENT.md)
 
@@ -16,15 +16,13 @@ Build 1.0 as one Python 3 package:
 | Catalog | Python's `sqlite3` module and the system SQLite library |
 | Secrets | SecretStorage against the user's Secret Service provider |
 | Local IPC | newline-delimited JSON over an `AF_UNIX` socket in `$XDG_RUNTIME_DIR` |
-| Nautilus | a thin nautilus-python 4 provider using PyGObject |
+| Nautilus | direct FreeDesktop thumbnail-cache integration using PyGObject |
 | Service | one systemd user service |
 | Package | a Flit Core wheel plus one Arch `PKGBUILD` |
 
 This is the least-code credible stack. The FUSE daemon, settings service, CLI,
-and Nautilus extension can share Python domain code. The daemon adds three
-application-level runtime dependencies: `python-pyfuse3`, `python-httpx`, and
-`python-secretstorage`. Desktop integration adds `nautilus-python`. Arch packages
-all four.
+and Preview integration share Python domain code. Arch supplies pyfuse3, HTTPX,
+Pillow, PyGObject, SecretStorage, and Trio.
 
 Do not add an ORM, a web server, a D-Bus service, a plugin framework, a second
 daemon language, or a GUI toolkit for 1.0. The CLI calls the settings service as
@@ -137,23 +135,11 @@ independently installed third-party clients need discovery or bus activation.
 
 ### Nautilus
 
-Use a small nautilus-python provider rather than a compiled Nautilus extension.
-The current API lets one Python class implement `InfoProvider`, `MenuProvider`,
-`ColumnProvider`, and `PropertiesModelProvider`
-([reference](https://gnome.pages.gitlab.gnome.org/nautilus-python/)). An
-`InfoProvider` can add emblems and string attributes, and a `MenuProvider` can
-add file and folder actions
-([FileInfo](https://gnome.pages.gitlab.gnome.org/nautilus-python/class-nautilus-python-file-info.html),
-[MenuProvider](https://gnome.pages.gitlab.gnome.org/nautilus-python/class-nautilus-python-menu-provider.html)).
-The extension identifies only files in this mount and sends bounded control
-requests. It does not import or run the daemon.
-
-Arch ships
-[`nautilus-python`](https://archlinux.org/packages/extra/x86_64/nautilus-python/)
-4.1.0 with dependencies on Nautilus, Python, and PyGObject. This stack choice
-does not decide the thumbnail mechanism: current nautilus-python exposes info,
-menu, column, and properties providers, not a thumbnail-provider interface.
-That decision remains with the dedicated Nautilus-thumbnail investigation.
+Write Preview and failure records directly to the FreeDesktop thumbnail cache.
+Nautilus-python exposes info, menu, column, and properties providers, but it has
+no thumbnail-provider interface. Keep nautilus-python for later mount-scoped
+actions and emblems. The [thumbnail-route research](nautilus-50-thumbnail-route.md)
+and [ADR 0002](../adr/0002-populate-the-freedesktop-thumbnail-cache.md) record the final decision.
 
 ### Arch packaging and service lifecycle
 
@@ -165,9 +151,8 @@ ships
 in `extra`. Follow Arch's
 [`python-build` and `python-installer` wheel pattern](https://wiki.archlinux.org/title/Python_package_guidelines).
 Set the project to `arch=('any')`. Arch owns the architecture-specific pyfuse3
-extension. Install the systemd user unit and Nautilus extension as plain data
-files from the `PKGBUILD`. The Python build backend does not need to know about
-system paths.
+extension. Install the systemd user unit as a plain data file from the
+`PKGBUILD`. The Python build backend does not need to know about system paths.
 
 Run the foreground process under the user manager. A systemd
 service unit directly supervises a process, and systemd recommends `Type=exec`
@@ -182,8 +167,10 @@ depends=(
 	python
 	python-pyfuse3
 	python-httpx
+	python-pillow
+	python-gobject
 	python-secretstorage
-	nautilus-python
+	python-trio
 	org.freedesktop.secrets
 )
 ```
@@ -194,10 +181,9 @@ Expected build dependencies are:
 makedepends=(python-build python-installer python-flit-core)
 ```
 
-`fuse3`, Trio, PyGObject, Nautilus, and SecretStorage's D-Bus and cryptographic
-libraries arrive through those packages. Pin application compatibility in
-project tests, but let pacman resolve the distribution packages. Do not vendor
-them into the release.
+`fuse3` and SecretStorage's D-Bus and cryptographic libraries arrive through
+those packages. Pin application compatibility in project tests, but let pacman
+resolve the distribution packages. Do not vendor them into the release.
 
 ## Alternatives considered
 
