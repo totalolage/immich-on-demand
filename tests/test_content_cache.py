@@ -209,6 +209,87 @@ class ContentCacheTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_metadata_change_cannot_replace_bytes_held_by_an_open_handle(self) -> None:
+        original = b"old bytes"
+        changed = b"new bytes"
+
+        async def scenario(root: Path) -> None:
+            client = Client([original])
+            cache = ContentCache(root, client)  # type: ignore[arg-type]
+            old_asset = asset(original)
+            path = await cache.hydrate(old_asset)
+            cache.acquire(old_asset.id)
+            client.chunks = [changed]
+            new_asset = asset(changed)
+
+            with self.assertRaises(CacheBusyError):
+                await cache.hydrate(new_asset)
+
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(await cache.read(old_asset, 0, len(original)), original)
+            self.assertEqual(client.calls, 1)
+
+            cache.release(old_asset.id)
+            self.assertFalse(path.exists())
+            self.assertEqual(
+                await cache.read(new_asset, 0, len(changed)),
+                changed,
+            )
+            self.assertEqual(client.calls, 2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_old_handle_reads_during_new_metadata_validation(self) -> None:
+        original = b"old bytes"
+        changed = b"new bytes"
+
+        async def scenario(root: Path) -> None:
+            client = Client([original])
+            cache = ContentCache(root, client)  # type: ignore[arg-type]
+            old_asset = asset(original)
+            await cache.hydrate(old_asset)
+            cache.acquire(old_asset.id)
+            started = trio.Event()
+            proceed = trio.Event()
+            results: list[bytes] = []
+            errors: dict[str, BaseException] = {}
+
+            async def blocked_hash(function, *args, **kwargs):
+                started.set()
+                await proceed.wait()
+                return function(*args, **kwargs)
+
+            async def hydrate_new() -> None:
+                try:
+                    await cache.hydrate(asset(changed))
+                except BaseException as error:
+                    errors["new"] = error
+
+            async def read_old() -> None:
+                try:
+                    results.append(await cache.read(old_asset, 0, len(original)))
+                except BaseException as error:
+                    errors["old"] = error
+
+            with patch(
+                "immich_on_demand.content_cache.trio.to_thread.run_sync", blocked_hash
+            ):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(hydrate_new)
+                    await started.wait()
+                    nursery.start_soon(read_old)
+                    await trio.lowlevel.checkpoint()
+                    proceed.set()
+
+            self.assertIsInstance(errors.get("new"), CacheBusyError)
+            self.assertNotIn("old", errors)
+            self.assertEqual(results, [original])
+            cache.release(old_asset.id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_unchanged_managed_asset_is_not_rehashed_on_each_open(self) -> None:
         content = b"trusted original"
 

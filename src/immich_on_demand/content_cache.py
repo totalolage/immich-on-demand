@@ -74,6 +74,7 @@ class ContentCache:
         self._reservations: dict[str, int] = {}
         self._written: dict[str, int] = {}
         self._validated: dict[str, _Validation] = {}
+        self._pending_discards: set[str] = set()
 
     def acquire(self, asset_id: str) -> None:
         UUID(asset_id)
@@ -85,6 +86,8 @@ class ContentCache:
             raise CacheError(f"asset {asset_id} is not open")
         if count == 1:
             del self._open[asset_id]
+            if asset_id in self._pending_discards:
+                self._discard(asset_id, self.root / asset_id)
         else:
             self._open[asset_id] = count - 1
 
@@ -93,6 +96,11 @@ class ContentCache:
         if hydration is not None:
             await hydration.done.wait()
             if hydration.error is not None:
+                if isinstance(hydration.error, CacheBusyError):
+                    path = await self._cached_path(asset)
+                    if path is not None:
+                        self._touch(path, asset)
+                        return path
                 raise CacheError(f"shared hydration of {asset.id} failed") from hydration.error
             path = await self._cached_path(asset)
             if path is None:
@@ -336,7 +344,11 @@ class ContentCache:
         return int(parsed.timestamp() * 1_000_000_000)
 
     def _discard(self, asset_id: str, path: Path) -> None:
+        if self._open.get(asset_id, 0) > 0:
+            self._pending_discards.add(asset_id)
+            raise CacheBusyError(f"asset {asset_id} changed while open")
         path.unlink(missing_ok=True)
+        self._pending_discards.discard(asset_id)
         self._validated.pop(asset_id, None)
 
     def _busy(self, asset_id: str) -> bool:
