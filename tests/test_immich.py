@@ -31,6 +31,30 @@ def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
 
 
 class ImmichClientTest(unittest.TestCase):
+    def test_thumbnail_stream_stops_at_the_memory_limit(self) -> None:
+        class Oversized(httpx.AsyncByteStream):
+            chunks = 0
+
+            async def __aiter__(self):
+                for _ in range(10_000):
+                    self.chunks += 1
+                    yield b"x" * 4096
+
+        stream = Oversized()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=stream)
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                with self.assertRaisesRegex(ImmichError, "exceeds 32 MiB"):
+                    await client.thumbnail(ASSET_ID)
+
+        trio.run(scenario)
+        self.assertEqual(stream.chunks, 8193)
+
     def test_rejects_a_cross_origin_discovery_endpoint(self) -> None:
         seen: list[str] = []
 

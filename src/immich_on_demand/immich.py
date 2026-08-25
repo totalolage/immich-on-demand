@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import base64
@@ -70,6 +70,11 @@ class ImmichClient:
     async def _request(self, method: str, path: str, **kwargs: object) -> httpx.Response:
         url = urljoin(self._api_root, path.lstrip("/"))
         response = await self._http.request(method, url, **kwargs)
+        self._raise_for_status(response, method, path)
+        return response
+
+    @staticmethod
+    def _raise_for_status(response: httpx.Response, method: str, path: str) -> None:
         LOGGER.info("Immich %s %s -> %s", method, path, response.status_code)
         try:
             response.raise_for_status()
@@ -78,7 +83,6 @@ class ImmichClient:
             raise ImmichError(
                 f"Immich {method} {path} failed with {response.status_code}; correlation {correlation}"
             ) from error
-        return response
 
     async def _json(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
         response = await self._request(method, path, **kwargs)
@@ -161,12 +165,24 @@ class ImmichClient:
 
     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
         UUID(asset_id)
-        response = await self._request(
-            "GET", f"assets/{asset_id}/thumbnail", params={"size": "preview", "edited": "false"}
-        )
-        if len(response.content) > 32 * 1024**2:
-            raise ImmichError("Immich preview exceeds 32 MiB")
-        return response.content, response.headers.get("content-type", "application/octet-stream")
+        path = f"assets/{asset_id}/thumbnail"
+        url = urljoin(self._api_root, path)
+        preview = bytearray()
+        async with self._http.stream(
+            "GET",
+            url,
+            params={"size": "preview", "edited": "false"},
+            headers={"accept-encoding": "identity"},
+        ) as response:
+            self._raise_for_status(response, "GET", path)
+            if response.headers.get("content-encoding", "identity") != "identity":
+                raise ImmichError("Immich preview ignored identity content encoding")
+            async with aclosing(response.aiter_raw()) as chunks:
+                async for chunk in chunks:
+                    if len(preview) + len(chunk) > 32 * 1024**2:
+                        raise ImmichError("Immich preview exceeds 32 MiB")
+                    preview.extend(chunk)
+        return bytes(preview), response.headers.get("content-type", "application/octet-stream")
 
     async def asset(self, asset_id: str) -> Asset:
         UUID(asset_id)
@@ -229,13 +245,7 @@ class ImmichClient:
         UUID(asset_id)
         url = urljoin(self._api_root, f"assets/{asset_id}/original")
         async with self._http.stream("GET", url, params={"edited": "false"}) as response:
-            LOGGER.info("Immich GET original %s -> %s", asset_id, response.status_code)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                raise ImmichError(
-                    f"Immich original download failed with {response.status_code}"
-                ) from error
+            self._raise_for_status(response, "GET", f"assets/{asset_id}/original")
             yield response
 
 
