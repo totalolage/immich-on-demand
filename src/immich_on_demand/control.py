@@ -98,20 +98,35 @@ def _decode_json(data: bytes) -> Any:
 
 
 def _has_secret_field(value: Any) -> bool:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            normalized = "".join(character for character in str(key).lower() if character.isalnum())
-            if any(normalized.endswith(field) for field in _SECRET_FIELDS) or _has_secret_field(item):
-                return True
-    elif isinstance(value, (list, tuple)):
-        return any(_has_secret_field(item) for item in value)
+    pending = [value]
+    visited = 0
+    while pending:
+        visited += 1
+        if visited > MAX_MESSAGE_BYTES:
+            raise ValueError("message structure is too complex")
+        item = pending.pop()
+        if isinstance(item, dict):
+            for key, child in item.items():
+                normalized = "".join(
+                    character for character in str(key).lower() if character.isalnum()
+                )
+                if any(normalized.endswith(field) for field in _SECRET_FIELDS):
+                    return True
+                pending.append(child)
+                if visited + len(pending) > MAX_MESSAGE_BYTES:
+                    raise ValueError("message structure is too complex")
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                pending.append(child)
+                if visited + len(pending) > MAX_MESSAGE_BYTES:
+                    raise ValueError("message structure is too complex")
     return False
 
 
 def _parse_request(data: bytes) -> tuple[int, str, dict[str, Any]]:
     try:
         request = _decode_json(data)
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError) as error:
         raise _RequestError("malformed request") from error
     if not isinstance(request, dict):
         raise _RequestError("request must be an object")
@@ -127,8 +142,11 @@ def _parse_request(data: bytes) -> tuple[int, str, dict[str, Any]]:
         raise _RequestError("unknown method", request_id)
     if not isinstance(params, dict):
         raise _RequestError("params must be an object", request_id)
-    if _has_secret_field(params):
-        raise _RequestError("secret fields are forbidden", request_id)
+    try:
+        if _has_secret_field(params):
+            raise _RequestError("secret fields are forbidden", request_id)
+    except ValueError as error:
+        raise _RequestError("request structure is too complex", request_id) from error
     return request_id, method, params
 
 
@@ -137,7 +155,7 @@ def _encode_response(response: dict[str, Any]) -> bytes:
         data = json.dumps(
             response, allow_nan=False, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8") + b"\n"
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RecursionError) as error:
         raise _RequestError("result is not JSON serializable", response.get("id")) from error
     if len(data) > MAX_MESSAGE_BYTES:
         raise _RequestError("response too large", response.get("id"))
@@ -203,8 +221,21 @@ async def _handle_connection(
         except Exception:
             await _send(stream, {"id": request_id, "error": "request failed"}, timeout)
             return
-        if _has_secret_field(result):
-            await _send(stream, {"id": request_id, "error": "handler returned forbidden fields"}, timeout)
+        try:
+            contains_secret = _has_secret_field(result)
+        except ValueError:
+            await _send(
+                stream,
+                {"id": request_id, "error": "handler result is too complex"},
+                timeout,
+            )
+            return
+        if contains_secret:
+            await _send(
+                stream,
+                {"id": request_id, "error": "handler returned forbidden fields"},
+                timeout,
+            )
             return
         await _send(stream, {"id": request_id, "result": result}, timeout)
     except (trio.BrokenResourceError, trio.ClosedResourceError, OSError):
@@ -269,14 +300,28 @@ async def send_request(
                 response = _decode_json(await _read_line(stream))
     except trio.TooSlowError as error:
         raise ControlError("control request timed out") from error
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError, _RequestError) as error:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+        RecursionError,
+        _RequestError,
+    ) as error:
         raise ControlError("invalid control response") from error
 
-    if not isinstance(response, dict) or response.get("id") != request_id:
+    if (
+        not isinstance(response, dict)
+        or type(response.get("id")) is not int
+        or response["id"] != request_id
+    ):
         raise ControlError("control response id does not match")
     if set(response) == {"id", "result"}:
-        if _has_secret_field(response["result"]):
-            raise ControlError("control response contains forbidden fields")
+        try:
+            if _has_secret_field(response["result"]):
+                raise ControlError("control response contains forbidden fields")
+        except ValueError as error:
+            raise ControlError("control response is too complex") from error
         return response["result"]
     if set(response) == {"id", "error"} and isinstance(response["error"], str):
         raise ControlError(response["error"][:256])

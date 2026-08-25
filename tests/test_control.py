@@ -5,6 +5,7 @@ import socket
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 import trio
 
@@ -89,6 +90,98 @@ class ControlTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory) / "runtime" / "control.sock")
+
+    def test_deep_request_and_result_do_not_stop_the_server(self) -> None:
+        deep_request_value = b"[" * 10_000 + b"null" + b"]" * 10_000
+        deep_result: object = None
+        for _ in range(MAX_MESSAGE_BYTES + 1):
+            deep_result = [deep_result]
+
+        async def status(params: dict[str, object]) -> object:
+            return deep_result
+
+        async def refresh(params: dict[str, object]) -> object:
+            return {"refreshed": True}
+
+        async def scenario(path: Path) -> None:
+            async with trio.open_nursery() as nursery:
+                await nursery.start(
+                    serve_control, path, {"status": status, "refresh": refresh}
+                )
+                request = (
+                    b'{"id":1,"method":"refresh","params":{"value":'
+                    + deep_request_value
+                    + b"}}\n"
+                )
+                response, _ = await _raw_request(path, request)
+                self.assertIn(
+                    response,
+                    (
+                        {"id": 1, "result": {"refreshed": True}},
+                        {"id": None, "error": "malformed request"},
+                    ),
+                )
+                with self.assertRaisesRegex(ControlError, "handler result is too complex"):
+                    await send_request(path, 2, "status", {})
+                self.assertEqual(
+                    await send_request(path, 3, "refresh", {}), {"refreshed": True}
+                )
+                nursery.cancel_scope.cancel()
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory) / "runtime" / "control.sock")
+
+    def test_decoder_recursion_is_a_bounded_request_error(self) -> None:
+        async def status(params: dict[str, object]) -> object:
+            return {"mounted": True}
+
+        async def scenario(path: Path) -> None:
+            async with trio.open_nursery() as nursery:
+                await nursery.start(serve_control, path, {"status": status})
+                with mock.patch(
+                    "immich_on_demand.control._decode_json",
+                    side_effect=RecursionError,
+                ):
+                    response, _ = await _raw_request(
+                        path, b'{"id":1,"method":"status","params":{}}\n'
+                    )
+                self.assertEqual(response, {"id": None, "error": "malformed request"})
+                self.assertEqual(
+                    await send_request(path, 2, "status", {}), {"mounted": True}
+                )
+                nursery.cancel_scope.cancel()
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory) / "runtime" / "control.sock")
+
+    def test_rejects_boolean_response_id(self) -> None:
+        async def fake_server(
+            path: Path,
+            *,
+            task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
+        ) -> None:
+            raw = trio.socket.socket(trio.socket.AF_UNIX, trio.socket.SOCK_STREAM)
+            try:
+                await raw.bind(str(path))
+                raw.listen()
+                task_status.started()
+                connection, _ = await raw.accept()
+                stream = trio.SocketStream(connection)
+                async with stream:
+                    await stream.receive_some(MAX_MESSAGE_BYTES)
+                    await stream.send_all(b'{"id":true,"result":{}}\n')
+            finally:
+                raw.close()
+                path.unlink(missing_ok=True)
+
+        async def scenario(path: Path) -> None:
+            async with trio.open_nursery() as nursery:
+                await nursery.start(fake_server, path)
+                with self.assertRaisesRegex(ControlError, "id does not match"):
+                    await send_request(path, 1, "status", {})
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory) / "control.sock")
 
     def test_bounds_failures_without_leaking_handler_secrets(self) -> None:
         async def broken(params: dict[str, object]) -> object:
