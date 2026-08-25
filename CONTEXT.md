@@ -16,6 +16,10 @@ _Avoid_: MVP, prototype, read-only release
 The single mounted directory containing one entry for every visible Immich asset. Version 1.0 has no album, person, favorite, or date-based views.
 _Avoid_: Timeline, virtual views
 
+**Library name**:
+The stable filename assigned to one asset in the Flat library. The first deterministic occurrence keeps its sanitized original filename; a collision adds the complete asset ID before the extension.
+_Avoid_: Original filename, server path
+
 **Hydration**:
 Downloading an asset's original content when an application first reads its Library entry.
 _Avoid_: Preview, synchronization

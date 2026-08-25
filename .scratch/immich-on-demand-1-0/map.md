@@ -22,6 +22,8 @@ Ship a personal 1.0 Arch package for the Reference system. Its Flat library prev
 - [Compare the minimal implementation stacks](issues/03-compare-minimal-implementation-stacks.md): one Python package covers the whole Reference system with the least project code.
 - [Provision read-only live-test access](issues/04-provision-isolated-live-test-access.md): the verified read-only key lives in Secret Service and exposes no mutation permission.
 - [Choose the implementation stack](issues/06-choose-the-implementation-stack.md): adopt Python, pyfuse3 with Trio, HTTPX, stdlib SQLite, SecretStorage, Unix-socket control, and nautilus-python.
+- [Inventory the real library shape](issues/05-inventory-the-real-library-shape.md): 11,237 visible entries include 1,892 duplicate-name groups, while every visible asset has byte-size metadata.
+- [Define Flat library names](issues/07-define-flat-library-names.md): preserve the first safe original basename and suffix collisions with the complete asset ID.
 
 ## Not yet specified
 
