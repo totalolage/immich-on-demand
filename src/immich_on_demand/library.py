@@ -66,6 +66,8 @@ class Library:
         mutation, session = self._mutation_access()
 
         result = await mutation.upload(staged_path, session.media_types)
+        if not result.created:
+            raise FileExistsError("Immich already contains an asset with identical content")
         uploaded = await self._read_client.asset(result.asset_id)
         if uploaded.owner_id != session.owner_id:
             raise LibraryError("uploaded asset is not owned by the mutation user")

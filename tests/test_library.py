@@ -61,8 +61,9 @@ class ReadClient:
 
 
 class MutationClient:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, *, created: bool = True) -> None:
         self.error = error
+        self.created = created
         self.uploads = 0
         self.trashes: list[tuple[str, bool]] = []
         self.on_upload = lambda: None
@@ -72,7 +73,7 @@ class MutationClient:
         self.on_upload()
         if self.error is not None:
             raise self.error
-        return UploadResult(ASSET_ID, True)
+        return UploadResult(ASSET_ID, self.created)
 
     async def trash(self, asset_id: str, *, trash_enabled: bool) -> None:
         if self.error is not None:
@@ -209,6 +210,28 @@ class LibraryTest(unittest.TestCase):
                 self.assertEqual(mutation.uploads, 0)
                 with self.assertRaises(LibraryError):
                     await library(catalog, root).upload_new(staged, "free.jpg")
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_duplicate_upload_keeps_recovery_file_out_of_the_catalog(self) -> None:
+        async def scenario(root: Path) -> None:
+            staged = root / "duplicate.jpg"
+            staged.write_bytes(b"same bytes")
+            with Catalog(root / "catalog.db") as catalog:
+                mutation = MutationClient(created=False)
+                read = ReadClient(asset())
+                with self.assertRaisesRegex(FileExistsError, "identical content"):
+                    await library(
+                        catalog,
+                        root,
+                        read=read,
+                        mutation=mutation,
+                        mutation_session=session(),
+                    ).upload_new(staged, "duplicate.jpg")
+
+                self.assertEqual(catalog.list_visible(), [])
+                self.assertEqual(staged.read_bytes(), b"same bytes")
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
