@@ -469,6 +469,58 @@ class FilesystemTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_failed_writes_stay_failed_and_retain_recovery_bytes(self) -> None:
+        real_pwrite = os.pwrite
+
+        def no_space(descriptor: int, data: bytes, offset: int) -> int:
+            raise OSError(errno.ENOSPC, "no space")
+
+        def short_write(descriptor: int, data: bytes, offset: int) -> int:
+            return real_pwrite(descriptor, data[:1], offset)
+
+        async def scenario(root: Path) -> None:
+            cases = (
+                ("exception.jpg", no_space, errno.ENOSPC, 3, b"abcXYZ"),
+                ("short.jpg", short_write, errno.EIO, 4, b"abcdXYZ"),
+            )
+            for name, failure, expected_errno, next_offset, expected_bytes in cases:
+                with self.subTest(name=name):
+                    library = FakeLibrary()
+                    recovery = root / name
+                    filesystem = ImmichFilesystem(library, recovery)  # type: ignore[arg-type]
+                    info, _ = await filesystem.create(
+                        pyfuse3.ROOT_INODE,
+                        name.encode(),
+                        0o600,
+                        os.O_WRONLY,
+                        None,  # type: ignore[arg-type]
+                    )
+                    await filesystem.write(info.fh, 0, b"abc")
+
+                    with patch(
+                        "immich_on_demand.filesystem.os.pwrite", side_effect=failure
+                    ):
+                        with self.assertRaises(pyfuse3.FUSEError) as failed:
+                            await filesystem.write(info.fh, 3, b"def")
+                    self.assertEqual(failed.exception.errno, expected_errno)
+
+                    await filesystem.write(info.fh, next_offset, b"XYZ")
+                    with self.assertRaises(pyfuse3.FUSEError) as sticky:
+                        await filesystem.flush(info.fh)
+                    self.assertEqual(sticky.exception.errno, expected_errno)
+
+                    with self.assertLogs(
+                        "immich_on_demand.filesystem", level="ERROR"
+                    ):
+                        with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                            await filesystem.release(info.fh)
+                    staged = next(recovery.rglob(name))
+                    self.assertEqual(staged.read_bytes(), expected_bytes)
+                    self.assertEqual(library.uploads, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_unlink_uses_remote_trash_guard_and_rejects_other_mutations(self) -> None:
         async def scenario(root: Path) -> None:
             library = FakeLibrary()

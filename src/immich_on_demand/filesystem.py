@@ -360,10 +360,11 @@ class ImmichFilesystem(pyfuse3.Operations):
                 offset = os.fstat(staged.descriptor).st_size if staged_handle.append else off
                 written = os.pwrite(staged.descriptor, buf, offset)
             except OSError as error:
-                raise pyfuse3.FUSEError(error.errno or errno.EIO) from error
+                staged.failure_errno = error.errno or errno.EIO
+                raise pyfuse3.FUSEError(staged.failure_errno) from error
             if written != len(buf):
+                staged.failure_errno = errno.EIO
                 raise pyfuse3.FUSEError(errno.EIO)
-            staged.failure_errno = None
             return written
 
     async def flush(self, fh: int) -> None:
