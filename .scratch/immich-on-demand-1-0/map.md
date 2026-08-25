@@ -17,11 +17,18 @@ Ship a personal 1.0 Arch package for the Reference system. Its Flat library prev
 
 ## Decisions so far
 
+- [Establish the Immich 3.0.3 API contract](issues/01-establish-immich-api-contract.md): use stable REST routes with scoped keys, complete originals, checksum-safe uploads, and trash-only deletion.
+- [Find the Nautilus 50 thumbnail route](issues/02-find-nautilus-thumbnail-route.md): populate the global FreeDesktop cache and suppress unsafe fallbacks per mounted URI.
+- [Compare the minimal implementation stacks](issues/03-compare-minimal-implementation-stacks.md): one Python package covers the whole Reference system with the least project code.
+- [Provision read-only live-test access](issues/04-provision-isolated-live-test-access.md): the verified read-only key lives in Secret Service and exposes no mutation permission.
+- [Choose the implementation stack](issues/06-choose-the-implementation-stack.md): adopt Python, pyfuse3 with Trio, HTTPX, stdlib SQLite, SecretStorage, Unix-socket control, and nautilus-python.
+
 ## Not yet specified
 
 - The exact MVP and 1.0 implementation sequence after the stack and component boundaries are chosen.
 - Catalog refresh, reconciliation, and persistence after the Immich API contract and real library shape are known.
 - Upload recovery and Remote deletion safeguards after mutation semantics are fixed.
+- Mutation credentials and Test assets after the deletion guard can restrict destructive tests to recorded asset IDs.
 - The control API shape after process ownership is decided.
 - Automated verification, migration, packaging, and release work after the architecture is proved.
 
