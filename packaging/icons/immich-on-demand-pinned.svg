@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Immich On-Demand pinned</title>
+  <circle cx="32" cy="32" r="29" fill="#b86b00"/>
+  <path d="m23 13 18 8-6 9 7 8-12 3-7 14-2-16-8-7 11-4z" fill="#fff" stroke="#fff" stroke-width="2" stroke-linejoin="round"/>
+</svg>

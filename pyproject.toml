@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 immich-on-demand = "immich_on_demand.cli:main"
+immich-on-demand-desktop = "immich_on_demand.desktop_app:main"
 
 [project.urls]
 Repository = "https://github.com/totalolage/immich-on-demand"

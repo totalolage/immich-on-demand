@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Immich On-Demand
+Comment=Configure and control the Immich On-Demand filesystem
+Exec=immich-on-demand-desktop
+TryExec=immich-on-demand-desktop
+Icon=immich-on-demand
+Terminal=false
+Categories=Settings;Utility;
+Keywords=Immich;Photos;Filesystem;
+StartupNotify=true
