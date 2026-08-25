@@ -80,3 +80,31 @@ class CatalogTest(unittest.TestCase):
                 self.assertEqual(stats.missing_size, 1)
                 self.assertEqual(stats.trashed, 1)
                 self.assertEqual(stats.hidden, 1)
+
+    def test_uploaded_asset_gets_stable_inode_and_deterministic_collision_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh()
+
+                added = catalog.add_uploaded(asset(OTHER_ID), "photo.jpg")
+                refreshed = catalog.add_uploaded(
+                    replace(asset(OTHER_ID), modified_ns=99), "ignored.jpg"
+                )
+
+                self.assertEqual(added.name, f"photo__{OTHER_ID}.jpg")
+                self.assertEqual((added.inode, added.name), (refreshed.inode, refreshed.name))
+                self.assertEqual(refreshed.asset.modified_ns, 99)
+
+    def test_marks_only_a_known_asset_trashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                entry = catalog.add_uploaded(asset(), "photo.jpg")
+                catalog.mark_trashed(entry.asset.id)
+
+                self.assertEqual(catalog.list_visible(), [])
+                trashed = catalog.by_inode(entry.inode)
+                self.assertTrue(trashed and trashed.asset.is_trashed)
+                with self.assertRaises(KeyError):
+                    catalog.mark_trashed(OTHER_ID)

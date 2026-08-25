@@ -199,6 +199,59 @@ class Catalog:
         row = self._connection.execute("SELECT * FROM assets WHERE name = ?", (name,)).fetchone()
         return self._catalog_asset(row) if row else None
 
+    def add_uploaded(self, asset: Asset, requested_name: str) -> CatalogAsset:
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT inode, name FROM assets WHERE id = ?", (asset.id,)
+            ).fetchone()
+            if row:
+                inode, name = row["inode"], row["name"]
+            else:
+                inode = self._connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'next_inode'"
+                ).fetchone()[0]
+                self._connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = 'next_inode'", (inode + 1,)
+                )
+                name = safe_filename(requested_name, asset.id)
+                if self.by_name(name) is not None:
+                    name = collision_name(name, asset.id)
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    asset.id,
+                    inode,
+                    name,
+                    asset.owner_id,
+                    asset.original_name,
+                    asset.mime_type,
+                    asset.size,
+                    asset.created_ns,
+                    asset.modified_ns,
+                    asset.updated_at,
+                    asset.checksum,
+                    asset.visibility,
+                    asset.is_trashed,
+                    asset.is_offline,
+                    asset.library_id,
+                ),
+            )
+            inserted = self._connection.execute(
+                "SELECT * FROM assets WHERE id = ?", (asset.id,)
+            ).fetchone()
+        assert inserted is not None
+        return self._catalog_asset(inserted)
+
+    def mark_trashed(self, asset_id: str) -> None:
+        with self._connection:
+            updated = self._connection.execute(
+                "UPDATE assets SET is_trashed = 1 WHERE id = ?", (asset_id,)
+            )
+            if updated.rowcount != 1:
+                raise KeyError(asset_id)
+
     @staticmethod
     def _catalog_asset(row: sqlite3.Row) -> CatalogAsset:
         asset = Asset(
