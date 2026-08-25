@@ -18,7 +18,8 @@ from .model import Asset
 
 
 READ_PERMISSIONS = frozenset({"user.read", "asset.read", "asset.view", "asset.download"})
-MUTATION_PERMISSIONS = READ_PERMISSIONS | {"asset.upload", "asset.delete"}
+UPLOAD_PERMISSIONS = READ_PERMISSIONS | {"asset.upload"}
+MUTATION_PERMISSIONS = UPLOAD_PERMISSIONS | {"asset.delete"}
 LOGGER = logging.getLogger(__name__)
 
 
