@@ -79,7 +79,10 @@ Write the server URL, mount path, and default cache limits:
 ```bash
 immich-on-demand configure \
   --server https://photos.example.com \
-  --mount "$HOME/Photos"
+  --mount "$HOME/Photos" \
+  --cache-max-gib 10 \
+  --cache-max-age-days 30 \
+  --minimum-free-gib 5
 immich-on-demand auth-check
 immich-on-demand auth-check --mutation
 ```

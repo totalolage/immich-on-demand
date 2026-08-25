@@ -26,6 +26,13 @@ def _asset_id(value: str) -> str:
         raise argparse.ArgumentTypeError("asset must be a UUID") from error
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="immich-on-demand")
     result.add_argument("--version", action="version", version=__version__)
@@ -35,6 +42,9 @@ def parser() -> argparse.ArgumentParser:
     configure = commands.add_parser("configure", help="write non-secret settings")
     configure.add_argument("--server", required=True)
     configure.add_argument("--mount", required=True, type=Path)
+    configure.add_argument("--cache-max-gib", type=_positive_int, default=10)
+    configure.add_argument("--cache-max-age-days", type=_positive_int, default=30)
+    configure.add_argument("--minimum-free-gib", type=_positive_int, default=5)
     configure.add_argument("--enable-remote-delete", action="store_true")
 
     auth_check = commands.add_parser("auth-check", help="validate an API key")
@@ -55,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
                 Settings(
                     arguments.server,
                     arguments.mount.expanduser().resolve(),
+                    cache_max_bytes=arguments.cache_max_gib * 1024**3,
+                    cache_max_age_seconds=arguments.cache_max_age_days * 24 * 60 * 60,
+                    minimum_free_bytes=arguments.minimum_free_gib * 1024**3,
                     remote_delete=arguments.enable_remote_delete,
                 ),
                 arguments.config,

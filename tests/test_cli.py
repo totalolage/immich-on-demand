@@ -67,6 +67,12 @@ class CliTest(unittest.TestCase):
                         "https://photos.example.test",
                         "--mount",
                         str(mount),
+                        "--cache-max-gib",
+                        "20",
+                        "--cache-max-age-days",
+                        "7",
+                        "--minimum-free-gib",
+                        "3",
                         "--enable-remote-delete",
                     ]
                 )
@@ -74,8 +80,26 @@ class CliTest(unittest.TestCase):
             self.assertEqual(result, 0)
             value = json.loads(config.read_text())
             self.assertEqual(value["server_url"], "https://photos.example.test")
+            self.assertEqual(value["cache_max_bytes"], 20 * 1024**3)
+            self.assertEqual(value["cache_max_age_seconds"], 7 * 24 * 60 * 60)
+            self.assertEqual(value["minimum_free_bytes"], 3 * 1024**3)
             self.assertTrue(value["remote_delete"])
             self.assertNotIn("key", value)
+
+    def test_configure_rejects_non_positive_cache_limits(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
+            main(
+                [
+                    "configure",
+                    "--server",
+                    "https://photos.example.test",
+                    "--mount",
+                    "/Photos",
+                    "--cache-max-gib",
+                    "0",
+                ]
+            )
+        self.assertEqual(exit.exception.code, 2)
 
     def test_prints_flat_results_in_key_order(self) -> None:
         output = io.StringIO()
