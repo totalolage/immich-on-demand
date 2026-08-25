@@ -98,6 +98,8 @@ async def _refresh_worker(
         except Exception as error:
             LOGGER.warning("background cache eviction failed: %s", error)
         try:
+            # Keep this as the next Trio checkpoint: populate_previews installs every
+            # failure record synchronously before it starts any network work.
             await populate_previews(library.list(), read_client, settings.mount_path)
         except Exception as error:
             LOGGER.error("preview suppression failed; terminating mount: %s", error)

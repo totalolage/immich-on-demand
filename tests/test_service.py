@@ -388,6 +388,29 @@ class ServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_background_refresh_cannot_yield_before_preview_suppression(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(root, block_preview=False)
+            settings = Settings(
+                "https://photos.example.test", root / "mount", refresh_seconds=3600
+            )
+
+            async def observe_commit() -> None:
+                await fakes.second_refresh.wait()
+                self.assertEqual(fakes.events.count("suppress"), 2)
+                fakes.stop_main.set()
+
+            with fakes.patches():
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(observe_commit)
+                    await fakes.main_started.wait()
+                    refresh = fakes.handlers["refresh"]
+                    self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_upload_suppression_failure_terminates_and_fails_the_service(self) -> None:
         async def scenario(root: Path) -> None:
             fakes = ServiceFakes(root, block_preview=False)
