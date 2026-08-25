@@ -390,7 +390,8 @@ class ContentCache:
     def _reserve(self, asset: Asset) -> None:
         if asset.size is None:
             raise CacheIntegrityError(f"asset {asset.id} has no expected size")
-        if self.max_bytes is not None and asset.size > self.max_bytes:
+        pinned = asset.id in self._pinned
+        if not pinned and self.max_bytes is not None and asset.size > self.max_bytes:
             raise CacheCapacityError(f"asset {asset.id} exceeds cache capacity")
 
         reserved = sum(self._reservations.values())
@@ -405,7 +406,7 @@ class ContentCache:
         def fits(candidate_total: int, candidate_free: int) -> bool:
             return (
                 (
-                    self.max_bytes is None
+                    pinned or self.max_bytes is None
                     or candidate_total + reserved + asset.size <= self.max_bytes
                 )
                 and candidate_free - remaining - asset.size >= self.minimum_free_bytes

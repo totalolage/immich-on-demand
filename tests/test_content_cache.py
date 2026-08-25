@@ -190,6 +190,58 @@ class ContentCacheTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_pinned_hydration_bypasses_the_soft_size_target(self) -> None:
+        content = b"large"
+
+        async def scenario(root: Path) -> None:
+            existing = root / ASSET_ID
+            existing.write_bytes(b"keep")
+            client = Client([content])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=4,
+                pinned_ids={ASSET_ID},
+            )
+            cache.pin(OTHER_ID)
+
+            hydrated = await cache.hydrate(asset(content, OTHER_ID))
+
+            self.assertEqual(hydrated.read_bytes(), content)
+            self.assertTrue(existing.exists())
+            self.assertEqual(client.calls, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_pinned_hydration_still_respects_the_free_space_floor(self) -> None:
+        content = b"pin!"
+
+        async def scenario(root: Path) -> None:
+            client = Client([content])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=1,
+                minimum_free_bytes=3,
+            )
+            cache.pin(ASSET_ID)
+
+            with (
+                patch(
+                    "immich_on_demand.content_cache.shutil.disk_usage",
+                    return_value=SimpleNamespace(free=6),
+                ),
+                self.assertRaisesRegex(CacheError, "cache capacity"),
+            ):
+                await cache.hydrate(asset(content))
+
+            self.assertEqual(client.calls, 0)
+            self.assertFalse((root / ASSET_ID).exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_rejects_a_symlink_cache_root_without_touching_its_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
