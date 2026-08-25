@@ -8,7 +8,12 @@ import trio
 
 from . import __version__
 from .control import send_request
-from .immich import ImmichClient
+from .immich import (
+    ImmichClient,
+    MUTATION_PERMISSIONS,
+    READ_PERMISSIONS,
+    UPLOAD_PERMISSIONS,
+)
 from .settings import Settings, config_path, load, load_api_key, runtime_path, save
 
 
@@ -28,8 +33,10 @@ def parser() -> argparse.ArgumentParser:
     configure = commands.add_parser("configure", help="write non-secret settings")
     configure.add_argument("--server", required=True)
     configure.add_argument("--mount", required=True, type=Path)
+    configure.add_argument("--enable-remote-delete", action="store_true")
 
-    commands.add_parser("auth-check", help="validate the read-only key")
+    auth_check = commands.add_parser("auth-check", help="validate an API key")
+    auth_check.add_argument("--mutation", action="store_true")
     commands.add_parser("refresh", help="ask the running service to refresh")
     commands.add_parser("status", help="show local catalog counts")
     evict = commands.add_parser("evict", help="evict cached originals")
@@ -42,12 +49,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "configure":
             destination = save(
-                Settings(arguments.server, arguments.mount.expanduser().resolve()), arguments.config
+                Settings(
+                    arguments.server,
+                    arguments.mount.expanduser().resolve(),
+                    remote_delete=arguments.enable_remote_delete,
+                ),
+                arguments.config,
             )
             print(destination)
             return 0
         if arguments.command == "auth-check":
-            return trio.run(_auth_check, load(arguments.config))
+            return trio.run(_auth_check, load(arguments.config), arguments.mutation)
         if arguments.command in {"refresh", "status", "evict"}:
             params = (
                 {"asset": arguments.asset}
@@ -61,10 +73,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-async def _auth_check(settings: Settings) -> int:
-    async with ImmichClient(settings.server_url, load_api_key(settings)) as client:
-        session = await client.validate()
-    print(f"Immich {session.version}; read-only key verified")
+async def _auth_check(settings: Settings, mutation: bool) -> int:
+    purpose = "mutation" if mutation else "read-only"
+    permissions = READ_PERMISSIONS
+    if mutation:
+        permissions = MUTATION_PERMISSIONS if settings.remote_delete else UPLOAD_PERMISSIONS
+    async with ImmichClient(settings.server_url, load_api_key(settings, purpose)) as client:
+        session = await client.validate(permissions)
+    print(f"Immich {session.version}; {purpose} key verified")
     return 0
 
 
