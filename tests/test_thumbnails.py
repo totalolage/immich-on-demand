@@ -1,4 +1,5 @@
 from io import BytesIO
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -14,6 +15,7 @@ from immich_on_demand.thumbnails import (
     failed_thumbnail_path,
     install_failed_thumbnail,
     install_thumbnail,
+    prepare_thumbnail_cache,
     thumbnail_cache_path,
     thumbnail_is_current,
 )
@@ -26,6 +28,31 @@ def preview(width: int = 800, height: int = 400) -> bytes:
 
 
 class ThumbnailTest(unittest.TestCase):
+    def test_prepares_failure_before_removing_a_stale_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            source = root / "photo.jpg"
+            stale = install_thumbnail(
+                preview(), source, 1, 1, cache_home=cache, size="xx-large"
+            )
+            real_unlink = Path.unlink
+
+            def assert_suppressed(path: Path, *args: object, **kwargs: object) -> None:
+                if path == stale:
+                    self.assertTrue(
+                        failed_thumbnail_is_current(
+                            source, 2, 1, cache_home=cache
+                        )
+                    )
+                real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(Path, "unlink", assert_suppressed):
+                retained = prepare_thumbnail_cache(source, 2, 1, cache_home=cache)
+
+            self.assertFalse(retained)
+            self.assertFalse(stale.exists())
+
     def test_derives_canonical_uri_and_standard_cache_path(self) -> None:
         path = Path("/home/alice/Photos/../Photos/example one.jpg")
         uri = "file:///home/alice/Photos/example%20one.jpg"
@@ -137,6 +164,97 @@ class ThumbnailTest(unittest.TestCase):
                 return_value=thumbnail_root.stat().st_uid + 1,
             ), self.assertRaisesRegex(PermissionError, "thumbnail cache root"):
                 install_failed_thumbnail(root / "photo.jpg", 1, 1, cache_home=cache)
+
+    def test_reconciliation_rejects_a_symlinked_size_directory_without_touching_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            thumbnail_root = cache / "thumbnails"
+            thumbnail_root.mkdir(parents=True)
+            target = root / "target"
+            target.mkdir()
+            (thumbnail_root / "xx-large").symlink_to(target, target_is_directory=True)
+            source = root / "photo.jpg"
+            target_entry = target / thumbnail_cache_path(
+                source, cache, "xx-large"
+            ).name
+            target_entry.write_bytes(b"keep")
+
+            with self.assertRaisesRegex(PermissionError, "thumbnail cache directory"):
+                prepare_thumbnail_cache(source, 1, 1, cache_home=cache)
+
+            self.assertEqual(target_entry.read_bytes(), b"keep")
+
+    def test_reconciliation_refuses_a_foreign_owned_cache_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            source = root / "photo.jpg"
+            cached = install_thumbnail(
+                preview(), source, 1, 1, cache_home=cache, size="xx-large"
+            )
+            real_lstat = os.lstat
+
+            def foreign_entry(path: Path) -> os.stat_result:
+                info = real_lstat(path)
+                if Path(path) == cached:
+                    values = list(info)
+                    values[4] = info.st_uid + 1
+                    return os.stat_result(values)
+                return info
+
+            with patch(
+                "immich_on_demand.thumbnails.os.lstat", side_effect=foreign_entry
+            ), self.assertRaisesRegex(PermissionError, "thumbnail cache entry"):
+                prepare_thumbnail_cache(source, 1, 1, cache_home=cache)
+
+            self.assertTrue(cached.exists())
+
+    def test_reconciliation_tolerates_cleanup_during_entry_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            source = root / "photo.jpg"
+            cached = install_thumbnail(
+                preview(), source, 1, 1, cache_home=cache, size="xx-large"
+            )
+            real_lstat = os.lstat
+            candidate_checks = 0
+
+            def disappear(path: Path) -> os.stat_result:
+                nonlocal candidate_checks
+                if Path(path) == cached:
+                    candidate_checks += 1
+                    if candidate_checks == 2:
+                        cached.unlink()
+                return real_lstat(path)
+
+            with patch("immich_on_demand.thumbnails.os.lstat", side_effect=disappear):
+                self.assertFalse(
+                    prepare_thumbnail_cache(source, 1, 1, cache_home=cache)
+                )
+
+    def test_reconciliation_tolerates_cleanup_before_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            source = root / "photo.jpg"
+            cached = install_thumbnail(
+                preview(), source, 1, 1, cache_home=cache, size="xx-large"
+            )
+            real_unlink = Path.unlink
+
+            def disappear(path: Path, *args: object, **kwargs: object) -> None:
+                if path == cached:
+                    real_unlink(path)
+                real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(Path, "unlink", disappear):
+                self.assertFalse(
+                    prepare_thumbnail_cache(source, 1, 1, cache_home=cache)
+                )
 
     def test_recognizes_only_a_matching_cached_thumbnail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

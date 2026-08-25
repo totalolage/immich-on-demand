@@ -445,7 +445,7 @@ class ServiceTest(unittest.TestCase):
                     failures.append(error)
 
             with fakes.patches(), patch(
-                "immich_on_demand.service.install_failed_thumbnail",
+                "immich_on_demand.service.prepare_thumbnail_cache",
                 side_effect=OSError("thumbnail cache unavailable"),
             ):
                 async with trio.open_nursery() as nursery:
@@ -489,14 +489,21 @@ class ServiceTest(unittest.TestCase):
                 3,
                 "uploaded.jpg",
             )
-            installed: list[tuple[Path, int, int]] = []
+            prepared: list[tuple[Path, int, int, str | None]] = []
 
-            def install(source: Path, mtime: int, size: int) -> None:
-                installed.append((source, mtime, size))
+            def prepare(
+                source: Path,
+                mtime: int,
+                size: int,
+                *,
+                retain_size: str | None,
+            ) -> bool:
+                prepared.append((source, mtime, size, retain_size))
                 fakes.events.append("upload-suppressed")
+                return False
 
             with fakes.patches(), patch(
-                "immich_on_demand.service.install_failed_thumbnail", install
+                "immich_on_demand.service.prepare_thumbnail_cache", prepare
             ):
                 async with trio.open_nursery() as nursery:
                     nursery.start_soon(run_service, settings)
@@ -506,10 +513,10 @@ class ServiceTest(unittest.TestCase):
                     await on_uploaded(entry)
                     await on_uploaded(entry)
                     self.assertEqual(
-                        installed,
+                        prepared,
                         [
-                            (root / "mount" / "uploaded.jpg", 4, 123),
-                            (root / "mount" / "uploaded.jpg", 4, 123),
+                            (root / "mount" / "uploaded.jpg", 4, 123, None),
+                            (root / "mount" / "uploaded.jpg", 4, 123, None),
                         ],
                     )
                     self.assertEqual(fakes.events.count("refresh"), 1)

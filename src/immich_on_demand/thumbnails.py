@@ -94,6 +94,58 @@ def failed_thumbnail_is_current(
     return _png_metadata_matches(failed_thumbnail_path(source_path, cache_home), expected)
 
 
+def prepare_thumbnail_cache(
+    source_path: Path,
+    mtime: int,
+    original_size: int,
+    *,
+    cache_home: Path | None = None,
+    retain_size: str | None = "large",
+) -> bool:
+    """Suppress fallback reads, retaining only a current requested success."""
+    if retain_size is not None and retain_size not in THUMBNAIL_SIZES:
+        raise ValueError(f"unknown thumbnail size: {retain_size}")
+    if not failed_thumbnail_is_current(
+        source_path, mtime, original_size, cache_home=cache_home
+    ):
+        install_failed_thumbnail(
+            source_path, mtime, original_size, cache_home=cache_home
+        )
+    retained = False
+    for size in THUMBNAIL_SIZES:
+        candidate = thumbnail_cache_path(source_path, cache_home, size)
+        if not _owned_regular_cache_entry(candidate):
+            continue
+        if size == retain_size and thumbnail_is_current(
+            source_path,
+            mtime,
+            original_size,
+            cache_home=cache_home,
+            size=size,
+        ):
+            retained = True
+            continue
+        candidate.unlink(missing_ok=True)
+    return retained
+
+
+def _owned_regular_cache_entry(candidate: Path) -> bool:
+    try:
+        os.lstat(candidate)
+    except FileNotFoundError:
+        return False
+    _private_cache_directory(candidate)
+    try:
+        info = os.lstat(candidate)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise PermissionError(
+            "thumbnail cache entry must be a regular file owned by this user"
+        )
+    return True
+
+
 def _metadata(path: Path, mtime: int, original_size: int) -> PngImagePlugin.PngInfo:
     if type(mtime) is not int or type(original_size) is not int or mtime < 0 or original_size < 0:
         raise ValueError("thumbnail mtime and size must be non-negative integers")

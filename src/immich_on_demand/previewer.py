@@ -11,11 +11,8 @@ import trio
 from .catalog import CatalogAsset
 from .immich import ImmichClient
 from .thumbnails import (
-    failed_thumbnail_is_current,
-    failed_thumbnail_path,
-    install_failed_thumbnail,
     install_thumbnail,
-    thumbnail_is_current,
+    prepare_thumbnail_cache,
 )
 
 
@@ -40,7 +37,6 @@ async def populate_previews(
     *,
     cache_home: Path | None = None,
     concurrency: int = 4,
-    size: str = "large",
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> PreviewStats:
     """Suppress desktop fallbacks, then populate supported previews concurrently."""
@@ -51,24 +47,23 @@ async def populate_previews(
         raise ValueError("visible catalog entries must have a size")
 
     jobs: list[tuple[CatalogAsset, Path, int, int]] = []
-    current = 0
+    current_count = 0
     for entry in entries:
         source_path = mount_path / entry.name
         mtime = entry.asset.modified_ns // 1_000_000_000
         original_size = entry.asset.size
         assert original_size is not None
-        if entry.asset.mime_type.lower() in PREVIEW_MIME_TYPES and thumbnail_is_current(
-            source_path, mtime, original_size, cache_home=cache_home, size=size
-        ):
-            failed_thumbnail_path(source_path, cache_home).unlink(missing_ok=True)
-            current += 1
-            continue
         supported = entry.asset.mime_type.lower() in PREVIEW_MIME_TYPES
-        if not supported and failed_thumbnail_is_current(
-            source_path, mtime, original_size, cache_home=cache_home
-        ):
+        current_thumbnail = prepare_thumbnail_cache(
+            source_path,
+            mtime,
+            original_size,
+            cache_home=cache_home,
+            retain_size="large" if supported else None,
+        )
+        if current_thumbnail:
+            current_count += 1
             continue
-        install_failed_thumbnail(source_path, mtime, original_size, cache_home=cache_home)
         if supported:
             jobs.append((entry, source_path, mtime, original_size))
 
@@ -85,12 +80,14 @@ async def populate_previews(
                 mtime,
                 original_size,
                 cache_home=cache_home,
-                size=size,
+                size="large",
             )
-            try:
-                failed_thumbnail_path(source_path, cache_home).unlink(missing_ok=True)
-            except OSError:
-                LOGGER.warning("could not remove stale failure thumbnail for %s", entry.asset.id)
+            prepare_thumbnail_cache(
+                source_path,
+                mtime,
+                original_size,
+                cache_home=cache_home,
+            )
             installed[index] = True
         except Exception as error:
             LOGGER.warning("preview failed for asset %s: %s", entry.asset.id, error)
@@ -102,5 +99,8 @@ async def populate_previews(
 
     successes = sum(installed)
     return PreviewStats(
-        len(entries), current + successes, len(jobs) - successes, len(entries) - current - len(jobs)
+        len(entries),
+        current_count + successes,
+        len(jobs) - successes,
+        len(entries) - current_count - len(jobs),
     )

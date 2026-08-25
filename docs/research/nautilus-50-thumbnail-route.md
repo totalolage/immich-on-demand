@@ -8,10 +8,9 @@ Examined baseline: Nautilus 50.2.2 (`c6592e9c`), GLib/GIO 2.89.4 (`fa41d356`), a
 
 Populate the user's FreeDesktop **global thumbnail cache** from Immich's server-generated previews. Key each cache entry by the final mounted `file://` URI. Do this in the core service, not in a MIME thumbnailer or Nautilus extension.
 
-For every virtual file that Nautilus may show, create one of these files before Nautilus can start normal thumbnail generation:
+For every virtual file that Nautilus may show, create a valid per-file failed-thumbnail record before Nautilus can start normal thumbnail generation. For supported media, also create a valid cached PNG from the Immich preview endpoint.
 
-1. A valid cached PNG made from the Immich preview endpoint; or
-2. A valid per-file failed-thumbnail record when 1.0 does not support that preview or the preview fetch fails.
+Keep the failure record after the successful PNG is installed. GLib prefers the successful cache entry, while the failure record still suppresses fallback immediately if the success entry is later removed.
 
 On a cache miss, Nautilus can invoke the desktop thumbnailer registered for the file's MIME type. That thumbnailer may open the FUSE file and hydrate the original. A valid failed-thumbnail record suppresses that fallback only for the named mounted URI. GLib checks the successful cache before the failure cache, so a later successful preview takes precedence. See [GLib's local thumbnail lookup](https://gitlab.gnome.org/GNOME/glib/-/blob/fa41d356ee4936264c45cf11fa6c2640a89fbdda/gio/glocalfileinfo.c#L1420-1523) and [Nautilus's cache-miss guard](https://gitlab.gnome.org/GNOME/nautilus/-/blob/c6592e9c7fce37ad685d0ba24720893955b7835d/src/nautilus-file.c#L4767-4784).
 
@@ -114,12 +113,12 @@ Do not rely on it. The FreeDesktop standard defines read-only shared repositorie
 
 1. Keep the canonical mounted path, reported mtime, and original size in the catalog row used by FUSE.
 2. During exposure of an entry, derive its GLib-equivalent `file://` URI and cache hash.
-3. Before exposing the directory entry, install either a successful thumbnail or a failed-thumbnail record.
-4. For JPEG, PNG, GIF, and the chosen basic video MIME types, fetch only the Immich server preview. Convert it to a standard-sized PNG, add the required metadata, and atomically install it in the global cache.
-5. Remove the failure record after successful installation. This cleanup is optional because GIO prefers a successful thumbnail.
+3. Before exposing the directory entry, install a failed-thumbnail record.
+4. For JPEG, PNG, GIF, and the chosen basic video MIME types, also fetch only the Immich server preview. Convert it to a `large` PNG, add the required metadata, and atomically install it in the global cache.
+5. Keep the failure record after successful installation. GIO prefers the successful thumbnail, and retaining the failure record avoids a suppression gap if the success entry is removed.
 6. Leave non-preview formats with generic icons and valid failure records. Their originals remain available on explicit file reads.
 
-Only one successful size entry is required for correctness because GIO's generic lookup selects the largest available. Do not generate all four sizes. Choose between `large`, `x-large`, and `xx-large` after checking the target monitor scale and the dimensions returned by Immich; Nautilus's own scale mapping is 256/512/1024.
+Only one successful size entry is required for correctness because GIO's generic lookup selects the largest available. Version 1.0 keeps only `large`; stale entries in the other standard size directories can otherwise shadow both that preview and the failure record.
 
 ## Prototype questions
 

@@ -10,4 +10,4 @@ Which supported Nautilus 50, GIO, and FreeDesktop mechanisms can display an Immi
 
 ## Answer
 
-Populate the global FreeDesktop thumbnail cache with URI-keyed PNGs before exposing entries, and install GNOME failure records for unsupported or unavailable Previews. [Nautilus 50 thumbnail route](../../../docs/research/nautilus-50-thumbnail-route.md) records the exact cache and invalidation contract.
+Install a GNOME failure record for every entry before exposing it. Retain that record alongside any successful Preview. Keep only a current `large` success PNG for supported Previews. Remove stale or competing success records from every standard size directory. [Nautilus 50 thumbnail route](../../../docs/research/nautilus-50-thumbnail-route.md) records the exact cache and invalidation contract.

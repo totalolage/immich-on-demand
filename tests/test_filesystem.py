@@ -186,6 +186,23 @@ class FilesystemTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_remote_open_rejects_noatime_without_hydrating(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            filesystem = ImmichFilesystem(library, root / "recovery")  # type: ignore[arg-type]
+
+            with self.assertRaises(pyfuse3.FUSEError) as rejected:
+                await filesystem.open(
+                    2, os.O_RDONLY | os.O_NOATIME, None  # type: ignore[arg-type]
+                )
+
+            self.assertEqual(rejected.exception.errno, errno.EOPNOTSUPP)
+            self.assertEqual(library.content_cache.acquired, [])
+            self.assertEqual(library.reads, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_staged_write_uploads_exact_name_once(self) -> None:
         async def scenario(root: Path) -> None:
             library = FakeLibrary()
@@ -268,7 +285,7 @@ class FilesystemTest(unittest.TestCase):
             await filesystem.write(truncating.fh, 0, b"X")
             appending = await filesystem.open(
                 attributes.st_ino,
-                os.O_WRONLY | os.O_APPEND,
+                os.O_WRONLY | os.O_APPEND | os.O_NOATIME,
                 None,  # type: ignore[arg-type]
             )
             await filesystem.write(appending.fh, 0, b"-A")
@@ -420,6 +437,48 @@ class FilesystemTest(unittest.TestCase):
                 pyfuse3.ROOT_INODE, b"callback.jpg", None  # type: ignore[arg-type]
             )
             self.assertEqual(promoted.st_ino, 3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_promoted_staged_inode_rejects_noatime_without_hydrating(self) -> None:
+        async def scenario(root: Path) -> None:
+            library = FakeLibrary()
+            filesystem = ImmichFilesystem(
+                library, root / "recovery"  # type: ignore[arg-type]
+            )
+            info, attributes = await filesystem.create(
+                pyfuse3.ROOT_INODE,
+                b"promoted.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(info.fh, 0, b"hello")
+            invalidating = trio.Event()
+            finish_invalidation = trio.Event()
+
+            async def block_invalidation(*args: object) -> None:
+                invalidating.set()
+                await finish_invalidation.wait()
+
+            with patch(
+                "immich_on_demand.filesystem.trio.to_thread.run_sync",
+                side_effect=block_invalidation,
+            ):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(filesystem.release, info.fh)
+                    await invalidating.wait()
+                    with self.assertRaises(pyfuse3.FUSEError) as rejected:
+                        await filesystem.open(
+                            attributes.st_ino,
+                            os.O_RDONLY | os.O_NOATIME,
+                            None,  # type: ignore[arg-type]
+                        )
+                    self.assertEqual(rejected.exception.errno, errno.EOPNOTSUPP)
+                    self.assertEqual(library.content_cache.acquired, [])
+                    self.assertEqual(library.reads, 0)
+                    finish_invalidation.set()
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

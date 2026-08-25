@@ -8,7 +8,7 @@ Version 1.0 targets Arch Linux, Niri, Nautilus 50, FUSE 3, and Immich 3.0.3. Oth
 
 The mount contains one file for each visible asset. The first asset with a given safe basename keeps that name. Later collisions include the complete asset UUID before the extension.
 
-Existing assets are immutable. Applications can list, open, read, and copy them. They cannot overwrite, truncate, rename, link, or change their metadata.
+Existing assets are immutable. Applications can list, read, and copy them through ordinary read-only opens. A read-only remote open with `O_NOATIME` returns `EOPNOTSUPP` before it can download the original. Applications cannot overwrite, truncate, rename, link, or change their metadata.
 
 Creating a new file stages private local bytes. Flush syncs those bytes but does not upload them. The last close makes one upload attempt. FUSE cannot report an error from release, so an upload failure is logged and the recovery copy stays outside the mount. A successful upload removes the staged copy. Version 1.0 does not queue writes or retry uploads while offline.
 

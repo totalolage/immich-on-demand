@@ -1,8 +1,10 @@
 from functools import partial
+from inspect import signature
 from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
 import trio
@@ -11,7 +13,10 @@ from immich_on_demand.catalog import CatalogAsset
 from immich_on_demand.model import Asset
 from immich_on_demand.previewer import PreviewStats, populate_previews
 from immich_on_demand.thumbnails import (
+    THUMBNAIL_SIZES,
     failed_thumbnail_path,
+    install_failed_thumbnail,
+    install_thumbnail,
     thumbnail_cache_path,
 )
 
@@ -46,6 +51,9 @@ def preview_bytes() -> bytes:
 
 
 class PreviewerTest(unittest.TestCase):
+    def test_preview_size_is_fixed_by_the_previewer(self) -> None:
+        self.assertNotIn("size", signature(populate_previews).parameters)
+
     def test_signals_ready_after_suppression_and_before_fetch_completion(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
@@ -104,6 +112,15 @@ class PreviewerTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 item = entry(1, "application/pdf")
+                source = root / "mount" / item.name
+                competing = install_thumbnail(
+                    preview_bytes(),
+                    source,
+                    4,
+                    124,
+                    cache_home=root / "cache",
+                    size="xx-large",
+                )
 
                 class Client:
                     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
@@ -112,54 +129,131 @@ class PreviewerTest(unittest.TestCase):
                 stats = await populate_previews(
                     [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
                 )
-                source = root / "mount" / item.name
                 self.assertEqual(stats, PreviewStats(1, 0, 0, 1))
+                self.assertFalse(competing.exists())
                 self.assertTrue(failed_thumbnail_path(source, root / "cache").exists())
 
         trio.run(scenario)
 
-    def test_success_replaces_failure_with_standard_cache_entry(self) -> None:
+    def test_success_keeps_failure_with_only_a_large_success_entry(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 item = entry(1)
+                source = root / "mount" / item.name
+                competing = install_thumbnail(
+                    preview_bytes(),
+                    source,
+                    4,
+                    124,
+                    cache_home=root / "cache",
+                    size="xx-large",
+                )
 
                 class Client:
                     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        self_outer.assertFalse(competing.exists())
+                        self_outer.assertTrue(
+                            failed_thumbnail_path(source, root / "cache").exists()
+                        )
                         return preview_bytes(), "image/jpeg"
 
+                self_outer = self
                 stats = await populate_previews(
                     [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
                 )
-                source = root / "mount" / item.name
                 success = thumbnail_cache_path(source, root / "cache")
                 self.assertEqual(stats.installed, 1)
                 self.assertTrue(success.exists())
-                self.assertFalse(failed_thumbnail_path(source, root / "cache").exists())
+                self.assertTrue(failed_thumbnail_path(source, root / "cache").exists())
+                for size in THUMBNAIL_SIZES:
+                    if size != "large":
+                        self.assertFalse(
+                            thumbnail_cache_path(source, root / "cache", size).exists()
+                        )
                 with Image.open(success) as image:
                     self.assertEqual(image.info["Thumb::MTime"], "4")
                     self.assertEqual(image.info["Thumb::Size"], "124")
 
         trio.run(scenario)
 
-    def test_current_success_is_reused_without_network(self) -> None:
+    def test_current_success_and_failure_are_reused_without_writes_or_network(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 item = entry(1)
                 source = root / "mount" / item.name
-                from immich_on_demand.thumbnails import install_thumbnail
 
                 install_thumbnail(preview_bytes(), source, 4, 124, cache_home=root / "cache")
+                for size in ("normal", "x-large", "xx-large"):
+                    install_thumbnail(
+                        preview_bytes(),
+                        source,
+                        4,
+                        124,
+                        cache_home=root / "cache",
+                        size=size,
+                    )
+                install_failed_thumbnail(source, 4, 124, cache_home=root / "cache")
 
                 class Client:
                     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
                         raise AssertionError("current preview fetched")
 
-                stats = await populate_previews(
-                    [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
-                )
+                with patch(
+                    "immich_on_demand.thumbnails._atomic_png",
+                    side_effect=AssertionError("current preview rewrote failure cache"),
+                ):
+                    stats = await populate_previews(
+                        [item],
+                        Client(),  # type: ignore[arg-type]
+                        root / "mount",
+                        cache_home=root / "cache",
+                    )
                 self.assertEqual(stats, PreviewStats(1, 1, 0, 0))
+                self.assertTrue(failed_thumbnail_path(source, root / "cache").exists())
+                self.assertTrue(thumbnail_cache_path(source, root / "cache").exists())
+                for size in ("normal", "x-large", "xx-large"):
+                    self.assertFalse(
+                        thumbnail_cache_path(source, root / "cache", size).exists()
+                    )
+
+        trio.run(scenario)
+
+    def test_removes_glib_priority_stale_success_before_signaling_ready(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                item = entry(1)
+                source = root / "mount" / item.name
+                stale = install_thumbnail(
+                    preview_bytes(),
+                    source,
+                    3,
+                    124,
+                    cache_home=root / "cache",
+                    size="xx-large",
+                )
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        await trio.sleep_forever()
+
+                async with trio.open_nursery() as nursery:
+                    await nursery.start(
+                        partial(
+                            populate_previews,
+                            [item],
+                            Client(),  # type: ignore[arg-type]
+                            root / "mount",
+                            cache_home=root / "cache",
+                        )
+                    )
+                    self.assertFalse(stale.exists())
+                    self.assertTrue(
+                        failed_thumbnail_path(source, root / "cache").exists()
+                    )
+                    nursery.cancel_scope.cancel()
 
         trio.run(scenario)
 

@@ -20,7 +20,7 @@ from .immich import ImmichClient, MUTATION_PERMISSIONS, ServerSession, UPLOAD_PE
 from .library import Library
 from .previewer import populate_previews
 from .settings import Settings, cache_path, load_api_key, runtime_path, state_path
-from .thumbnails import install_failed_thumbnail
+from .thumbnails import prepare_thumbnail_cache
 
 
 LOGGER = logging.getLogger(__name__)
@@ -172,10 +172,13 @@ async def run_service(settings: Settings) -> None:
             async def on_uploaded(entry: CatalogAsset) -> None:
                 try:
                     if entry.asset.size is not None:
-                        install_failed_thumbnail(
-                            settings.mount_path / entry.name,
-                            entry.asset.modified_ns // 1_000_000_000,
+                        source_path = settings.mount_path / entry.name
+                        mtime = entry.asset.modified_ns // 1_000_000_000
+                        prepare_thumbnail_cache(
+                            source_path,
+                            mtime,
                             entry.asset.size,
+                            retain_size=None,
                         )
                 except Exception:
                     fatal_errors.append("preview suppression failed; mount terminated")

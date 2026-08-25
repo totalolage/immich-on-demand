@@ -88,6 +88,10 @@ class ImmichFilesystem(pyfuse3.Operations):
     def _open_remote(self, entry: CatalogAsset, flags: int) -> pyfuse3.FileInfo:
         if flags & os.O_ACCMODE != os.O_RDONLY or flags & (os.O_APPEND | os.O_TRUNC):
             raise pyfuse3.FUSEError(errno.EROFS)
+        # ponytail: Reference-system GLib uses O_NOATIME for MIME sniffing; add caller-aware
+        # policy if legitimate O_NOATIME readers need support.
+        if flags & os.O_NOATIME:
+            raise pyfuse3.FUSEError(errno.EOPNOTSUPP)
         try:
             self.library.acquire(entry)
         except Exception as error:
@@ -224,7 +228,8 @@ class ImmichFilesystem(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EISDIR)
         staged = self._staged_inodes.get(inode)
         if staged is None:
-            return self._open_remote(self._remote(inode), flags)
+            entry = self._remote(inode)
+            return self._open_remote(entry, flags)
 
         readable, writable = self._access(flags)
         async with staged.lock:

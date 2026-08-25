@@ -1,3 +1,3 @@
 # Populate the FreeDesktop thumbnail cache
 
-Write Immich Previews into the URI-keyed FreeDesktop thumbnail cache before Nautilus can request the mounted originals, and create GNOME failure records for entries without a supported Preview. Nautilus 50 has no public thumbnail-provider extension, while a global MIME thumbnailer would affect unrelated files and could Hydrate originals on cache misses.
+Before Nautilus can request mounted originals, install a GNOME failure record for every entry and reconcile its URI-keyed FreeDesktop success records. Keep only a current `large` success PNG for supported media. Retain the failure record alongside it. Remove stale or competing success records from every standard size directory. The service fetches missing Immich Previews while startup continues. Nautilus 50 has no public thumbnail-provider extension, while a global MIME thumbnailer would affect unrelated files and could Hydrate originals on cache misses.
