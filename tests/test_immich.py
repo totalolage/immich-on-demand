@@ -35,10 +35,14 @@ class ImmichClientTest(unittest.TestCase):
         class Oversized(httpx.AsyncByteStream):
             chunks = 0
 
-            async def __aiter__(self):
-                for _ in range(10_000):
-                    self.chunks += 1
-                    yield b"x" * 4096
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self) -> bytes:
+                if self.chunks == 10_000:
+                    raise StopAsyncIteration
+                self.chunks += 1
+                return b"x" * 4096
 
         stream = Oversized()
 

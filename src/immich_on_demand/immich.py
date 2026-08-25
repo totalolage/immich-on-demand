@@ -177,7 +177,7 @@ class ImmichClient:
             self._raise_for_status(response, "GET", path)
             if response.headers.get("content-encoding", "identity") != "identity":
                 raise ImmichError("Immich preview ignored identity content encoding")
-            async with aclosing(response.aiter_raw()) as chunks:
+            async with aclosing(response.stream.__aiter__()) as chunks:
                 async for chunk in chunks:
                     if len(preview) + len(chunk) > 32 * 1024**2:
                         raise ImmichError("Immich preview exceeds 32 MiB")
