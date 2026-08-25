@@ -214,6 +214,50 @@ class PreviewerTest(unittest.TestCase):
 
         trio.run(scenario)
 
+    def test_reorders_pending_previews_after_nautilus_sort_changes(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entries = [entry(index, modified_ns=index) for index in range(1, 5)]
+                fetched: list[str] = []
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        fetched.append(asset_id)
+                        return preview_bytes(), "image/jpeg"
+
+                with (
+                    patch(
+                        "immich_on_demand.previewer._read_nautilus_sort",
+                        side_effect=[
+                            ("date_modified", False),
+                            ("date_modified", True),
+                            ("date_modified", True),
+                            ("date_modified", True),
+                        ],
+                    ),
+                    patch("immich_on_demand.previewer.SORT_POLL_SECONDS", 0),
+                ):
+                    await populate_previews(
+                        entries,
+                        Client(),  # type: ignore[arg-type]
+                        root / "mount",
+                        cache_home=root / "cache",
+                        concurrency=1,
+                    )
+
+                self.assertEqual(
+                    fetched,
+                    [
+                        entries[0].asset.id,
+                        entries[3].asset.id,
+                        entries[2].asset.id,
+                        entries[1].asset.id,
+                    ],
+                )
+
+        trio.run(scenario)
+
     def test_unsupported_types_make_no_network_calls(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:

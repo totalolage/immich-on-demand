@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
-from itertools import batched
 import logging
 from pathlib import Path
 import warnings
@@ -29,6 +29,7 @@ PREVIEW_MIME_TYPES = frozenset(
 LOGGER = logging.getLogger(__name__)
 _SORT_BY = "metadata::nautilus-icon-view-sort-by"
 _SORT_REVERSED = "metadata::nautilus-icon-view-sort-reversed"
+SORT_POLL_SECONDS = 1.0
 
 
 def _read_nautilus_sort(mount_path: Path) -> tuple[str, bool] | None:
@@ -45,12 +46,11 @@ def _read_nautilus_sort(mount_path: Path) -> tuple[str, bool] | None:
     return (attribute, reversed_value == "true") if attribute else None
 
 
-async def _sort_for_nautilus(
-    entries: tuple[CatalogAsset, ...], mount_path: Path
-) -> tuple[CatalogAsset, ...]:
-    metadata = await trio.to_thread.run_sync(_read_nautilus_sort, mount_path)
+def _order_for_nautilus(
+    entries: tuple[CatalogAsset, ...], metadata: tuple[str, bool] | None
+) -> tuple[tuple[CatalogAsset, ...], bool]:
     if metadata is None:
-        return entries
+        return entries, False
     attribute, descending = metadata
     filename_key = lambda entry: GLib.utf8_collate_key_for_filename(entry.name, -1)
     modified_key = lambda entry: (entry.asset.modified_ns, filename_key(entry))
@@ -71,13 +71,8 @@ async def _sort_for_nautilus(
         "creation date": created_key,
     }.get(attribute)
     if key is None:
-        return entries
-    LOGGER.info(
-        "preview queue follows Nautilus %s sort (%s)",
-        attribute,
-        "descending" if descending else "ascending",
-    )
-    return tuple(sorted(entries, key=key, reverse=descending))
+        return entries, False
+    return tuple(sorted(entries, key=key, reverse=descending)), True
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,16 +123,11 @@ async def populate_previews(
     task_status.started()
     if mount_ready is not None:
         await mount_ready.wait()
-    if jobs:
-        ordered_entries = await _sort_for_nautilus(
-            tuple(job[0] for job in jobs), mount_path
-        )
-        rank = {entry.asset.id: index for index, entry in enumerate(ordered_entries)}
-        jobs.sort(key=lambda job: rank[job[0].asset.id])
+    job_count = len(jobs)
+    pending = deque(jobs)
+    installed: set[str] = set()
 
-    installed = [False] * len(jobs)
-
-    async def fetch(index: int, job: tuple[CatalogAsset, Path, int, int]) -> None:
+    async def fetch(job: tuple[CatalogAsset, Path, int, int]) -> None:
         entry, source_path, mtime, original_size = job
         try:
             preview, _ = await client.thumbnail(entry.asset.id)
@@ -155,19 +145,44 @@ async def populate_previews(
                 original_size,
                 cache_home=cache_home,
             )
-            installed[index] = True
+            installed.add(entry.asset.id)
         except Exception as error:
             LOGGER.warning("preview failed for asset %s: %s", entry.asset.id, error)
 
-    for batch in batched(enumerate(jobs), concurrency):
-        async with trio.open_nursery() as nursery:
-            for index, job in batch:
-                nursery.start_soon(fetch, index, job)
+    unread = object()
+    active_sort: object | tuple[str, bool] | None = unread
+    next_sort_check = 0.0
+    while pending:
+        if trio.current_time() >= next_sort_check:
+            metadata = await trio.to_thread.run_sync(_read_nautilus_sort, mount_path)
+            if metadata != active_sort:
+                ordered_entries, supported = _order_for_nautilus(
+                    tuple(job[0] for job in pending), metadata
+                )
+                rank = {
+                    entry.asset.id: index for index, entry in enumerate(ordered_entries)
+                }
+                pending = deque(sorted(pending, key=lambda job: rank[job[0].asset.id]))
+                active_sort = metadata
+                if supported:
+                    assert metadata is not None
+                    attribute, descending = metadata
+                    LOGGER.info(
+                        "preview queue follows Nautilus %s sort (%s)",
+                        attribute,
+                        "descending" if descending else "ascending",
+                    )
+            next_sort_check = trio.current_time() + SORT_POLL_SECONDS
 
-    successes = sum(installed)
+        batch = [pending.popleft() for _ in range(min(concurrency, len(pending)))]
+        async with trio.open_nursery() as nursery:
+            for job in batch:
+                nursery.start_soon(fetch, job)
+
+    successes = len(installed)
     return PreviewStats(
         len(entries),
         current_count + successes,
-        len(jobs) - successes,
-        len(entries) - current_count - len(jobs),
+        job_count - successes,
+        len(entries) - current_count - job_count,
     )
