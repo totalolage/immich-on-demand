@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import trio
 
 from immich_on_demand.cli import _auth_check, _print_result, main
@@ -122,3 +123,17 @@ class CliTest(unittest.TestCase):
         ):
             self.assertEqual(main(["mount"]), 0)
         run.assert_called_once_with(run_service, configured)
+
+    def test_network_failure_is_a_concise_cli_error(self) -> None:
+        configured = Settings("https://photos.example.test", Path("/Photos"))
+        error = io.StringIO()
+        with (
+            patch("immich_on_demand.cli.load", return_value=configured),
+            patch(
+                "immich_on_demand.cli.trio.run",
+                side_effect=httpx.ConnectError("network unavailable"),
+            ),
+            contextlib.redirect_stderr(error),
+        ):
+            self.assertEqual(main(["mount"]), 1)
+        self.assertEqual(error.getvalue(), "immich-on-demand: network unavailable\n")

@@ -4,6 +4,7 @@ import secrets
 import sys
 from uuid import UUID
 
+import httpx
 import trio
 
 from . import __version__
@@ -73,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return trio.run(_control, arguments.command, params)
         raise AssertionError(arguments.command)
-    except (OSError, RuntimeError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
         print(f"immich-on-demand: {error}", file=sys.stderr)
         return 1
 
