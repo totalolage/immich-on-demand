@@ -75,6 +75,23 @@ def runtime_path() -> Path:
     return Path(value) / APP_ID
 
 
+def _api_key_attributes(settings: Settings, purpose: str) -> dict[str, str]:
+    if purpose not in {"read-only", "mutation"}:
+        raise ValueError("API key purpose must be read-only or mutation")
+    return {
+        "application": APP_ID,
+        "server": settings.server_name,
+        "purpose": purpose,
+    }
+
+
+def _secret_collection():
+    import secretstorage
+
+    connection = secretstorage.dbus_init()
+    return secretstorage.get_default_collection(connection)
+
+
 def load(path: Path | None = None) -> Settings:
     source = path or config_path()
     value = json.loads(source.read_text(encoding="utf-8"))
@@ -104,25 +121,44 @@ def save(settings: Settings, path: Path | None = None) -> Path:
 
 
 def load_api_key(settings: Settings, purpose: str = "read-only") -> str:
+    attributes = _api_key_attributes(settings, purpose)
     try:
-        import secretstorage
-
-        connection = secretstorage.dbus_init()
-        collection = secretstorage.get_default_collection(connection)
-        items = list(
-            collection.search_items(
-                {"application": APP_ID, "server": settings.server_name, "purpose": purpose}
-            )
-        )
-        if len(items) != 1:
-            raise RuntimeError(f"expected one {purpose} API key in Secret Service, found {len(items)}")
-        if items[0].is_locked() and not items[0].unlock():
-            raise RuntimeError("Secret Service item remains locked")
-        secret = items[0].get_secret().decode("utf-8")
-        if not secret:
-            raise RuntimeError("Secret Service returned an empty API key")
-        return secret
-    except RuntimeError:
-        raise
+        collection = _secret_collection()
+        items = list(collection.search_items(attributes))
     except Exception as error:
-        raise RuntimeError(f"could not read API key from Secret Service: {error}") from error
+        raise RuntimeError("could not read API key from Secret Service") from error
+    if len(items) != 1:
+        raise RuntimeError(f"expected one {purpose} API key in Secret Service, found {len(items)}")
+    try:
+        locked = items[0].is_locked()
+    except Exception as error:
+        raise RuntimeError("could not read API key from Secret Service") from error
+    if locked:
+        try:
+            unlocked = items[0].unlock()
+        except Exception as error:
+            raise RuntimeError("could not read API key from Secret Service") from error
+        if not unlocked:
+            raise RuntimeError("Secret Service item remains locked")
+    try:
+        secret = items[0].get_secret().decode("utf-8")
+    except Exception as error:
+        raise RuntimeError("could not read API key from Secret Service") from error
+    if not secret:
+        raise RuntimeError("Secret Service returned an empty API key")
+    return secret
+
+
+def store_api_key(settings: Settings, purpose: str, secret: str) -> None:
+    if not isinstance(secret, str) or not secret:
+        raise ValueError("API key must not be empty")
+    attributes = _api_key_attributes(settings, purpose)
+    try:
+        _secret_collection().create_item(
+            f"Immich On-Demand {purpose} API key",
+            attributes,
+            secret.encode("utf-8"),
+            replace=True,
+        )
+    except Exception as error:
+        raise RuntimeError("could not store API key in Secret Service") from error

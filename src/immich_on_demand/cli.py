@@ -9,15 +9,17 @@ import httpx
 import trio
 
 from . import __version__
+from .auth import validate_api_key
 from .control import send_request
-from .immich import (
-    ImmichClient,
-    MUTATION_PERMISSIONS,
-    READ_PERMISSIONS,
-    UPLOAD_PERMISSIONS,
-)
 from .service import run_service
-from .settings import Settings, config_path, load, load_api_key, runtime_path, save
+from .settings import (
+    Settings,
+    config_path,
+    load,
+    load_api_key,
+    runtime_path,
+    save,
+)
 
 
 def _asset_id(value: str) -> str:
@@ -96,11 +98,11 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _auth_check(settings: Settings, mutation: bool) -> int:
     purpose = "mutation" if mutation else "read-only"
-    permissions = READ_PERMISSIONS
-    if mutation:
-        permissions = MUTATION_PERMISSIONS if settings.remote_delete else UPLOAD_PERMISSIONS
-    async with ImmichClient(settings.server_url, load_api_key(settings, purpose)) as client:
-        session = await client.validate(permissions)
+    session = await validate_api_key(
+        settings,
+        purpose,
+        load_api_key(settings, purpose),
+    )
     print(f"Immich {session.version}; {purpose} key verified")
     return 0
 

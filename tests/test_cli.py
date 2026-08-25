@@ -10,7 +10,7 @@ import httpx
 import trio
 
 from immich_on_demand.cli import _auth_check, _print_result, main
-from immich_on_demand.immich import UPLOAD_PERMISSIONS
+from immich_on_demand.immich import ServerSession
 from immich_on_demand.service import run_service
 from immich_on_demand.settings import Settings
 
@@ -20,29 +20,26 @@ ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 
 class CliTest(unittest.TestCase):
     def test_mutation_auth_check_uses_the_upload_only_secret_and_scope(self) -> None:
-        seen: list[object] = []
-
-        class Client:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                pass
-
-            async def validate(self, permissions: frozenset[str]):
-                seen.append(permissions)
-                return type("Session", (), {"version": "3.0.3"})()
-
         configured = Settings("https://photos.example.test", Path("/Photos"))
         with (
             patch("immich_on_demand.cli.load_api_key", return_value="secret") as load_key,
-            patch("immich_on_demand.cli.ImmichClient", return_value=Client()),
+            patch(
+                "immich_on_demand.cli.validate_api_key",
+                new=AsyncMock(
+                    return_value=ServerSession(
+                        "87654321-4321-4321-8321-cba987654321",
+                        "3.0.3",
+                        frozenset(),
+                        True,
+                    )
+                ),
+            ) as validate,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(trio.run(_auth_check, configured, True), 0)
 
         load_key.assert_called_once_with(configured, "mutation")
-        self.assertEqual(seen, [UPLOAD_PERMISSIONS])
+        validate.assert_awaited_once_with(configured, "mutation", "secret")
 
     def test_version(self) -> None:
         output = io.StringIO()
