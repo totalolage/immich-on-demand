@@ -99,8 +99,10 @@ class ImmichClient:
         exact_permissions: bool = True,
     ) -> ServerSession:
         discovery = await self._http.get(urljoin(self._origin, ".well-known/immich"))
-        discovery.raise_for_status()
-        endpoint = discovery.json().get("api", {}).get("endpoint")
+        self._raise_for_status(discovery, "GET", ".well-known/immich")
+        discovery_value = discovery.json()
+        api = discovery_value.get("api") if isinstance(discovery_value, dict) else None
+        endpoint = api.get("endpoint") if isinstance(api, dict) else None
         if not isinstance(endpoint, str):
             raise ImmichError("Immich discovery response has no API endpoint")
         api_root = urljoin(self._origin, endpoint)
@@ -111,12 +113,20 @@ class ImmichClient:
         self._api_root = f"{api_root.rstrip('/')}/"
 
         version_value = await self._json("GET", "server/version")
-        version = ".".join(str(version_value[name]) for name in ("major", "minor", "patch"))
+        version_parts = tuple(version_value.get(name) for name in ("major", "minor", "patch"))
+        if any(type(part) is not int for part in version_parts):
+            raise ImmichError("Immich returned an invalid server version")
+        version = ".".join(str(part) for part in version_parts)
         if version != "3.0.3":
             raise ImmichError(f"Immich 3.0.3 is required, server reports {version}")
 
         key_value = await self._json("GET", "api-keys/me")
-        permissions = frozenset(str(value) for value in key_value.get("permissions", []))
+        permissions_value = key_value.get("permissions")
+        if not isinstance(permissions_value, list) or any(
+            not isinstance(value, str) for value in permissions_value
+        ):
+            raise ImmichError("Immich returned invalid API key permissions")
+        permissions = frozenset(permissions_value)
         missing = required_permissions - permissions
         extra = permissions - required_permissions
         if missing:
@@ -125,20 +135,31 @@ class ImmichClient:
             raise ImmichError(f"API key has unexpected permissions: {', '.join(sorted(extra))}")
 
         user_value = await self._json("GET", "users/me")
-        owner_id = str(user_value["id"])
-        UUID(owner_id)
+        owner_id = user_value.get("id")
+        if not isinstance(owner_id, str):
+            raise ImmichError("Immich returned an invalid user")
+        try:
+            UUID(owner_id)
+        except ValueError as error:
+            raise ImmichError("Immich returned an invalid user") from error
         media_value = await self._json("GET", "server/media-types")
-        media_types = frozenset(
-            str(extension).lower()
-            for kind in ("image", "video", "sidecar")
-            for extension in media_value.get(kind, [])
-        )
+        media_groups = tuple(media_value.get(kind) for kind in ("image", "video", "sidecar"))
+        if any(
+            not isinstance(group, list)
+            or any(not isinstance(extension, str) for extension in group)
+            for group in media_groups
+        ):
+            raise ImmichError("Immich returned invalid media types")
+        media_types = frozenset(extension.lower() for group in media_groups for extension in group)
         feature_value = await self._json("GET", "server/features")
-        return ServerSession(owner_id, version, media_types, bool(feature_value.get("trash")))
+        trash_enabled = feature_value.get("trash")
+        if type(trash_enabled) is not bool:
+            raise ImmichError("Immich returned invalid server features")
+        return ServerSession(owner_id, version, media_types, trash_enabled)
 
     async def asset_pages(self, owner_id: str, page_size: int = 1000) -> AsyncIterator[list[Asset]]:
         UUID(owner_id)
-        if not 1 <= page_size <= 1000:
+        if type(page_size) is not int or not 1 <= page_size <= 1000:
             raise ValueError("page_size must be between 1 and 1000")
         page = 1
         seen_asset_ids: set[str] = set()
@@ -161,25 +182,14 @@ class ImmichClient:
             items = assets_value["items"]
             if any(not isinstance(item, dict) for item in items):
                 raise ImmichError("Immich search response contains a non-object asset")
-            next_page = assets_value.get("nextPage")
-            if next_page is not None:
-                if type(next_page) is int:
-                    parsed_next_page = next_page
-                elif (
-                    isinstance(next_page, str)
-                    and next_page.isascii()
-                    and next_page.isdecimal()
-                ):
-                    try:
-                        parsed_next_page = int(next_page)
-                    except ValueError as error:
-                        raise ImmichError("Immich search response has an invalid next page") from error
-                    if str(parsed_next_page) != next_page:
-                        raise ImmichError("Immich search response has an invalid next page")
-                else:
-                    raise ImmichError("Immich search response has an invalid next page")
-                if parsed_next_page <= page:
-                    raise ImmichError("Immich search response has an invalid next page")
+            count = assets_value.get("count")
+            if type(count) is not int or count != len(items):
+                raise ImmichError("Immich search response has an invalid asset count")
+            if "nextPage" not in assets_value:
+                raise ImmichError("Immich search response has no next page field")
+            next_page = assets_value["nextPage"]
+            if next_page is not None and next_page != str(page + 1):
+                raise ImmichError("Immich search response has an invalid next page")
 
             assets = [Asset.from_api(item) for item in items]
             for asset in assets:
@@ -189,7 +199,7 @@ class ImmichClient:
             yield [asset for asset in assets if asset.owner_id == owner_id]
             if next_page is None:
                 return
-            page = parsed_next_page
+            page += 1
 
     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
         UUID(asset_id)
@@ -266,7 +276,7 @@ class ImmichClient:
     async def restore(self, asset_id: str) -> None:
         UUID(asset_id)
         value = await self._json("POST", "trash/restore/assets", json={"ids": [asset_id]})
-        if value.get("count") != 1:
+        if type(value.get("count")) is not int or value["count"] != 1:
             raise ImmichError("Immich did not restore the requested asset")
 
     @asynccontextmanager

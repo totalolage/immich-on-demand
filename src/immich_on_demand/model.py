@@ -27,6 +27,20 @@ def _nanoseconds(value: str) -> int:
     return int(parsed.timestamp() * 1_000_000_000)
 
 
+def _string(value: dict[str, object], name: str) -> str:
+    result = value.get(name)
+    if not isinstance(result, str):
+        raise ValueError(f"asset {name} is not a string")
+    return result
+
+
+def _boolean(value: dict[str, object], name: str) -> bool:
+    result = value.get(name)
+    if type(result) is not bool:
+        raise ValueError(f"asset {name} is not a boolean")
+    return result
+
+
 def safe_filename(original: str, asset_id: str, limit: int = 255) -> str:
     UUID(asset_id)
     if limit <= 0:
@@ -93,32 +107,45 @@ class Asset:
 
     @classmethod
     def from_api(cls, value: dict[str, object]) -> Asset:
-        asset_id = str(value["id"])
-        owner_id = str(value["ownerId"])
+        asset_id = _string(value, "id")
+        owner_id = _string(value, "ownerId")
         UUID(asset_id)
         UUID(owner_id)
-        exif = value.get("exifInfo") or {}
+        exif = value.get("exifInfo")
+        if exif is None:
+            exif = {}
         if not isinstance(exif, dict):
             raise ValueError("asset exifInfo is not an object")
         raw_size = exif.get("fileSizeInByte")
-        size = int(raw_size) if raw_size is not None else None
+        if raw_size is not None and type(raw_size) is not int:
+            raise ValueError("asset size is not an integer")
+        size = raw_size
         if size is not None and size < 0:
             raise ValueError("asset size is negative")
+        created_at = _string(value, "fileCreatedAt")
+        modified_at = _string(value, "fileModifiedAt")
+        updated_at = _string(value, "updatedAt")
+        _nanoseconds(updated_at)
+        library_id = value.get("libraryId")
+        if library_id is not None:
+            if not isinstance(library_id, str):
+                raise ValueError("asset libraryId is not a string")
+            UUID(library_id)
 
         return cls(
             id=asset_id,
             owner_id=owner_id,
-            original_name=str(value["originalFileName"]),
-            mime_type=str(value["originalMimeType"]),
+            original_name=_string(value, "originalFileName"),
+            mime_type=_string(value, "originalMimeType"),
             size=size,
-            created_ns=_nanoseconds(str(value["fileCreatedAt"])),
-            modified_ns=_nanoseconds(str(value["fileModifiedAt"])),
-            updated_at=str(value["updatedAt"]),
-            checksum=str(value["checksum"]),
-            visibility=str(value["visibility"]),
-            is_trashed=bool(value["isTrashed"]),
-            is_offline=bool(value["isOffline"]),
-            library_id=str(value["libraryId"]) if value.get("libraryId") else None,
+            created_ns=_nanoseconds(created_at),
+            modified_ns=_nanoseconds(modified_at),
+            updated_at=updated_at,
+            checksum=_string(value, "checksum"),
+            visibility=_string(value, "visibility"),
+            is_trashed=_boolean(value, "isTrashed"),
+            is_offline=_boolean(value, "isOffline"),
+            library_id=library_id,
         )
 
     @property
