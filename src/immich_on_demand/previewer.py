@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import batched
 import logging
 from pathlib import Path
 
@@ -9,7 +10,13 @@ import trio
 
 from .catalog import CatalogAsset
 from .immich import ImmichClient
-from .thumbnails import failed_thumbnail_path, install_failed_thumbnail, install_thumbnail
+from .thumbnails import (
+    failed_thumbnail_is_current,
+    failed_thumbnail_path,
+    install_failed_thumbnail,
+    install_thumbnail,
+    thumbnail_is_current,
+)
 
 
 PREVIEW_MIME_TYPES = frozenset(
@@ -44,32 +51,42 @@ async def populate_previews(
         raise ValueError("visible catalog entries must have a size")
 
     jobs: list[tuple[CatalogAsset, Path, int, int]] = []
+    current = 0
     for entry in entries:
         source_path = mount_path / entry.name
         mtime = entry.asset.modified_ns // 1_000_000_000
         original_size = entry.asset.size
         assert original_size is not None
+        if entry.asset.mime_type.lower() in PREVIEW_MIME_TYPES and thumbnail_is_current(
+            source_path, mtime, original_size, cache_home=cache_home, size=size
+        ):
+            failed_thumbnail_path(source_path, cache_home).unlink(missing_ok=True)
+            current += 1
+            continue
+        supported = entry.asset.mime_type.lower() in PREVIEW_MIME_TYPES
+        if not supported and failed_thumbnail_is_current(
+            source_path, mtime, original_size, cache_home=cache_home
+        ):
+            continue
         install_failed_thumbnail(source_path, mtime, original_size, cache_home=cache_home)
-        if entry.asset.mime_type.lower() in PREVIEW_MIME_TYPES:
+        if supported:
             jobs.append((entry, source_path, mtime, original_size))
 
     installed = [False] * len(jobs)
-    limiter = trio.CapacityLimiter(concurrency)
     task_status.started()
 
     async def fetch(index: int, job: tuple[CatalogAsset, Path, int, int]) -> None:
         entry, source_path, mtime, original_size = job
         try:
-            async with limiter:
-                preview, _ = await client.thumbnail(entry.asset.id)
-                install_thumbnail(
-                    preview,
-                    source_path,
-                    mtime,
-                    original_size,
-                    cache_home=cache_home,
-                    size=size,
-                )
+            preview, _ = await client.thumbnail(entry.asset.id)
+            install_thumbnail(
+                preview,
+                source_path,
+                mtime,
+                original_size,
+                cache_home=cache_home,
+                size=size,
+            )
             try:
                 failed_thumbnail_path(source_path, cache_home).unlink(missing_ok=True)
             except OSError:
@@ -78,9 +95,12 @@ async def populate_previews(
         except Exception as error:
             LOGGER.warning("preview failed for asset %s: %s", entry.asset.id, error)
 
-    async with trio.open_nursery() as nursery:
-        for index, job in enumerate(jobs):
-            nursery.start_soon(fetch, index, job)
+    for batch in batched(enumerate(jobs), concurrency):
+        async with trio.open_nursery() as nursery:
+            for index, job in batch:
+                nursery.start_soon(fetch, index, job)
 
     successes = sum(installed)
-    return PreviewStats(len(entries), successes, len(jobs) - successes, len(entries) - len(jobs))
+    return PreviewStats(
+        len(entries), current + successes, len(jobs) - successes, len(entries) - current - len(jobs)
+    )

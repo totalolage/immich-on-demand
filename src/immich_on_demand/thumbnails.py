@@ -51,6 +51,48 @@ def failed_thumbnail_path(path: Path, cache_home: Path | None = None) -> Path:
     )
 
 
+def _png_metadata_matches(path: Path, expected: dict[str, str]) -> bool:
+    try:
+        with Image.open(path) as image:
+            image.load()
+            return image.format == "PNG" and all(
+                image.info.get(key) == value for key, value in expected.items()
+            )
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError):
+        return False
+
+
+def thumbnail_is_current(
+    source_path: Path,
+    mtime: int,
+    original_size: int,
+    *,
+    cache_home: Path | None = None,
+    size: str = "large",
+) -> bool:
+    expected = {
+        "Thumb::URI": canonical_file_uri(source_path),
+        "Thumb::MTime": str(mtime),
+        "Thumb::Size": str(original_size),
+    }
+    return _png_metadata_matches(thumbnail_cache_path(source_path, cache_home, size), expected)
+
+
+def failed_thumbnail_is_current(
+    source_path: Path,
+    mtime: int,
+    original_size: int,
+    *,
+    cache_home: Path | None = None,
+) -> bool:
+    expected = {
+        "Thumb::URI": canonical_file_uri(source_path),
+        "Thumb::MTime": str(mtime),
+        "Thumb::Size": str(original_size),
+    }
+    return _png_metadata_matches(failed_thumbnail_path(source_path, cache_home), expected)
+
+
 def _metadata(path: Path, mtime: int, original_size: int) -> PngImagePlugin.PngInfo:
     if type(mtime) is not int or type(original_size) is not int or mtime < 0 or original_size < 0:
         raise ValueError("thumbnail mtime and size must be non-negative integers")

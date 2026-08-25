@@ -1,5 +1,5 @@
-from io import BytesIO
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -139,6 +139,27 @@ class PreviewerTest(unittest.TestCase):
                 with Image.open(success) as image:
                     self.assertEqual(image.info["Thumb::MTime"], "4")
                     self.assertEqual(image.info["Thumb::Size"], "124")
+
+        trio.run(scenario)
+
+    def test_current_success_is_reused_without_network(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                item = entry(1)
+                source = root / "mount" / item.name
+                from immich_on_demand.thumbnails import install_thumbnail
+
+                install_thumbnail(preview_bytes(), source, 4, 124, cache_home=root / "cache")
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        raise AssertionError("current preview fetched")
+
+                stats = await populate_previews(
+                    [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
+                )
+                self.assertEqual(stats, PreviewStats(1, 1, 0, 0))
 
         trio.run(scenario)
 

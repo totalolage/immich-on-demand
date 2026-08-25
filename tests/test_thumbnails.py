@@ -9,10 +9,12 @@ from PIL import Image
 from immich_on_demand.thumbnails import (
     ThumbnailError,
     canonical_file_uri,
+    failed_thumbnail_is_current,
     failed_thumbnail_path,
     install_failed_thumbnail,
     install_thumbnail,
     thumbnail_cache_path,
+    thumbnail_is_current,
 )
 
 
@@ -93,6 +95,20 @@ class ThumbnailTest(unittest.TestCase):
                 self.assertEqual(failed.info["Thumb::URI"], canonical_file_uri(source))
                 self.assertEqual(failed.info["Thumb::MTime"], "42")
                 self.assertEqual(failed.info["Thumb::Size"], "1234")
+
+            self.assertTrue(failed_thumbnail_is_current(source, 42, 1234, cache_home=cache))
+            self.assertFalse(failed_thumbnail_is_current(source, 43, 1234, cache_home=cache))
+
+    def test_recognizes_only_a_matching_cached_thumbnail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            source = Path(directory) / "photo.jpg"
+            installed = install_thumbnail(preview(), source, 42, 1234, cache_home=cache)
+
+            self.assertTrue(thumbnail_is_current(source, 42, 1234, cache_home=cache))
+            self.assertFalse(thumbnail_is_current(source, 43, 1234, cache_home=cache))
+            installed.write_bytes(b"broken")
+            self.assertFalse(thumbnail_is_current(source, 42, 1234, cache_home=cache))
 
 
 if __name__ == "__main__":
