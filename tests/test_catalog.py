@@ -1,6 +1,7 @@
 from dataclasses import replace
 import os
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -35,6 +36,56 @@ def asset(asset_id: str = ASSET_ID, name: str = "photo.jpg") -> Asset:
 
 
 class CatalogTest(unittest.TestCase):
+    def test_pin_schema_migrates_in_place_and_uses_existing_private_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            database = state / "catalog.db"
+            with Catalog(database):
+                pass
+
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("DROP TABLE pins")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog:
+                self.assertEqual(catalog.pinned_ids(), frozenset())
+                catalog.pin(ASSET_ID)
+
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(database.stat().st_mode & 0o777, 0o600)
+            suffixes = {
+                path.name.removeprefix("catalog.db") for path in state.iterdir()
+            }
+            self.assertIn("", suffixes)
+            self.assertLessEqual(suffixes, {"", "-journal", "-shm", "-wal"})
+
+    def test_pins_persist_by_asset_id_independently_of_catalog_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                catalog.pin(ASSET_ID)
+                catalog.pin(ASSET_ID)
+                self.assertEqual(catalog.pinned_ids(), frozenset({ASSET_ID}))
+                with self.assertRaises(ValueError):
+                    catalog.pin("not-an-asset-id")
+
+                catalog.begin_refresh()
+                catalog.finish_refresh(high_water_ms=2, page_count=1)
+                self.assertEqual(catalog.list_visible(), [])
+                self.assertEqual(catalog.pinned_ids(), frozenset({ASSET_ID}))
+
+            with Catalog(database) as catalog:
+                self.assertEqual(catalog.pinned_ids(), frozenset({ASSET_ID}))
+                catalog.unpin(ASSET_ID)
+                catalog.unpin(ASSET_ID)
+                self.assertEqual(catalog.pinned_ids(), frozenset())
+
     def test_rejects_an_unsafe_state_directory_before_opening_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

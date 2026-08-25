@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
@@ -56,9 +57,13 @@ class ContentCache:
         *,
         max_bytes: int | None = None,
         minimum_free_bytes: int = 0,
+        pinned_ids: Iterable[str] = (),
     ) -> None:
         if (max_bytes is not None and max_bytes < 0) or minimum_free_bytes < 0:
             raise ValueError("cache limits must be non-negative")
+        pins = set(pinned_ids)
+        for asset_id in pins:
+            UUID(asset_id)
         self.root = root
         self.client = client
         self.max_bytes = max_bytes
@@ -75,6 +80,30 @@ class ContentCache:
         self._written: dict[str, int] = {}
         self._validated: dict[str, _Validation] = {}
         self._pending_discards: set[str] = set()
+        self._pinned = pins
+
+    def describe(self, asset: Asset) -> dict[str, bool]:
+        UUID(asset.id)
+        info = self._complete_info(self.root / asset.id)
+        cached = (
+            info is not None
+            and asset.size is not None
+            and info.st_size == asset.size
+            and info.st_mtime_ns == self._cache_mtime_ns(asset)
+        )
+        return {
+            "cached": cached,
+            "busy": self._busy(asset.id),
+            "pinned": asset.id in self._pinned,
+        }
+
+    def pin(self, asset_id: str) -> None:
+        UUID(asset_id)
+        self._pinned.add(asset_id)
+
+    def unpin(self, asset_id: str) -> None:
+        UUID(asset_id)
+        self._pinned.discard(asset_id)
 
     def acquire(self, asset_id: str) -> None:
         UUID(asset_id)
@@ -144,6 +173,8 @@ class ContentCache:
 
     def evict(self, asset_id: str) -> bool:
         UUID(asset_id)
+        if asset_id in self._pinned:
+            raise CacheError(f"asset {asset_id} is pinned")
         if self._busy(asset_id):
             raise CacheBusyError(f"asset {asset_id} is open or being hydrated")
         path = self.root / asset_id
@@ -177,6 +208,8 @@ class ContentCache:
             expired = now - stat.st_atime_ns > max_age_seconds * 1_000_000_000
             over_limit = total > max_bytes or free < minimum_free_bytes
             if not expired and not over_limit:
+                continue
+            if asset_id in self._pinned:
                 continue
             if self._busy(asset_id):
                 continue
@@ -383,7 +416,7 @@ class ContentCache:
             for asset_id, (path, info) in sorted(
                 entries.items(), key=lambda item: (item[1][1].st_atime_ns, item[0])
             )
-            if not self._busy(asset_id)
+            if asset_id not in self._pinned and not self._busy(asset_id)
         ]
         reclaimable = sum(info.st_size for _, _, info in evictable)
         if not fits(total - reclaimable, free + reclaimable):

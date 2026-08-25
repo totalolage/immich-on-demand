@@ -78,6 +78,118 @@ class Client:
 
 
 class ContentCacheTest(unittest.TestCase):
+    def test_describe_reports_local_state_without_hashing_or_touching(self) -> None:
+        content = b"cached"
+        item = asset(content)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / item.id
+            original.write_bytes(content)
+            os.utime(original, ns=(1, item.modified_ns))
+            cache = ContentCache(
+                root,
+                Client([]),  # type: ignore[arg-type]
+                pinned_ids={item.id},
+            )
+            cache.acquire(item.id)
+
+            with (
+                patch.object(
+                    cache,
+                    "_file_sha1",
+                    side_effect=AssertionError("describe hashed cached bytes"),
+                ),
+                patch(
+                    "immich_on_demand.content_cache.os.utime",
+                    side_effect=AssertionError("describe touched cached bytes"),
+                ),
+            ):
+                self.assertEqual(
+                    cache.describe(item),
+                    {"cached": True, "busy": True, "pinned": True},
+                )
+
+            cache.release(item.id)
+            os.utime(original, ns=(1, item.modified_ns + 1))
+            self.assertEqual(
+                cache.describe(item),
+                {"cached": False, "busy": False, "pinned": True},
+            )
+            original.write_bytes(content + b"!")
+            os.utime(original, ns=(1, item.modified_ns))
+            self.assertEqual(
+                cache.describe(item),
+                {"cached": False, "busy": False, "pinned": True},
+            )
+
+    def test_initialized_pin_blocks_manual_eviction_until_unpinned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / ASSET_ID
+            original.write_bytes(b"pinned")
+            cache = ContentCache(
+                root,
+                Client([]),  # type: ignore[arg-type]
+                pinned_ids={ASSET_ID},
+            )
+
+            with self.assertRaisesRegex(CacheError, "pinned"):
+                cache.evict(ASSET_ID)
+            self.assertTrue(original.exists())
+
+            cache.unpin(ASSET_ID)
+            self.assertTrue(original.exists())
+            self.assertTrue(cache.evict(ASSET_ID))
+
+    def test_pin_operation_excludes_an_original_from_policy_eviction(self) -> None:
+        now = 1_000 * 1_000_000_000
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for asset_id in (ASSET_ID, OTHER_ID):
+                path = root / asset_id
+                path.write_bytes(b"old")
+                os.utime(path, ns=(1, 1))
+            cache = ContentCache(root, Client([]))  # type: ignore[arg-type]
+            cache.pin(ASSET_ID)
+
+            removed = cache.evict_to_limits(
+                max_age_seconds=0,
+                max_bytes=0,
+                minimum_free_bytes=0,
+                now_ns=now,
+            )
+
+            self.assertEqual(removed, [OTHER_ID])
+            self.assertTrue((root / ASSET_ID).exists())
+
+    def test_capacity_admission_never_reclaims_a_pinned_original(self) -> None:
+        content = b"new!"
+
+        async def scenario(root: Path) -> None:
+            client = Client([content])
+            pinned = root / ASSET_ID
+            pinned.write_bytes(b"keep")
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=4,
+                pinned_ids={ASSET_ID},
+            )
+
+            with self.assertRaisesRegex(CacheError, "cache capacity"):
+                await cache.hydrate(asset(content, OTHER_ID))
+
+            self.assertTrue(pinned.exists())
+            self.assertEqual(client.calls, 0)
+
+            cache.unpin(ASSET_ID)
+            hydrated = await cache.hydrate(asset(content, OTHER_ID))
+            self.assertEqual(hydrated.read_bytes(), content)
+            self.assertFalse(pinned.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_rejects_a_symlink_cache_root_without_touching_its_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

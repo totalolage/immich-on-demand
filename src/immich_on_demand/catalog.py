@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import stat
 from typing import Iterable
+from uuid import UUID
 
 from .model import Asset, collision_name, safe_filename
 
@@ -159,6 +160,9 @@ class Catalog:
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pins (
+                asset_id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
             INSERT OR IGNORE INTO metadata(key, value) VALUES ('next_inode', 2);
             INSERT OR IGNORE INTO metadata(key, value) VALUES ('high_water_ms', 0);
             INSERT OR IGNORE INTO metadata(key, value) VALUES ('full_refresh_pages', 0);
@@ -294,6 +298,24 @@ class Catalog:
             )
         }
         return int(values["high_water_ms"]), int(values["full_refresh_pages"])
+
+    def pinned_ids(self) -> frozenset[str]:
+        return frozenset(
+            row["asset_id"]
+            for row in self._connection.execute("SELECT asset_id FROM pins")
+        )
+
+    def pin(self, asset_id: str) -> None:
+        UUID(asset_id)
+        with self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO pins(asset_id) VALUES (?)", (asset_id,)
+            )
+
+    def unpin(self, asset_id: str) -> None:
+        UUID(asset_id)
+        with self._connection:
+            self._connection.execute("DELETE FROM pins WHERE asset_id = ?", (asset_id,))
 
     def stats(self) -> CatalogStats:
         row = self._connection.execute(
