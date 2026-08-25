@@ -20,26 +20,41 @@ def _require_owned_directory(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
-def _prepare_database(path: Path) -> None:
+def _open_database(path: Path) -> int:
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        info = os.lstat(path)
+        descriptor = os.open(path, flags)
     except FileNotFoundError:
-        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
         try:
-            descriptor = os.open(path, flags, 0o600)
+            descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            info = os.lstat(path)
-        else:
-            try:
-                os.fchmod(descriptor, 0o600)
-            finally:
-                os.close(descriptor)
-            info = os.lstat(path)
+            return _open_database(path)
+    except OSError as error:
+        raise PermissionError(
+            "catalog database must be a regular file owned by this user"
+        ) from error
+    info = os.fstat(descriptor)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        os.close(descriptor)
         raise PermissionError("catalog database must be a regular file owned by this user")
-    os.chmod(path, 0o600)
+    os.fchmod(descriptor, 0o600)
+    return descriptor
+
+
+def _prepare_auxiliary_files(path: Path) -> None:
+    for suffix in ("-journal", "-wal", "-shm"):
+        auxiliary = Path(f"{path}{suffix}")
+        try:
+            info = os.lstat(auxiliary)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError(
+                "catalog auxiliary files must be regular files owned by this user"
+            )
+        os.chmod(auxiliary, 0o600)
 
 
 def _available_name(original: str, asset_id: str, used: set[str]) -> str:
@@ -74,15 +89,28 @@ class Catalog:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _require_owned_directory(path.parent)
-        _prepare_database(path)
-        self._connection = sqlite3.connect(path)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        descriptor = _open_database(path)
+        connection: sqlite3.Connection | None = None
+        try:
+            _prepare_auxiliary_files(path)
+            connection = sqlite3.connect(f"/proc/self/fd/{descriptor}")
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            self._connection = connection
+            self._database_descriptor = descriptor
+            self._create_schema()
+        except Exception:
+            if connection is not None:
+                connection.close()
+            os.close(descriptor)
+            raise
 
     def close(self) -> None:
-        self._connection.close()
+        try:
+            self._connection.close()
+        finally:
+            os.close(self._database_descriptor)
 
     def __enter__(self) -> Catalog:
         return self

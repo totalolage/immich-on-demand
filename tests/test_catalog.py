@@ -105,16 +105,14 @@ class CatalogTest(unittest.TestCase):
 
             database.rmdir()
             database.write_bytes(b"")
-            real_lstat = os.lstat
+            real_fstat = os.fstat
 
-            def wrong_owner(candidate: os.PathLike[str]) -> os.stat_result | SimpleNamespace:
-                info = real_lstat(candidate)
-                if Path(candidate) == database:
-                    return SimpleNamespace(st_mode=info.st_mode, st_uid=os.getuid() + 1)
-                return info
+            def wrong_owner(descriptor: int) -> os.stat_result | SimpleNamespace:
+                info = real_fstat(descriptor)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=os.getuid() + 1)
 
             with (
-                patch("immich_on_demand.catalog.os.lstat", side_effect=wrong_owner),
+                patch("immich_on_demand.catalog.os.fstat", side_effect=wrong_owner),
                 patch(
                     "immich_on_demand.catalog.sqlite3.connect",
                     side_effect=AssertionError("opened an unsafe database"),
@@ -123,6 +121,40 @@ class CatalogTest(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "catalog database"):
                     Catalog(database)
             connect.assert_not_called()
+
+    def test_sqlite_opens_the_checked_database_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state" / "catalog.db"
+            real_connect = __import__("sqlite3").connect
+
+            def checked_connect(path: str):
+                self.assertTrue(path.startswith("/proc/self/fd/"))
+                self.assertTrue(os.path.samefile(path, database))
+                return real_connect(path)
+
+            with patch("immich_on_demand.catalog.sqlite3.connect", side_effect=checked_connect):
+                with Catalog(database):
+                    pass
+
+    def test_rejects_unsafe_sqlite_auxiliary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir()
+            database = state / "catalog.db"
+            database.write_bytes(b"")
+            target = Path(directory) / "target"
+            target.write_bytes(b"do not touch")
+            Path(f"{database}-wal").symlink_to(target)
+
+            with patch(
+                "immich_on_demand.catalog.sqlite3.connect",
+                side_effect=AssertionError("opened unsafe SQLite state"),
+            ) as connect:
+                with self.assertRaisesRegex(PermissionError, "auxiliary files"):
+                    Catalog(database)
+
+            connect.assert_not_called()
+            self.assertEqual(target.read_bytes(), b"do not touch")
 
     def test_creates_a_private_catalog_and_state_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
