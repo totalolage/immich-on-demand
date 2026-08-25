@@ -9,6 +9,7 @@ import trio
 
 from immich_on_demand.cli import _auth_check, _print_result, main
 from immich_on_demand.immich import UPLOAD_PERMISSIONS
+from immich_on_demand.service import run_service
 from immich_on_demand.settings import Settings
 
 
@@ -112,3 +113,12 @@ class CliTest(unittest.TestCase):
                     load_api_key.assert_not_called()
                     catalog.assert_not_called()
                     self.assertEqual(output.getvalue(), "a=1 z=2\n")
+
+    def test_mount_routes_through_the_service(self) -> None:
+        configured = Settings("https://photos.example.test", Path("/Photos"))
+        with (
+            patch("immich_on_demand.cli.load", return_value=configured),
+            patch("immich_on_demand.cli.trio.run", return_value=None) as run,
+        ):
+            self.assertEqual(main(["mount"]), 0)
+        run.assert_called_once_with(run_service, configured)

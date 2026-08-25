@@ -14,6 +14,7 @@ from .immich import (
     READ_PERMISSIONS,
     UPLOAD_PERMISSIONS,
 )
+from .service import run_service
 from .settings import Settings, config_path, load, load_api_key, runtime_path, save
 
 
@@ -37,6 +38,7 @@ def parser() -> argparse.ArgumentParser:
 
     auth_check = commands.add_parser("auth-check", help="validate an API key")
     auth_check.add_argument("--mutation", action="store_true")
+    commands.add_parser("mount", help="run the foreground filesystem service")
     commands.add_parser("refresh", help="ask the running service to refresh")
     commands.add_parser("status", help="show local catalog counts")
     evict = commands.add_parser("evict", help="evict cached originals")
@@ -60,6 +62,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if arguments.command == "auth-check":
             return trio.run(_auth_check, load(arguments.config), arguments.mutation)
+        if arguments.command == "mount":
+            trio.run(run_service, load(arguments.config))
+            return 0
         if arguments.command in {"refresh", "status", "evict"}:
             params = (
                 {"asset": arguments.asset}
