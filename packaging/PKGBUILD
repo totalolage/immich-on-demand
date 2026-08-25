@@ -1,0 +1,31 @@
+pkgname=immich-on-demand
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Expose an Immich library as a Linux filesystem with files on demand'
+arch=('any')
+url='https://github.com/totalolage/immich-on-demand'
+license=('GPL-3.0-or-later')
+depends=(
+  'org.freedesktop.secrets'
+  'python'
+  'python-httpx'
+  'python-pillow'
+  'python-pyfuse3'
+  'python-secretstorage'
+  'python-trio'
+)
+makedepends=('python-build' 'python-flit-core' 'python-installer')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+b2sums=('SKIP') # ponytail: replace with the release archive checksum before publishing.
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 packaging/immich-on-demand.service \
+    "$pkgdir/usr/lib/systemd/user/immich-on-demand.service"
+}
