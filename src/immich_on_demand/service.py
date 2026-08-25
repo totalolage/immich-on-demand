@@ -76,6 +76,7 @@ async def _refresh_worker(
     settings: Settings,
     initial_entries: list[CatalogAsset],
     requests: trio.MemoryReceiveChannel[None],
+    fatal_errors: list[str],
     *,
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> None:
@@ -100,6 +101,7 @@ async def _refresh_worker(
             await populate_previews(library.list(), read_client, settings.mount_path)
         except Exception as error:
             LOGGER.error("preview suppression failed; terminating mount: %s", error)
+            fatal_errors.append("preview suppression failed; mount terminated")
             pyfuse3.terminate()
             return
 
@@ -163,14 +165,19 @@ async def run_service(settings: Settings) -> None:
             await refresh_catalog(catalog, read_client, read_session, catalog_lock)
 
             requests, refreshes = trio.open_memory_channel[None](1)
+            fatal_errors: list[str] = []
 
             async def on_uploaded(entry: CatalogAsset) -> None:
-                if entry.asset.size is not None:
-                    install_failed_thumbnail(
-                        settings.mount_path / entry.name,
-                        entry.asset.modified_ns // 1_000_000_000,
-                        entry.asset.size,
-                    )
+                try:
+                    if entry.asset.size is not None:
+                        install_failed_thumbnail(
+                            settings.mount_path / entry.name,
+                            entry.asset.modified_ns // 1_000_000_000,
+                            entry.asset.size,
+                        )
+                except Exception:
+                    fatal_errors.append("preview suppression failed; mount terminated")
+                    raise
                 try:
                     requests.send_nowait(None)
                 except trio.WouldBlock:
@@ -228,6 +235,7 @@ async def run_service(settings: Settings) -> None:
                     settings,
                     library.list(),
                     refreshes,
+                    fatal_errors,
                 )
                 try:
                     _evict_to_limits(content_cache, settings)
@@ -252,6 +260,8 @@ async def run_service(settings: Settings) -> None:
                         pyfuse3.close(unmount=True)
                     finally:
                         nursery.cancel_scope.cancel()
+            if fatal_errors:
+                raise RuntimeError(fatal_errors[0])
     finally:
         try:
             if mutation_client is not None:

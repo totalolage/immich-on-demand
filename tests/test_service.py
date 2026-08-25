@@ -29,11 +29,13 @@ class ServiceFakes:
         mutation_owner: str = OWNER_ID,
         block_preview: bool = True,
         preview_error_call: int | None = None,
+        refresh_error_call: int | None = None,
     ) -> None:
         self.root = root
         self.mutation = mutation
         self.block_preview = block_preview
         self.preview_error_call = preview_error_call
+        self.refresh_error_call = refresh_error_call
         self.events: list[str] = []
         self.clients: list[ServiceFakes.Client] = []
         self.handlers: dict[str, object] = {}
@@ -147,6 +149,8 @@ class ServiceFakes:
         self.events.append("refresh")
         if self.events.count("refresh") == 2:
             self.second_refresh.set()
+        if self.events.count("refresh") == self.refresh_error_call:
+            raise OSError("Immich unavailable")
         return CatalogStats(7, 6, 1, 0, 0, 0)
 
     async def previews(
@@ -325,12 +329,19 @@ class ServiceTest(unittest.TestCase):
             settings = Settings(
                 "https://photos.example.test", root / "mount", refresh_seconds=3600
             )
+            failures: list[RuntimeError] = []
+
+            async def serve() -> None:
+                try:
+                    await run_service(settings)
+                except RuntimeError as error:
+                    failures.append(error)
 
             with fakes.patches(), self.assertLogs(
                 "immich_on_demand.service", level="ERROR"
             ) as logs:
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(serve)
                     await fakes.main_started.wait()
                     refresh = fakes.handlers["refresh"]
                     self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
@@ -341,7 +352,93 @@ class ServiceTest(unittest.TestCase):
                 fakes.events.index("fuse-terminate"),
                 fakes.events.index("fuse-close:True"),
             )
+            self.assertEqual(str(failures[0]), "preview suppression failed; mount terminated")
             self.assertIn("preview suppression failed", "\n".join(logs.output))
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_refresh_outage_keeps_the_existing_mount_running(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(
+                root, block_preview=False, refresh_error_call=2
+            )
+            settings = Settings(
+                "https://photos.example.test", root / "mount", refresh_seconds=3600
+            )
+
+            with fakes.patches(), self.assertLogs(
+                "immich_on_demand.service", level="WARNING"
+            ) as logs:
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    refresh = fakes.handlers["refresh"]
+                    self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
+                    with trio.fail_after(0.1):
+                        await fakes.second_refresh.wait()
+                    await trio.sleep(0)
+                    self.assertNotIn("fuse-terminate", fakes.events)
+                    self.assertNotIn("fuse-close:True", fakes.events)
+                    fakes.stop_main.set()
+
+            self.assertIn("background refresh failed", "\n".join(logs.output))
+            self.assertIn("fuse-close:True", fakes.events)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_upload_suppression_failure_terminates_and_fails_the_service(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(root, block_preview=False)
+            settings = Settings(
+                "https://photos.example.test", root / "mount", refresh_seconds=3600
+            )
+            entry = CatalogAsset(
+                Asset(
+                    ASSET_ID,
+                    OWNER_ID,
+                    "uploaded.jpg",
+                    "image/jpeg",
+                    123,
+                    1,
+                    4_999_999_999,
+                    "2026-08-25T12:00:00Z",
+                    "abc=",
+                    "timeline",
+                    False,
+                    False,
+                    None,
+                ),
+                3,
+                "uploaded.jpg",
+            )
+            failures: list[RuntimeError] = []
+
+            async def serve() -> None:
+                try:
+                    await run_service(settings)
+                except RuntimeError as error:
+                    failures.append(error)
+
+            with fakes.patches(), patch(
+                "immich_on_demand.service.install_failed_thumbnail",
+                side_effect=OSError("thumbnail cache unavailable"),
+            ):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(serve)
+                    await fakes.main_started.wait()
+                    on_uploaded = fakes.on_uploaded
+                    assert callable(on_uploaded)
+                    with self.assertRaises(OSError):
+                        await on_uploaded(entry)
+                    fakes.fuse_terminate()
+
+            self.assertLess(
+                fakes.events.index("fuse-terminate"),
+                fakes.events.index("fuse-close:True"),
+            )
+            self.assertEqual(str(failures[0]), "preview suppression failed; mount terminated")
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
