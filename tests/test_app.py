@@ -22,7 +22,12 @@ class AppTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 with Catalog(Path(directory) / "catalog.db") as catalog:
                     session = ServerSession(OWNER_ID, "3.0.3", frozenset(), True)
-                    stats = await refresh_catalog(catalog, FakeClient(), session)  # type: ignore[arg-type]
+                    stats = await refresh_catalog(
+                        catalog,
+                        FakeClient(),  # type: ignore[arg-type]
+                        session,
+                        trio.Lock(),
+                    )
                     self.assertEqual(stats.visible, 1)
                     self.assertEqual(catalog.list_visible()[0].asset.id, ASSET_ID)
 

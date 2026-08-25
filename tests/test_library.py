@@ -6,7 +6,9 @@ import tempfile
 import unittest
 
 import trio
+from trio.testing import wait_all_tasks_blocked
 
+from immich_on_demand.app import refresh_catalog
 from immich_on_demand.catalog import Catalog
 from immich_on_demand.immich import ServerSession, UploadResult
 from immich_on_demand.library import Library, LibraryError
@@ -65,7 +67,7 @@ class MutationClient:
         self.error = error
         self.created = created
         self.uploads = 0
-        self.trashes: list[tuple[str, bool]] = []
+        self.trashes: list[str] = []
         self.on_upload = lambda: None
 
     async def upload(self, path: Path, media_types: frozenset[str]) -> UploadResult:
@@ -75,10 +77,10 @@ class MutationClient:
             raise self.error
         return UploadResult(ASSET_ID, self.created)
 
-    async def trash(self, asset_id: str, *, trash_enabled: bool) -> None:
+    async def trash(self, asset_id: str) -> None:
         if self.error is not None:
             raise self.error
-        self.trashes.append((asset_id, trash_enabled))
+        self.trashes.append(asset_id)
 
 
 class Cache:
@@ -104,6 +106,7 @@ def library(
     mutation: MutationClient | None = None,
     mutation_session: ServerSession | None = None,
     remote_delete: bool = False,
+    catalog_lock: trio.Lock | None = None,
 ) -> Library:
     return Library(
         catalog,
@@ -112,6 +115,7 @@ def library(
         settings(root, remote_delete=remote_delete),
         mutation_client=mutation,  # type: ignore[arg-type]
         mutation_session=mutation_session,
+        catalog_lock=catalog_lock if catalog_lock is not None else trio.Lock(),
     )
 
 
@@ -270,7 +274,7 @@ class LibraryTest(unittest.TestCase):
                     remote_delete=True,
                 )
                 await mounted.remote_trash(entry)
-                self.assertEqual(mutation.trashes, [(ASSET_ID, True)])
+                self.assertEqual(mutation.trashes, [ASSET_ID])
                 self.assertEqual(catalog.list_visible(), [])
 
             with Catalog(root / "failure.db") as catalog:
@@ -285,6 +289,96 @@ class LibraryTest(unittest.TestCase):
                         remote_delete=True,
                     ).remote_trash(entry)
                 self.assertEqual(catalog.list_visible(), [entry])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_refresh_cannot_erase_a_concurrent_upload(self) -> None:
+        async def scenario(root: Path) -> None:
+            refresh_paused = trio.Event()
+            finish_refresh = trio.Event()
+            upload_done = trio.Event()
+
+            class RefreshClient:
+                async def asset_pages(self, owner_id: str):
+                    if owner_id != OWNER_ID:
+                        raise AssertionError(owner_id)
+                    yield []
+                    refresh_paused.set()
+                    await finish_refresh.wait()
+
+            staged = root / "new.jpg"
+            staged.write_bytes(b"hello")
+            with Catalog(root / "catalog.db") as catalog:
+                lock = trio.Lock()
+                mutation = MutationClient()
+                mounted = library(
+                    catalog,
+                    root,
+                    mutation=mutation,
+                    mutation_session=session(),
+                    catalog_lock=lock,
+                )
+
+                async def upload() -> None:
+                    await mounted.upload_new(staged, "new.jpg")
+                    upload_done.set()
+
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(refresh_catalog, catalog, RefreshClient(), session(), lock)
+                    await refresh_paused.wait()
+                    nursery.start_soon(upload)
+                    await wait_all_tasks_blocked()
+                    self.assertEqual(mutation.uploads, 0)
+                    finish_refresh.set()
+                    await upload_done.wait()
+
+                self.assertEqual(catalog.by_name("new.jpg").asset.id, ASSET_ID)  # type: ignore[union-attr]
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_refresh_cannot_resurrect_a_concurrent_trash(self) -> None:
+        async def scenario(root: Path) -> None:
+            refresh_paused = trio.Event()
+            finish_refresh = trio.Event()
+            trash_done = trio.Event()
+
+            class RefreshClient:
+                async def asset_pages(self, owner_id: str):
+                    if owner_id != OWNER_ID:
+                        raise AssertionError(owner_id)
+                    yield [asset()]
+                    refresh_paused.set()
+                    await finish_refresh.wait()
+
+            with Catalog(root / "catalog.db") as catalog:
+                entry = catalog.add_uploaded(asset(), "photo.jpg")
+                lock = trio.Lock()
+                mutation = MutationClient()
+                mounted = library(
+                    catalog,
+                    root,
+                    mutation=mutation,
+                    mutation_session=session(),
+                    remote_delete=True,
+                    catalog_lock=lock,
+                )
+
+                async def trash() -> None:
+                    await mounted.remote_trash(entry)
+                    trash_done.set()
+
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(refresh_catalog, catalog, RefreshClient(), session(), lock)
+                    await refresh_paused.wait()
+                    nursery.start_soon(trash)
+                    await wait_all_tasks_blocked()
+                    self.assertEqual(mutation.trashes, [])
+                    finish_refresh.set()
+                    await trash_done.wait()
+
+                self.assertEqual(catalog.list_visible(), [])
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

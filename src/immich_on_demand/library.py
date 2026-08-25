@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import UUID
 
+import trio
+
 from .catalog import Catalog, CatalogAsset
 from .content_cache import ContentCache
 from .immich import ImmichClient, ServerSession
@@ -26,6 +28,7 @@ class Library:
         *,
         mutation_client: ImmichClient | None = None,
         mutation_session: ServerSession | None = None,
+        catalog_lock: trio.Lock,
     ) -> None:
         self._catalog = catalog
         self._read_client = read_client
@@ -33,6 +36,8 @@ class Library:
         self._mutation_session = mutation_session
         self._content_cache = content_cache
         self._settings = settings
+        # ponytail: one service-wide lock; split only if mutation throughput matters.
+        self._catalog_lock = catalog_lock
 
     def list(self) -> list[CatalogAsset]:
         return self._catalog.list_visible()
@@ -61,17 +66,18 @@ class Library:
     async def upload_new(self, staged_path: Path, requested_name: str) -> CatalogAsset:
         if safe_filename(requested_name, str(UUID(int=0))) != requested_name:
             raise ValueError("requested library name is not safe")
-        if self._catalog.by_name(requested_name) is not None:
-            raise FileExistsError(requested_name)
-        mutation, session = self._mutation_access()
+        async with self._catalog_lock:
+            if self._catalog.by_name(requested_name) is not None:
+                raise FileExistsError(requested_name)
+            mutation, session = self._mutation_access()
 
-        result = await mutation.upload(staged_path, session.media_types)
-        if not result.created:
-            raise FileExistsError("Immich already contains an asset with identical content")
-        uploaded = await self._read_client.asset(result.asset_id)
-        if uploaded.owner_id != session.owner_id:
-            raise LibraryError("uploaded asset is not owned by the mutation user")
-        return self._catalog.add_uploaded(uploaded, requested_name)
+            result = await mutation.upload(staged_path, session.media_types)
+            if not result.created:
+                raise FileExistsError("Immich already contains an asset with identical content")
+            uploaded = await self._read_client.asset(result.asset_id)
+            if uploaded.owner_id != session.owner_id:
+                raise LibraryError("uploaded asset is not owned by the mutation user")
+            return self._catalog.add_uploaded(uploaded, requested_name)
 
     async def remote_trash(self, entry: CatalogAsset) -> None:
         if not self._settings.remote_delete:
@@ -79,14 +85,15 @@ class Library:
         mutation, session = self._mutation_access()
         if not session.trash_enabled:
             raise PermissionError("Immich trash is disabled")
-        current = self._catalog.by_inode(entry.inode)
-        if current is None or current.asset.id != entry.asset.id:
-            raise LibraryError("asset is no longer in the catalog")
-        if current.asset.owner_id != session.owner_id:
-            raise PermissionError("only owned assets can be remotely deleted")
+        async with self._catalog_lock:
+            current = self._catalog.by_inode(entry.inode)
+            if current is None or current.asset.id != entry.asset.id:
+                raise LibraryError("asset is no longer in the catalog")
+            if current.asset.owner_id != session.owner_id:
+                raise PermissionError("only owned assets can be remotely deleted")
 
-        await mutation.trash(current.asset.id, trash_enabled=True)
-        self._catalog.mark_trashed(current.asset.id)
+            await mutation.trash(current.asset.id)
+            self._catalog.mark_trashed(current.asset.id)
 
     def _mutation_access(self) -> tuple[ImmichClient, ServerSession]:
         if self._mutation_client is None or self._mutation_session is None:

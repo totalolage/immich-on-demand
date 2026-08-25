@@ -60,6 +60,7 @@ async def _refresh_worker(
     library: Library,
     read_client: ImmichClient,
     read_session: ServerSession,
+    catalog_lock: trio.Lock,
     content_cache: ContentCache,
     settings: Settings,
     initial_entries: list[CatalogAsset],
@@ -76,7 +77,7 @@ async def _refresh_worker(
 
     async for _ in requests:
         try:
-            await refresh_catalog(catalog, read_client, read_session)
+            await refresh_catalog(catalog, read_client, read_session, catalog_lock)
             try:
                 _evict_to_limits(content_cache, settings)
             except Exception as error:
@@ -125,6 +126,7 @@ async def run_service(settings: Settings) -> None:
         state_root = state_path()
         cache_root = cache_path()
         with Catalog(state_root / "catalog.db") as catalog:
+            catalog_lock = trio.Lock()
             content_cache = ContentCache(cache_root / "originals", read_client)
             library = Library(
                 catalog,
@@ -133,8 +135,9 @@ async def run_service(settings: Settings) -> None:
                 settings,
                 mutation_client=mutation_client,
                 mutation_session=mutation_session,
+                catalog_lock=catalog_lock,
             )
-            await refresh_catalog(catalog, read_client, read_session)
+            await refresh_catalog(catalog, read_client, read_session, catalog_lock)
 
             requests, refreshes = trio.open_memory_channel[None](1)
 
@@ -197,6 +200,7 @@ async def run_service(settings: Settings) -> None:
                     library,
                     read_client,
                     read_session,
+                    catalog_lock,
                     content_cache,
                     settings,
                     library.list(),

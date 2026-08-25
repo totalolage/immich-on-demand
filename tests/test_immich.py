@@ -184,10 +184,14 @@ class ImmichClientTest(unittest.TestCase):
             trio.run(scenario, path)
         self.assertEqual(requests, ["/api/assets/bulk-upload-check"])
 
-    def test_trash_never_requests_permanent_deletion(self) -> None:
+    def test_trash_refetches_feature_and_never_requests_permanent_deletion(self) -> None:
+        requests: list[tuple[str, str]] = []
+
         def handler(request: httpx.Request) -> httpx.Response:
-            self.assertEqual(request.url.path, "/api/assets")
-            self.assertEqual(request.method, "DELETE")
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/api/server/features":
+                return httpx.Response(200, json={"trash": True})
+            self.assertEqual((request.method, request.url.path), ("DELETE", "/api/assets"))
             self.assertEqual(request.read(), b'{"ids":["12345678-1234-4234-8234-123456789abc"],"force":false}')
             return httpx.Response(204)
 
@@ -195,6 +199,33 @@ class ImmichClientTest(unittest.TestCase):
             async with ImmichClient(
                 "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
             ) as client:
-                await client.trash(ASSET_ID, trash_enabled=True)
+                await client.trash(ASSET_ID)
+                await client.trash(ASSET_ID)
 
         trio.run(scenario)
+        self.assertEqual(
+            requests,
+            [
+                ("GET", "/api/server/features"),
+                ("DELETE", "/api/assets"),
+                ("GET", "/api/server/features"),
+                ("DELETE", "/api/assets"),
+            ],
+        )
+
+    def test_trash_requires_literal_true_from_fresh_feature_response(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            return httpx.Response(200, json={"trash": 1})
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                with self.assertRaisesRegex(ImmichError, "trash is disabled"):
+                    await client.trash(ASSET_ID)
+
+        trio.run(scenario)
+        self.assertEqual(requests, [("GET", "/api/server/features")])

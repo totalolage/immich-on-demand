@@ -42,6 +42,7 @@ class ServiceFakes:
         self.background_done = trio.Event()
         self.on_uploaded: object = None
         self.fuse_options: set[str] = set()
+        self.catalog_locks: list[object] = []
         outer = self
 
         class Client:
@@ -100,7 +101,9 @@ class ServiceFakes:
                 *,
                 mutation_client: object = None,
                 mutation_session: object = None,
+                catalog_lock: object,
             ) -> None:
+                outer.catalog_locks.append(catalog_lock)
                 self.mutation_enabled = mutation_client is not None and mutation_session is not None
                 outer.events.append(f"library:mutation={self.mutation_enabled}")
 
@@ -125,7 +128,10 @@ class ServiceFakes:
             return "mutation"
         raise RuntimeError("expected one mutation API key in Secret Service, found 0")
 
-    async def refresh(self, catalog: object, client: object, session: object) -> CatalogStats:
+    async def refresh(
+        self, catalog: object, client: object, session: object, catalog_lock: object
+    ) -> CatalogStats:
+        self.catalog_locks.append(catalog_lock)
         self.events.append("refresh")
         if self.events.count("refresh") == 2:
             self.second_refresh.set()
@@ -277,6 +283,10 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(fakes.cache.asset_evictions, [ASSET_ID])
             self.assertIn("fuse-close:True", fakes.events)
             self.assertIn("control-close", fakes.events)
+            self.assertTrue(fakes.catalog_locks)
+            self.assertTrue(
+                all(lock is fakes.catalog_locks[0] for lock in fakes.catalog_locks)
+            )
             self.assertIn("catalog-close", fakes.events)
             self.assertIn("close:read", fakes.events)
             self.assertIn("close:mutation", fakes.events)

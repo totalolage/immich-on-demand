@@ -229,9 +229,10 @@ class ImmichClient:
         UUID(asset_id)
         return UploadResult(asset_id, response.status_code == 201)
 
-    async def trash(self, asset_id: str, *, trash_enabled: bool) -> None:
+    async def trash(self, asset_id: str) -> None:
         UUID(asset_id)
-        if not trash_enabled:
+        features = await self._json("GET", "server/features")
+        if features.get("trash") is not True:
             raise ImmichError("Immich trash is disabled; refusing remote deletion")
         await self._request("DELETE", "assets", json={"ids": [asset_id], "force": False})
 
