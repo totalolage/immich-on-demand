@@ -11,12 +11,19 @@ from uuid import UUID
 import pyfuse3
 import trio
 
-from .app import refresh_catalog
+from .app import FullRefreshRequired, refresh_catalog, refresh_catalog_incremental
 from .catalog import Catalog, CatalogAsset
 from .content_cache import ContentCache
 from .control import serve_control
 from .filesystem import ImmichFilesystem
-from .immich import ImmichClient, MUTATION_PERMISSIONS, ServerSession, UPLOAD_PERMISSIONS
+from .immich import (
+    ImmichClient,
+    ImmichPageLimitError,
+    ImmichResponseError,
+    MUTATION_PERMISSIONS,
+    ServerSession,
+    UPLOAD_PERMISSIONS,
+)
 from .library import Library
 from .previewer import populate_previews
 from .settings import Settings, cache_path, load_api_key, runtime_path, state_path
@@ -24,6 +31,7 @@ from .thumbnails import prepare_thumbnail_cache
 
 
 LOGGER = logging.getLogger(__name__)
+FULL_REFRESH_SECONDS = 24 * 60 * 60
 
 
 def _check_mountpoint(path: Path) -> None:
@@ -76,7 +84,8 @@ async def _refresh_worker(
     settings: Settings,
     mount_ready: trio.Event,
     initial_entries: list[CatalogAsset],
-    requests: trio.MemoryReceiveChannel[None],
+    requests: trio.MemoryReceiveChannel[bool],
+    full_requested: list[bool],
     fatal_errors: list[str],
     *,
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
@@ -89,9 +98,26 @@ async def _refresh_worker(
         task_status=task_status,
     )
 
-    async for _ in requests:
+    async for force_full in requests:
+        force_full = force_full or full_requested[0]
+        full_requested[0] = False
         try:
-            await refresh_catalog(catalog, read_client, read_session, catalog_lock)
+            if force_full:
+                await refresh_catalog(catalog, read_client, read_session, catalog_lock)
+            else:
+                await refresh_catalog_incremental(
+                    catalog,
+                    read_client,
+                    read_session,
+                    catalog_lock,
+                    refresh_seconds=settings.refresh_seconds,
+                )
+        except (FullRefreshRequired, ImmichPageLimitError, ImmichResponseError):
+            try:
+                await refresh_catalog(catalog, read_client, read_session, catalog_lock)
+            except Exception as error:
+                LOGGER.warning("background full refresh failed: %s", error)
+                continue
         except Exception as error:
             LOGGER.warning("background refresh failed: %s", error)
             continue
@@ -116,12 +142,17 @@ async def _refresh_worker(
 
 
 async def _periodic_refresh(
-    requests: trio.MemorySendChannel[None], interval: int
+    requests: trio.MemorySendChannel[bool],
+    interval: int,
+    force_full: bool,
+    full_requested: list[bool],
 ) -> None:
     while True:
         await trio.sleep(interval)
+        if force_full:
+            full_requested[0] = True
         try:
-            requests.send_nowait(None)
+            requests.send_nowait(force_full)
         except trio.WouldBlock:
             pass
 
@@ -173,7 +204,8 @@ async def run_service(settings: Settings) -> None:
             )
             await refresh_catalog(catalog, read_client, read_session, catalog_lock)
 
-            requests, refreshes = trio.open_memory_channel[None](1)
+            requests, refreshes = trio.open_memory_channel[bool](1)
+            full_requested = [False]
             mount_ready = trio.Event()
             fatal_errors: list[str] = []
 
@@ -192,7 +224,7 @@ async def run_service(settings: Settings) -> None:
                     fatal_errors.append("preview suppression failed; mount terminated")
                     raise
                 try:
-                    requests.send_nowait(None)
+                    requests.send_nowait(False)
                 except trio.WouldBlock:
                     pass
 
@@ -212,12 +244,12 @@ async def run_service(settings: Settings) -> None:
             async def refresh(params: dict[str, Any]) -> dict[str, bool]:
                 if params:
                     raise ValueError("refresh takes no parameters")
+                full_requested[0] = True
                 try:
-                    requests.send_nowait(None)
-                    scheduled = True
+                    requests.send_nowait(True)
                 except trio.WouldBlock:
-                    scheduled = False
-                return {"scheduled": scheduled}
+                    pass
+                return {"scheduled": True}
 
             async def evict(params: dict[str, Any]) -> dict[str, object]:
                 if not params:
@@ -249,6 +281,7 @@ async def run_service(settings: Settings) -> None:
                     mount_ready,
                     library.list(),
                     refreshes,
+                    full_requested,
                     fatal_errors,
                 )
                 try:
@@ -268,7 +301,20 @@ async def run_service(settings: Settings) -> None:
                         runtime_path() / "control.sock",
                         {"status": status, "refresh": refresh, "evict": evict},
                     )
-                    nursery.start_soon(_periodic_refresh, requests, settings.refresh_seconds)
+                    nursery.start_soon(
+                        _periodic_refresh,
+                        requests,
+                        settings.refresh_seconds,
+                        False,
+                        full_requested,
+                    )
+                    nursery.start_soon(
+                        _periodic_refresh,
+                        requests,
+                        FULL_REFRESH_SECONDS,
+                        True,
+                        full_requested,
+                    )
                     await pyfuse3.main()
                 finally:
                     try:

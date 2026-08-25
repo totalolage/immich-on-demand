@@ -10,14 +10,42 @@ from unittest.mock import patch
 import trio
 
 from immich_on_demand.catalog import CatalogAsset, CatalogStats
-from immich_on_demand.immich import MUTATION_PERMISSIONS, ServerSession, UPLOAD_PERMISSIONS
+from immich_on_demand.immich import (
+    ImmichPageLimitError,
+    ImmichResponseError,
+    MUTATION_PERMISSIONS,
+    ServerSession,
+    UPLOAD_PERMISSIONS,
+)
 from immich_on_demand.model import Asset
-from immich_on_demand.service import run_service
+from immich_on_demand.service import FULL_REFRESH_SECONDS, _periodic_refresh, run_service
 from immich_on_demand.settings import Settings
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+
+
+def upload_entry() -> CatalogAsset:
+    return CatalogAsset(
+        Asset(
+            ASSET_ID,
+            OWNER_ID,
+            "new.jpg",
+            "image/jpeg",
+            None,
+            1,
+            2,
+            "2026-08-25T12:00:00Z",
+            "abc=",
+            "timeline",
+            False,
+            False,
+            None,
+        ),
+        2,
+        "new.jpg",
+    )
 
 
 class ServiceFakes:
@@ -30,12 +58,16 @@ class ServiceFakes:
         block_preview: bool = True,
         preview_error_call: int | None = None,
         refresh_error_call: int | None = None,
+        incremental_page_limit: bool = False,
+        incremental_response_error: bool = False,
     ) -> None:
         self.root = root
         self.mutation = mutation
         self.block_preview = block_preview
         self.preview_error_call = preview_error_call
         self.refresh_error_call = refresh_error_call
+        self.incremental_page_limit = incremental_page_limit
+        self.incremental_response_error = incremental_response_error
         self.events: list[str] = []
         self.clients: list[ServiceFakes.Client] = []
         self.handlers: dict[str, object] = {}
@@ -46,6 +78,7 @@ class ServiceFakes:
         self.terminated = trio.Event()
         self.second_refresh = trio.Event()
         self.background_done = trio.Event()
+        self.incremental_done = trio.Event()
         self.on_uploaded: object = None
         self.fuse_options: set[str] = set()
         self.catalog_locks: list[object] = []
@@ -153,6 +186,24 @@ class ServiceFakes:
             raise OSError("Immich unavailable")
         return CatalogStats(7, 6, 1, 0, 0, 0)
 
+    async def incremental_refresh(
+        self,
+        catalog: object,
+        client: object,
+        session: object,
+        catalog_lock: object,
+        *,
+        refresh_seconds: int,
+    ) -> CatalogStats:
+        self.catalog_locks.append(catalog_lock)
+        self.events.append(f"incremental:{refresh_seconds}")
+        self.incremental_done.set()
+        if self.incremental_page_limit:
+            raise ImmichPageLimitError("page limit")
+        if self.incremental_response_error:
+            raise ImmichResponseError("invalid search response")
+        return CatalogStats(7, 6, 1, 0, 0, 0)
+
     async def previews(
         self,
         entries: object,
@@ -216,6 +267,7 @@ class ServiceFakes:
             "ImmichFilesystem": self.Filesystem,
             "load_api_key": self.key,
             "refresh_catalog": self.refresh,
+            "refresh_catalog_incremental": self.incremental_refresh,
             "populate_previews": self.previews,
             "serve_control": self.control,
             "state_path": lambda: self.root / "state",
@@ -234,6 +286,92 @@ class ServiceFakes:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_periodic_refresh_wakes_for_the_daily_full_sweep(self) -> None:
+        async def scenario() -> None:
+            sleeps: list[int] = []
+
+            async def stop_after_sleep(seconds: int) -> None:
+                sleeps.append(seconds)
+                if len(sleeps) == 2:
+                    raise RuntimeError("stop")
+
+            requests, refreshes = trio.open_memory_channel[bool](1)
+            full_requested = [False]
+            with patch("immich_on_demand.service.trio.sleep", stop_after_sleep):
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    await _periodic_refresh(
+                        requests,
+                        FULL_REFRESH_SECONDS,
+                        True,
+                        full_requested,
+                    )
+            self.assertEqual(sleeps, [FULL_REFRESH_SECONDS, FULL_REFRESH_SECONDS])
+            self.assertTrue(full_requested[0])
+            self.assertTrue(refreshes.receive_nowait())
+
+        trio.run(scenario)
+
+    def test_manual_refresh_upgrades_an_already_queued_incremental_refresh(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(root)
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+            with fakes.patches():
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    callback = fakes.on_uploaded
+                    await callback(upload_entry())  # type: ignore[operator]
+                    refresh = fakes.handlers["refresh"]
+                    self.assertEqual(  # type: ignore[operator]
+                        await refresh({}),
+                        {"scheduled": True},
+                    )
+                    fakes.preview_gate.set()
+                    with trio.fail_after(0.1):
+                        await fakes.second_refresh.wait()
+                    fakes.stop_main.set()
+
+            self.assertEqual(fakes.events.count("refresh"), 2)
+            self.assertNotIn("incremental:3600", fakes.events)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_incremental_anomalies_fall_back_to_a_full_sweep(self) -> None:
+        async def scenario(root: Path, option: str) -> None:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                **{option: True},
+            )
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+            with fakes.patches():
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    callback = fakes.on_uploaded
+                    await callback(upload_entry())  # type: ignore[operator]
+                    await fakes.second_refresh.wait()
+                    fakes.stop_main.set()
+
+            self.assertEqual(fakes.events.count("refresh"), 2)
+            self.assertLess(
+                fakes.events.index("incremental:3600"),
+                len(fakes.events) - 1 - fakes.events[::-1].index("refresh"),
+            )
+
+        for option in ("incremental_page_limit", "incremental_response_error"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as directory:
+                trio.run(scenario, Path(directory), option)
+
     def test_lifecycle_prompt_refresh_controls_and_cleanup(self) -> None:
         async def scenario(root: Path) -> None:
             fakes = ServiceFakes(root)
@@ -273,7 +411,7 @@ class ServiceTest(unittest.TestCase):
                     )
                     with trio.fail_after(0.1):
                         self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
-                        self.assertEqual(await refresh({}), {"scheduled": False})  # type: ignore[operator]
+                        self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
                     self.assertEqual(await evict({}), {"evicted": 1})  # type: ignore[operator]
                     self.assertEqual(
                         await evict({"asset": ASSET_ID}), {"evicted": True}  # type: ignore[operator]
@@ -284,6 +422,9 @@ class ServiceTest(unittest.TestCase):
                     fakes.preview_gate.set()
                     await fakes.second_refresh.wait()
                     await fakes.background_done.wait()
+                    callback = fakes.on_uploaded
+                    await callback(upload_entry())  # type: ignore[operator]
+                    await fakes.incremental_done.wait()
                     evictions = [
                         index
                         for index, event in enumerate(fakes.events)
@@ -293,6 +434,7 @@ class ServiceTest(unittest.TestCase):
                         index for index, event in enumerate(fakes.events) if event == "fetch"
                     ]
                     self.assertLess(evictions[1], fetches[1])
+                    self.assertIn("incremental:3600", fakes.events)
                     fakes.stop_main.set()
 
             assert fakes.cache is not None
@@ -526,9 +668,10 @@ class ServiceTest(unittest.TestCase):
                     self.assertEqual(fakes.events.count("refresh"), 1)
 
                     fakes.preview_gate.set()
-                    await fakes.second_refresh.wait()
+                    await fakes.incremental_done.wait()
                     await trio.sleep(0)
-                    self.assertEqual(fakes.events.count("refresh"), 2)
+                    self.assertEqual(fakes.events.count("refresh"), 1)
+                    self.assertIn("incremental:3600", fakes.events)
                     fakes.stop_main.set()
 
         with tempfile.TemporaryDirectory() as directory:

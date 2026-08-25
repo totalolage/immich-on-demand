@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import PurePath
 import re
 import unicodedata
@@ -20,11 +20,15 @@ def _truncate_utf8(value: str, limit: int) -> str:
     return encoded[:limit].decode("utf-8", errors="ignore")
 
 
-def _nanoseconds(value: str) -> int:
+def timestamp_nanoseconds(value: str) -> int:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("asset timestamp has no timezone")
-    return int(parsed.timestamp() * 1_000_000_000)
+    delta = parsed.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (
+        (delta.days * 24 * 60 * 60 + delta.seconds) * 1_000_000
+        + delta.microseconds
+    ) * 1000
 
 
 def _string(value: dict[str, object], name: str) -> str:
@@ -125,7 +129,7 @@ class Asset:
         created_at = _string(value, "fileCreatedAt")
         modified_at = _string(value, "fileModifiedAt")
         updated_at = _string(value, "updatedAt")
-        _nanoseconds(updated_at)
+        timestamp_nanoseconds(updated_at)
         library_id = value.get("libraryId")
         if library_id is not None:
             if not isinstance(library_id, str):
@@ -138,8 +142,8 @@ class Asset:
             original_name=_string(value, "originalFileName"),
             mime_type=_string(value, "originalMimeType"),
             size=size,
-            created_ns=_nanoseconds(created_at),
-            modified_ns=_nanoseconds(modified_at),
+            created_ns=timestamp_nanoseconds(created_at),
+            modified_ns=timestamp_nanoseconds(modified_at),
             updated_at=updated_at,
             checksum=_string(value, "checksum"),
             visibility=_string(value, "visibility"),

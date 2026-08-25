@@ -173,13 +173,13 @@ class CatalogTest(unittest.TestCase):
             with Catalog(Path(directory) / "catalog.db") as catalog:
                 catalog.begin_refresh()
                 catalog.stage([asset()])
-                catalog.finish_refresh()
+                catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
                 first = catalog.by_name("photo.jpg")
                 assert first is not None
 
                 catalog.begin_refresh()
                 catalog.stage([asset(), asset(OTHER_ID)])
-                catalog.finish_refresh()
+                catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
                 existing = catalog.by_inode(first.inode)
                 added = catalog.by_name(f"photo__{OTHER_ID}.jpg")
 
@@ -199,7 +199,7 @@ class CatalogTest(unittest.TestCase):
                         asset(OTHER_ID, "photo.jpg"),
                     ]
                 )
-                catalog.finish_refresh()
+                catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
 
                 names = {entry.asset.id: entry.name for entry in catalog.list_visible()}
                 self.assertEqual(names[ASSET_ID], "photo.jpg")
@@ -211,11 +211,51 @@ class CatalogTest(unittest.TestCase):
             with Catalog(Path(directory) / "catalog.db") as catalog:
                 catalog.begin_refresh()
                 catalog.stage([asset()])
-                catalog.finish_refresh()
+                catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
                 catalog.begin_refresh()
                 catalog.stage([asset(OTHER_ID)])
 
                 self.assertEqual([entry.asset.id for entry in catalog.list_visible()], [ASSET_ID])
+
+    def test_incremental_refresh_upserts_without_removing_absent_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset(), asset(OTHER_ID, "other.jpg")])
+                catalog.finish_refresh(high_water_ms=1000, page_count=2)
+                before = catalog.by_name("photo.jpg")
+                assert before is not None
+
+                catalog.begin_refresh()
+                catalog.stage(
+                    [
+                        replace(
+                            asset(),
+                            original_name="renamed.jpg",
+                            updated_at="2026-08-25T12:05:00Z",
+                        )
+                    ]
+                )
+                catalog.finish_incremental(high_water_ms=2000)
+
+                after = catalog.by_inode(before.inode)
+                self.assertEqual(after and after.name, "photo.jpg")
+                self.assertEqual(after and after.asset.original_name, "renamed.jpg")
+                self.assertIsNotNone(catalog.by_name("other.jpg"))
+                self.assertEqual(catalog.refresh_state(), (2000, 2))
+
+    def test_complete_refresh_replaces_a_newer_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(high_water_ms=2000, page_count=2)
+
+                catalog.begin_refresh()
+                catalog.finish_refresh(high_water_ms=0, page_count=1)
+
+                self.assertEqual(catalog.refresh_state(), (0, 1))
+                self.assertEqual(catalog.list_visible(), [])
 
     def test_hides_non_filesystem_assets_and_reports_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -229,7 +269,10 @@ class CatalogTest(unittest.TestCase):
                         replace(asset("42345678-1234-4234-8234-123456789abc"), visibility="hidden"),
                     ]
                 )
-                stats = catalog.finish_refresh()
+                stats = catalog.finish_refresh(
+                    high_water_ms=1_787_659_200_000,
+                    page_count=1,
+                )
 
                 self.assertEqual(stats.total, 4)
                 self.assertEqual(stats.visible, 1)
@@ -242,7 +285,7 @@ class CatalogTest(unittest.TestCase):
             with Catalog(Path(directory) / "catalog.db") as catalog:
                 catalog.begin_refresh()
                 catalog.stage([asset()])
-                catalog.finish_refresh()
+                catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
 
                 added = catalog.add_uploaded(asset(OTHER_ID), "photo.jpg")
                 refreshed = catalog.add_uploaded(
@@ -261,7 +304,7 @@ class CatalogTest(unittest.TestCase):
                 catalog.stage(
                     [asset(ASSET_ID, "photo.jpg"), asset(LITERAL_ID, generated)]
                 )
-                catalog.finish_refresh()
+                catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
 
                 added = catalog.add_uploaded(asset(OTHER_ID), "photo.jpg")
 

@@ -93,6 +93,8 @@ The service creates a missing mount directory. An existing mount directory must 
 
 Startup deliberately requires Immich to be online. Before mounting, the service validates the configured keys, refreshes the catalog, and prepares Preview suppression. If Immich becomes unavailable later, the running mount keeps its catalog and continues to serve cached originals. Reads of uncached originals fail until Immich returns.
 
+Routine background refreshes request only assets updated within an overlapping time window and never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete sweeps before removing rows.
+
 To enable remote deletion, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.delete`. The service fails closed if either key has unexpected permissions.
 
 Start the filesystem as a systemd user service:
@@ -154,7 +156,7 @@ scripts/check
 
 ## Future work
 
-Version 1.0 is available on GitHub but is not published to the AUR.
+Version 1.0 is available on GitHub. The AUR recipe is ready, but publication is blocked while the AUR is not accepting account signups.
 
 Albums, people, dates, and other views are also deferred. A future version may expose paths such as `{Albums,People,All,by Date}/asset.ext` and hardlink repeated views of the same asset.
 

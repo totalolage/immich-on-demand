@@ -160,6 +160,8 @@ class Catalog:
                 value INTEGER NOT NULL
             );
             INSERT OR IGNORE INTO metadata(key, value) VALUES ('next_inode', 2);
+            INSERT OR IGNORE INTO metadata(key, value) VALUES ('high_water_ms', 0);
+            INSERT OR IGNORE INTO metadata(key, value) VALUES ('full_refresh_pages', 0);
             """
         )
         self._connection.commit()
@@ -194,9 +196,46 @@ class Catalog:
         )
         self._connection.commit()
 
-    def finish_refresh(self) -> CatalogStats:
+    def finish_refresh(
+        self,
+        *,
+        high_water_ms: int,
+        page_count: int,
+    ) -> CatalogStats:
+        self._validate_refresh_state(high_water_ms, page_count)
+        return self._finish_staged(
+            delete_missing=True,
+            high_water_ms=high_water_ms,
+            page_count=page_count,
+        )
+
+    def finish_incremental(self, *, high_water_ms: int) -> CatalogStats:
+        self._validate_refresh_state(high_water_ms, None)
+        return self._finish_staged(
+            delete_missing=False,
+            high_water_ms=high_water_ms,
+            page_count=None,
+        )
+
+    @staticmethod
+    def _validate_refresh_state(high_water_ms: int, page_count: int | None) -> None:
+        if type(high_water_ms) is not int or high_water_ms < 0:
+            raise ValueError("high_water_ms must be a non-negative integer")
+        if page_count is not None and (type(page_count) is not int or page_count < 1):
+            raise ValueError("page_count must be a positive integer")
+
+    def _finish_staged(
+        self,
+        *,
+        delete_missing: bool,
+        high_water_ms: int,
+        page_count: int | None,
+    ) -> CatalogStats:
         with self._connection:
-            self._connection.execute("DELETE FROM assets WHERE id NOT IN (SELECT id FROM incoming_assets)")
+            if delete_missing:
+                self._connection.execute(
+                    "DELETE FROM assets WHERE id NOT IN (SELECT id FROM incoming_assets)"
+                )
             existing = {
                 row["id"]: (row["inode"], row["name"])
                 for row in self._connection.execute("SELECT id, inode, name FROM assets")
@@ -230,8 +269,31 @@ class Catalog:
             self._connection.execute(
                 "UPDATE metadata SET value = ? WHERE key = 'next_inode'", (next_inode,)
             )
+            if page_count is not None:
+                self._connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = 'high_water_ms'",
+                    (high_water_ms,),
+                )
+                self._connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = 'full_refresh_pages'",
+                    (page_count,),
+                )
+            else:
+                self._connection.execute(
+                    "UPDATE metadata SET value = max(value, ?) WHERE key = 'high_water_ms'",
+                    (high_water_ms,),
+                )
             self._connection.execute("DELETE FROM incoming_assets")
         return self.stats()
+
+    def refresh_state(self) -> tuple[int, int]:
+        values = {
+            row["key"]: row["value"]
+            for row in self._connection.execute(
+                "SELECT key, value FROM metadata WHERE key IN ('high_water_ms', 'full_refresh_pages')"
+            )
+        }
+        return int(values["high_water_ms"]), int(values["full_refresh_pages"])
 
     def stats(self) -> CatalogStats:
         row = self._connection.execute(

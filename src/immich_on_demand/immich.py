@@ -27,6 +27,14 @@ class ImmichError(RuntimeError):
     pass
 
 
+class ImmichPageLimitError(ImmichError):
+    pass
+
+
+class ImmichResponseError(ImmichError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class ServerSession:
     owner_id: str
@@ -87,9 +95,12 @@ class ImmichClient:
 
     async def _json(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
         response = await self._request(method, path, **kwargs)
-        value = response.json()
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise ImmichResponseError(f"Immich {path} returned invalid JSON") from error
         if not isinstance(value, dict):
-            raise ImmichError(f"Immich {path} returned a non-object response")
+            raise ImmichResponseError(f"Immich {path} returned a non-object response")
         return value
 
     async def validate(
@@ -157,48 +168,86 @@ class ImmichClient:
             raise ImmichError("Immich returned invalid server features")
         return ServerSession(owner_id, version, media_types, trash_enabled)
 
-    async def asset_pages(self, owner_id: str, page_size: int = 1000) -> AsyncIterator[list[Asset]]:
+    async def asset_pages(
+        self,
+        owner_id: str,
+        page_size: int = 1000,
+        *,
+        updated_after_ms: int | None = None,
+        allow_duplicate_ids: bool = False,
+        page_limit: int | None = None,
+    ) -> AsyncIterator[list[Asset]]:
         UUID(owner_id)
         if type(page_size) is not int or not 1 <= page_size <= 1000:
             raise ValueError("page_size must be between 1 and 1000")
+        if updated_after_ms is not None and (
+            type(updated_after_ms) is not int or updated_after_ms < 0
+        ):
+            raise ValueError("updated_after_ms must be a non-negative integer")
+        if type(allow_duplicate_ids) is not bool:
+            raise ValueError("allow_duplicate_ids must be a boolean")
+        if page_limit is not None and (type(page_limit) is not int or page_limit < 1):
+            raise ValueError("page_limit must be a positive integer")
         page = 1
         seen_asset_ids: set[str] = set()
         while True:
+            body: dict[str, object] = {
+                "page": page,
+                "size": page_size,
+                "order": "asc",
+                "withExif": True,
+                "withDeleted": True,
+                "withStacked": True,
+            }
+            if updated_after_ms is not None:
+                body["updatedAfter"] = datetime.fromtimestamp(
+                    updated_after_ms / 1000, timezone.utc
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             value = await self._json(
                 "POST",
                 "search/metadata",
-                json={
-                    "page": page,
-                    "size": page_size,
-                    "order": "asc",
-                    "withExif": True,
-                    "withDeleted": True,
-                    "withStacked": True,
-                },
+                json=body,
             )
             assets_value = value.get("assets")
             if not isinstance(assets_value, dict) or not isinstance(assets_value.get("items"), list):
-                raise ImmichError("Immich search response has no asset list")
+                raise ImmichResponseError("Immich search response has no asset list")
             items = assets_value["items"]
             if any(not isinstance(item, dict) for item in items):
-                raise ImmichError("Immich search response contains a non-object asset")
+                raise ImmichResponseError(
+                    "Immich search response contains a non-object asset"
+                )
             count = assets_value.get("count")
             if type(count) is not int or count != len(items):
-                raise ImmichError("Immich search response has an invalid asset count")
+                raise ImmichResponseError(
+                    "Immich search response has an invalid asset count"
+                )
             if "nextPage" not in assets_value:
-                raise ImmichError("Immich search response has no next page field")
+                raise ImmichResponseError(
+                    "Immich search response has no next page field"
+                )
             next_page = assets_value["nextPage"]
             if next_page is not None and next_page != str(page + 1):
-                raise ImmichError("Immich search response has an invalid next page")
+                raise ImmichResponseError(
+                    "Immich search response has an invalid next page"
+                )
 
-            assets = [Asset.from_api(item) for item in items]
+            try:
+                assets = [Asset.from_api(item) for item in items]
+            except ValueError as error:
+                raise ImmichResponseError(
+                    "Immich search response contains an invalid asset"
+                ) from error
             for asset in assets:
-                if asset.id in seen_asset_ids:
-                    raise ImmichError("Immich search response contains a duplicate asset")
+                if asset.id in seen_asset_ids and not allow_duplicate_ids:
+                    raise ImmichResponseError(
+                        "Immich search response contains a duplicate asset"
+                    )
                 seen_asset_ids.add(asset.id)
             yield [asset for asset in assets if asset.owner_id == owner_id]
             if next_page is None:
                 return
+            if page_limit is not None and page >= page_limit:
+                raise ImmichPageLimitError("Immich search exceeded its page limit")
             page += 1
 
     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:

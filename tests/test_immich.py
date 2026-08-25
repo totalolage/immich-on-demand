@@ -1,5 +1,6 @@
 import unittest
 from contextlib import aclosing
+import json
 import logging
 from pathlib import Path
 import tempfile
@@ -7,7 +8,7 @@ import tempfile
 import httpx
 import trio
 
-from immich_on_demand.immich import ImmichClient, ImmichError
+from immich_on_demand.immich import ImmichClient, ImmichError, ImmichPageLimitError
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
@@ -34,6 +35,29 @@ def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
 
 
 class ImmichClientTest(unittest.TestCase):
+    def test_asset_pages_sends_an_inclusive_millisecond_update_bound(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.assertEqual(body["updatedAfter"], "2026-08-25T12:00:00.123Z")
+            return httpx.Response(
+                200,
+                json={"assets": {"items": [], "count": 0, "nextPage": None}},
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                self.assertEqual(
+                    [page async for page in client.asset_pages(
+                        OWNER_ID,
+                        updated_after_ms=1_787_659_200_123,
+                    )],
+                    [[]],
+                )
+
+        trio.run(scenario)
+
     def test_rejects_non_object_asset_items(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -105,6 +129,40 @@ class ImmichClientTest(unittest.TestCase):
         trio.run(scenario)
         self.assertEqual(requests, 2)
 
+    def test_incremental_pages_allow_shifted_duplicate_asset_ids(self) -> None:
+        requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "assets": {
+                        "items": [asset()],
+                        "count": 1,
+                        "nextPage": "2" if requests == 1 else None,
+                    }
+                },
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                pages = [
+                    page
+                    async for page in client.asset_pages(
+                        OWNER_ID,
+                        updated_after_ms=0,
+                        allow_duplicate_ids=True,
+                    )
+                ]
+                self.assertEqual([[item.id for item in page] for page in pages], [[ASSET_ID], [ASSET_ID]])
+
+        trio.run(scenario)
+        self.assertEqual(requests, 2)
+
     def test_requires_an_explicit_terminal_page_and_matching_count(self) -> None:
         async def scenario(assets_value: dict[str, object], message: str) -> None:
             def handler(request: httpx.Request) -> httpx.Response:
@@ -144,6 +202,35 @@ class ImmichClientTest(unittest.TestCase):
             ) as client:
                 pages = [page async for page in client.asset_pages(OWNER_ID, page_size=1)]
                 self.assertEqual([[item.id for item in page] for page in pages], [[ASSET_ID]])
+
+        trio.run(scenario)
+        self.assertEqual(requests, 1)
+
+    def test_page_limit_stops_before_the_next_request(self) -> None:
+        requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "assets": {
+                        "items": [asset()],
+                        "count": 1,
+                        "nextPage": str(requests + 1),
+                    }
+                },
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                async with aclosing(client.asset_pages(OWNER_ID, page_limit=1)) as pages:
+                    self.assertEqual((await anext(pages))[0].id, ASSET_ID)
+                    with self.assertRaisesRegex(ImmichPageLimitError, "page limit"):
+                        await anext(pages)
 
         trio.run(scenario)
         self.assertEqual(requests, 1)

@@ -1,13 +1,15 @@
 # Publish the Arch package to the AUR
 
 Type: delivery
-Status: ready
+Status: blocked
 Target: 1.0.x
-Blocked by: none
+Blocked by: AUR account signups reopening
 
 ## Scope
 
 Publish the released `PKGBUILD` and generated `.SRCINFO` under `immich-on-demand`. Keep the AUR repository limited to packaging files and update its source checksum for each release tag.
+
+The package metadata is generated and validates with `makepkg --printsrcinfo`. Publication is externally blocked while the AUR is not accepting account signups.
 
 ## Acceptance
 

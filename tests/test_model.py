@@ -2,7 +2,12 @@ import signal
 import unittest
 from uuid import UUID
 
-from immich_on_demand.model import Asset, collision_name, safe_filename
+from immich_on_demand.model import (
+    Asset,
+    collision_name,
+    safe_filename,
+    timestamp_nanoseconds,
+)
 
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
@@ -32,6 +37,12 @@ def raise_timeout(*_: object) -> None:
 
 
 class ModelTest(unittest.TestCase):
+    def test_timestamp_conversion_preserves_exact_milliseconds(self) -> None:
+        self.assertEqual(
+            timestamp_nanoseconds("2026-08-25T12:00:00.123Z"),
+            1_787_659_200_123_000_000,
+        )
+
     def test_sanitizes_untrusted_filename_without_losing_extension(self) -> None:
         self.assertEqual(safe_filename("../.bad\nname.jpg", ASSET_ID), "_bad_name.jpg")
         self.assertEqual(safe_filename("..", ASSET_ID), ASSET_ID)

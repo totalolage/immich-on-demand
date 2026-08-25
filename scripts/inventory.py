@@ -11,7 +11,7 @@ import trio
 
 from immich_on_demand.catalog import Catalog
 from immich_on_demand.immich import ImmichClient
-from immich_on_demand.model import safe_filename
+from immich_on_demand.model import safe_filename, timestamp_nanoseconds
 from immich_on_demand.settings import Settings, load_api_key
 
 
@@ -27,9 +27,16 @@ async def inventory(server: str) -> dict[str, object]:
             async with ImmichClient(server, load_api_key(settings)) as client:
                 session = await client.validate()
                 catalog.begin_refresh()
+                high_water_ms = 0
+                page_count = 0
                 async for page in client.asset_pages(session.owner_id):
+                    page_count += 1
                     catalog.stage(page)
                     for asset in page:
+                        high_water_ms = max(
+                            high_water_ms,
+                            timestamp_nanoseconds(asset.updated_at) // 1_000_000,
+                        )
                         mime_types[asset.mime_type] += 1
                         unsafe_names += safe_filename(asset.original_name, asset.id) != asset.original_name
                         if asset.visible:
@@ -45,7 +52,10 @@ async def inventory(server: str) -> dict[str, object]:
                             size_buckets["10_to_100_mib"] += 1
                         else:
                             size_buckets["100_mib_or_more"] += 1
-                stats = catalog.finish_refresh()
+                stats = catalog.finish_refresh(
+                    high_water_ms=high_water_ms,
+                    page_count=page_count,
+                )
 
     # ponytail: one name per asset in memory; aggregate in SQLite if a million-asset library makes this costly.
     collision_groups = [count for count in names.values() if count > 1]
