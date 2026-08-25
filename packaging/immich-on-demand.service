@@ -4,6 +4,7 @@ Description=Immich On-Demand filesystem
 [Service]
 Type=exec
 ExecStart=/usr/bin/immich-on-demand mount
+KillSignal=SIGINT
 Restart=on-failure
 RestartSec=5s
 UMask=0077

@@ -8,8 +8,9 @@ from unittest.mock import patch
 
 import trio
 
-from immich_on_demand.catalog import CatalogStats
+from immich_on_demand.catalog import CatalogAsset, CatalogStats
 from immich_on_demand.immich import MUTATION_PERMISSIONS, ServerSession, UPLOAD_PERMISSIONS
+from immich_on_demand.model import Asset
 from immich_on_demand.service import run_service
 from immich_on_demand.settings import Settings
 
@@ -39,6 +40,8 @@ class ServiceFakes:
         self.stop_main = trio.Event()
         self.second_refresh = trio.Event()
         self.background_done = trio.Event()
+        self.on_uploaded: object = None
+        self.fuse_options: set[str] = set()
         outer = self
 
         class Client:
@@ -78,6 +81,7 @@ class ServiceFakes:
 
             def evict_to_limits(self, **kwargs: int) -> list[str]:
                 self.limit_calls.append(kwargs)
+                outer.events.append(f"evict:{kwargs['max_bytes']}")
                 if len(self.limit_calls) == 3:
                     outer.background_done.set()
                 return ["old"]
@@ -104,7 +108,8 @@ class ServiceFakes:
                 return []
 
         class Filesystem:
-            def __init__(self, library: object, path: Path) -> None:
+            def __init__(self, library: object, path: Path, *, on_uploaded: object) -> None:
+                outer.on_uploaded = on_uploaded
                 outer.events.append(f"filesystem:{path.relative_to(root)}")
 
         self.Client = Client
@@ -158,6 +163,7 @@ class ServiceFakes:
             self.events.append("control-close")
 
     def fuse_init(self, filesystem: object, mountpoint: str, options: set[str]) -> None:
+        self.fuse_options = options
         self.events.append("fuse-init")
 
     async def fuse_main(self) -> None:
@@ -210,7 +216,9 @@ class ServiceTest(unittest.TestCase):
                     await fakes.main_started.wait()
                     self.assertLess(fakes.events.index("refresh"), fakes.events.index("suppress"))
                     self.assertLess(fakes.events.index("suppress"), fakes.events.index("fuse-init"))
+                    self.assertLess(fakes.events.index("evict:11"), fakes.events.index("fuse-init"))
                     self.assertNotIn("preview-done", fakes.events)
+                    self.assertIn("auto_unmount", fakes.fuse_options)
 
                     status = fakes.handlers["status"]
                     refresh = fakes.handlers["refresh"]
@@ -240,6 +248,15 @@ class ServiceTest(unittest.TestCase):
                     fakes.preview_gate.set()
                     await fakes.second_refresh.wait()
                     await fakes.background_done.wait()
+                    evictions = [
+                        index
+                        for index, event in enumerate(fakes.events)
+                        if event == "evict:11"
+                    ]
+                    fetches = [
+                        index for index, event in enumerate(fakes.events) if event == "fetch"
+                    ]
+                    self.assertLess(evictions[1], fetches[1])
                     fakes.stop_main.set()
 
             assert fakes.cache is not None
@@ -250,9 +267,13 @@ class ServiceTest(unittest.TestCase):
             }
             self.assertEqual(
                 fakes.cache.limit_calls[0],
+                expected_limits,
+            )
+            self.assertEqual(
+                fakes.cache.limit_calls[1],
                 {"max_age_seconds": 0, "max_bytes": 0, "minimum_free_bytes": 0},
             )
-            self.assertTrue(all(call == expected_limits for call in fakes.cache.limit_calls[1:]))
+            self.assertTrue(all(call == expected_limits for call in fakes.cache.limit_calls[2:]))
             self.assertEqual(fakes.cache.asset_evictions, [ASSET_ID])
             self.assertIn("fuse-close:True", fakes.events)
             self.assertIn("control-close", fakes.events)
@@ -260,6 +281,63 @@ class ServiceTest(unittest.TestCase):
             self.assertIn("close:read", fakes.events)
             self.assertIn("close:mutation", fakes.events)
             self.assertEqual(fakes.clients[1].validations, [UPLOAD_PERMISSIONS])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_upload_suppresses_fallback_before_coalesced_background_refresh(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(root)
+            settings = Settings("https://photos.example.test", root / "mount", refresh_seconds=3600)
+            entry = CatalogAsset(
+                Asset(
+                    ASSET_ID,
+                    OWNER_ID,
+                    "uploaded.jpg",
+                    "image/jpeg",
+                    123,
+                    1,
+                    4_999_999_999,
+                    "2026-08-25T12:00:00Z",
+                    "abc=",
+                    "timeline",
+                    False,
+                    False,
+                    None,
+                ),
+                3,
+                "uploaded.jpg",
+            )
+            installed: list[tuple[Path, int, int]] = []
+
+            def install(source: Path, mtime: int, size: int) -> None:
+                installed.append((source, mtime, size))
+                fakes.events.append("upload-suppressed")
+
+            with fakes.patches(), patch(
+                "immich_on_demand.service.install_failed_thumbnail", install
+            ):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    on_uploaded = fakes.on_uploaded
+                    assert callable(on_uploaded)
+                    await on_uploaded(entry)
+                    await on_uploaded(entry)
+                    self.assertEqual(
+                        installed,
+                        [
+                            (root / "mount" / "uploaded.jpg", 4, 123),
+                            (root / "mount" / "uploaded.jpg", 4, 123),
+                        ],
+                    )
+                    self.assertEqual(fakes.events.count("refresh"), 1)
+
+                    fakes.preview_gate.set()
+                    await fakes.second_refresh.wait()
+                    await trio.sleep(0)
+                    self.assertEqual(fakes.events.count("refresh"), 2)
+                    fakes.stop_main.set()
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

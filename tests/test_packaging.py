@@ -35,6 +35,7 @@ class PackagingTests(unittest.TestCase):
 
         self.assertIn("Type=exec", service)
         self.assertIn("ExecStart=/usr/bin/immich-on-demand mount", service)
+        self.assertIn("KillSignal=SIGINT", service)
         self.assertIn("Restart=on-failure", service)
         self.assertIn("UMask=0077", service)
         self.assertNotIn("User=root", service)

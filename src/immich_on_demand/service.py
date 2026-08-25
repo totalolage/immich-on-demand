@@ -20,6 +20,7 @@ from .immich import ImmichClient, MUTATION_PERMISSIONS, ServerSession, UPLOAD_PE
 from .library import Library
 from .previewer import populate_previews
 from .settings import Settings, cache_path, load_api_key, runtime_path, state_path
+from .thumbnails import install_failed_thumbnail
 
 
 LOGGER = logging.getLogger(__name__)
@@ -72,16 +73,15 @@ async def _refresh_worker(
         settings.mount_path,
         task_status=task_status,
     )
-    try:
-        _evict_to_limits(content_cache, settings)
-    except Exception as error:
-        LOGGER.warning("initial cache eviction failed: %s", error)
 
     async for _ in requests:
         try:
             await refresh_catalog(catalog, read_client, read_session)
+            try:
+                _evict_to_limits(content_cache, settings)
+            except Exception as error:
+                LOGGER.warning("background cache eviction failed: %s", error)
             await populate_previews(library.list(), read_client, settings.mount_path)
-            _evict_to_limits(content_cache, settings)
         except Exception as error:
             LOGGER.warning("background refresh failed: %s", error)
 
@@ -134,10 +134,27 @@ async def run_service(settings: Settings) -> None:
                 mutation_client=mutation_client,
                 mutation_session=mutation_session,
             )
-            filesystem = ImmichFilesystem(library, cache_root / "uploads")
             await refresh_catalog(catalog, read_client, read_session)
 
             requests, refreshes = trio.open_memory_channel[None](1)
+
+            async def on_uploaded(entry: CatalogAsset) -> None:
+                if entry.asset.size is not None:
+                    install_failed_thumbnail(
+                        settings.mount_path / entry.name,
+                        entry.asset.modified_ns // 1_000_000_000,
+                        entry.asset.size,
+                    )
+                try:
+                    requests.send_nowait(None)
+                except trio.WouldBlock:
+                    pass
+
+            filesystem = ImmichFilesystem(
+                library,
+                cache_root / "uploads",
+                on_uploaded=on_uploaded,
+            )
 
             async def status(params: dict[str, Any]) -> dict[str, Any]:
                 if params:
@@ -185,11 +202,15 @@ async def run_service(settings: Settings) -> None:
                     library.list(),
                     refreshes,
                 )
+                try:
+                    _evict_to_limits(content_cache, settings)
+                except Exception as error:
+                    LOGGER.warning("initial cache eviction failed: %s", error)
                 _check_mountpoint(settings.mount_path)
                 pyfuse3.init(
                     filesystem,
                     str(settings.mount_path),
-                    set(pyfuse3.default_options) | {"fsname=immich-on-demand"},
+                    set(pyfuse3.default_options) | {"fsname=immich-on-demand", "auto_unmount"},
                 )
                 try:
                     await nursery.start(
