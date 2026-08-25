@@ -74,11 +74,19 @@ class ServiceFakes:
                 return CatalogStats(7, 6, 1, 0, 0, 0)
 
         class Cache:
-            def __init__(self, path: Path, client: object) -> None:
+            def __init__(
+                self,
+                path: Path,
+                client: object,
+                *,
+                max_bytes: int,
+                minimum_free_bytes: int,
+            ) -> None:
                 self.limit_calls: list[dict[str, int]] = []
                 self.asset_evictions: list[str] = []
                 outer.cache = self
                 outer.events.append(f"cache:{path.relative_to(root)}")
+                outer.events.append(f"cache-policy:{max_bytes}:{minimum_free_bytes}")
 
             def evict_to_limits(self, **kwargs: int) -> list[str]:
                 self.limit_calls.append(kwargs)
@@ -283,6 +291,7 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(fakes.cache.asset_evictions, [ASSET_ID])
             self.assertIn("fuse-close:True", fakes.events)
             self.assertIn("control-close", fakes.events)
+            self.assertIn("cache-policy:11:33", fakes.events)
             self.assertTrue(fakes.catalog_locks)
             self.assertTrue(
                 all(lock is fakes.catalog_locks[0] for lock in fakes.catalog_locks)

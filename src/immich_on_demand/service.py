@@ -127,7 +127,12 @@ async def run_service(settings: Settings) -> None:
         cache_root = cache_path()
         with Catalog(state_root / "catalog.db") as catalog:
             catalog_lock = trio.Lock()
-            content_cache = ContentCache(cache_root / "originals", read_client)
+            content_cache = ContentCache(
+                cache_root / "originals",
+                read_client,
+                max_bytes=settings.cache_max_bytes,
+                minimum_free_bytes=settings.minimum_free_bytes,
+            )
             library = Library(
                 catalog,
                 read_client,
