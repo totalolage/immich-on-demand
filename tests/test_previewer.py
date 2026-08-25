@@ -57,7 +57,7 @@ class PreviewerTest(unittest.TestCase):
                     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
                         self.calls += 1
                         for item in entries:
-                            source = root / "mount" / "Library" / item.name
+                            source = root / "mount" / item.name
                             assert failed_thumbnail_path(source, root / "cache").exists()
                         return preview_bytes(), "image/jpeg"
 
@@ -84,7 +84,7 @@ class PreviewerTest(unittest.TestCase):
                 stats = await populate_previews(
                     [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
                 )
-                source = root / "mount" / "Library" / item.name
+                source = root / "mount" / item.name
                 self.assertEqual(stats, PreviewStats(1, 0, 0, 1))
                 self.assertTrue(failed_thumbnail_path(source, root / "cache").exists())
 
@@ -103,7 +103,7 @@ class PreviewerTest(unittest.TestCase):
                 stats = await populate_previews(
                     [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
                 )
-                source = root / "mount" / "Library" / item.name
+                source = root / "mount" / item.name
                 success = thumbnail_cache_path(source, root / "cache")
                 self.assertEqual(stats.installed, 1)
                 self.assertTrue(success.exists())
@@ -142,8 +142,8 @@ class PreviewerTest(unittest.TestCase):
                     concurrency=2,
                 )
 
-                failed_source = root / "mount" / "Library" / entries[0].name
-                good_source = root / "mount" / "Library" / entries[1].name
+                failed_source = root / "mount" / entries[0].name
+                good_source = root / "mount" / entries[1].name
                 self.assertEqual(stats, PreviewStats(5, 4, 1, 0))
                 self.assertEqual(client.maximum, 2)
                 self.assertTrue(failed_thumbnail_path(failed_source, root / "cache").exists())

@@ -44,7 +44,7 @@ async def populate_previews(
 
     jobs: list[tuple[CatalogAsset, Path, int, int]] = []
     for entry in entries:
-        source_path = mount_path / "Library" / entry.name
+        source_path = mount_path / entry.name
         mtime = entry.asset.modified_ns // 1_000_000_000
         original_size = entry.asset.size
         assert original_size is not None
