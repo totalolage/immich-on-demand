@@ -140,6 +140,20 @@ class CliTest(unittest.TestCase):
                     catalog.assert_not_called()
                     self.assertEqual(output.getvalue(), "a=1 z=2\n")
 
+    def test_status_before_service_start_is_a_concise_unavailable_error(self) -> None:
+        error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "secret-runtime"
+            with (
+                patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                contextlib.redirect_stderr(error),
+            ):
+                self.assertEqual(main(["status"]), 1)
+
+        self.assertEqual(
+            error.getvalue(), "immich-on-demand: control service is unavailable\n"
+        )
+
     def test_mount_routes_through_the_service(self) -> None:
         configured = Settings("https://photos.example.test", Path("/Photos"))
         events: list[str] = []

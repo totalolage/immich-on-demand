@@ -32,6 +32,25 @@ async def _raw_request(path: Path, data: bytes) -> tuple[dict[str, object], byte
 
 
 class ControlTests(unittest.TestCase):
+    def test_reports_an_absent_or_refused_service_without_leaking_its_path(self) -> None:
+        async def scenario(root: Path) -> None:
+            absent = root / "absent-secret" / "control.sock"
+            stale = root / "refused-secret.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(stale))
+            listener.close()
+
+            for path in (absent, stale):
+                with self.subTest(path=path.name):
+                    with self.assertRaisesRegex(
+                        ControlError, "^control service is unavailable$"
+                    ) as unavailable:
+                        await send_request(path, 1, "status", {})
+                    self.assertNotIn(str(path), str(unavailable.exception))
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_round_trip_is_private_and_one_shot(self) -> None:
         async def scenario(path: Path) -> None:
             seen: list[dict[str, object]] = []

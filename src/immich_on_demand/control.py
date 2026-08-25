@@ -294,7 +294,10 @@ async def send_request(
         raise ControlError(error.message) from error
     try:
         with trio.fail_after(timeout):
-            stream = await trio.open_unix_socket(path)
+            try:
+                stream = await trio.open_unix_socket(path)
+            except OSError:
+                raise ControlError("control service is unavailable") from None
             async with stream:
                 await stream.send_all(data)
                 response = _decode_json(await _read_line(stream))
