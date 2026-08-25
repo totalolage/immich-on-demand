@@ -4,12 +4,41 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sqlite3
+import stat
 from typing import Iterable
 
 from .model import Asset, collision_name, safe_filename
 
 
 ROOT_INODE = 1
+
+
+def _require_owned_directory(path: Path) -> None:
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise PermissionError("catalog state directory must be owned by this user")
+
+
+def _prepare_database(path: Path) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            info = os.lstat(path)
+        else:
+            try:
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+            info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise PermissionError("catalog database must be a regular file owned by this user")
+    os.chmod(path, 0o600)
 
 
 def _available_name(original: str, asset_id: str, used: set[str]) -> str:
@@ -43,8 +72,9 @@ class CatalogStats:
 class Catalog:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _require_owned_directory(path.parent)
+        _prepare_database(path)
         self._connection = sqlite3.connect(path)
-        os.chmod(path, 0o600)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")

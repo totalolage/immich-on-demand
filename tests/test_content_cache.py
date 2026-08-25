@@ -103,6 +103,55 @@ class ContentCacheTest(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "owned by this user"):
                     ContentCache(root, Client([]))  # type: ignore[arg-type]
 
+    def test_rejects_unsafe_complete_candidates_without_touching_them(self) -> None:
+        content = b"cached original"
+
+        async def scenario(base: Path) -> None:
+            target = base / "target"
+            target.write_bytes(content)
+            os.utime(target, ns=(1_000_000_000, 2_000_000_000))
+            target_state = target.stat()
+            symlink_root = base / "symlink-cache"
+            symlink_cache = ContentCache(symlink_root, Client([content]))  # type: ignore[arg-type]
+            (symlink_root / ASSET_ID).symlink_to(target)
+
+            with self.assertRaisesRegex(PermissionError, "cached original"):
+                await symlink_cache.read(asset(content), 0, len(content))
+
+            self.assertTrue((symlink_root / ASSET_ID).is_symlink())
+            self.assertEqual(target.stat().st_atime_ns, target_state.st_atime_ns)
+            self.assertEqual(target.read_bytes(), content)
+            self.assertEqual(symlink_cache.client.calls, 0)
+
+            directory_root = base / "directory-cache"
+            directory_cache = ContentCache(directory_root, Client([content]))  # type: ignore[arg-type]
+            (directory_root / ASSET_ID).mkdir()
+            with self.assertRaisesRegex(PermissionError, "cached original"):
+                await directory_cache.hydrate(asset(content))
+            self.assertTrue((directory_root / ASSET_ID).is_dir())
+            self.assertEqual(directory_cache.client.calls, 0)
+
+            owner_root = base / "owner-cache"
+            owner_cache = ContentCache(owner_root, Client([content]))  # type: ignore[arg-type]
+            candidate = owner_root / ASSET_ID
+            candidate.write_bytes(content)
+            with patch(
+                "immich_on_demand.content_cache.os.getuid", return_value=os.getuid() + 1
+            ):
+                with self.assertRaisesRegex(PermissionError, "cached original"):
+                    await owner_cache.hydrate(asset(content))
+                removed = owner_cache.evict_to_limits(
+                    max_age_seconds=0,
+                    max_bytes=0,
+                    minimum_free_bytes=0,
+                )
+            self.assertEqual(removed, [])
+            self.assertEqual(candidate.read_bytes(), content)
+            self.assertEqual(owner_cache.client.calls, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_initialization_removes_only_safe_stale_downloads(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

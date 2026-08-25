@@ -1,7 +1,10 @@
 from dataclasses import replace
+import os
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from immich_on_demand.catalog import Catalog
 from immich_on_demand.model import Asset
@@ -32,6 +35,106 @@ def asset(asset_id: str = ASSET_ID, name: str = "photo.jpg") -> Asset:
 
 
 class CatalogTest(unittest.TestCase):
+    def test_rejects_an_unsafe_state_directory_before_opening_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "target"
+            target.mkdir(mode=0o755)
+            state = base / "state"
+            state.symlink_to(target, target_is_directory=True)
+
+            with patch(
+                "immich_on_demand.catalog.sqlite3.connect",
+                side_effect=AssertionError("opened an unsafe database"),
+            ) as connect:
+                with self.assertRaisesRegex(PermissionError, "state directory"):
+                    Catalog(state / "catalog.db")
+
+            connect.assert_not_called()
+            self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(list(target.iterdir()), [])
+
+            owned = base / "wrong-owner"
+            owned.mkdir(mode=0o755)
+            with (
+                patch(
+                    "immich_on_demand.catalog.os.getuid", return_value=os.getuid() + 1
+                ),
+                patch(
+                    "immich_on_demand.catalog.sqlite3.connect",
+                    side_effect=AssertionError("opened an unsafe database"),
+                ) as connect,
+            ):
+                with self.assertRaisesRegex(PermissionError, "state directory"):
+                    Catalog(owned / "catalog.db")
+
+            connect.assert_not_called()
+            self.assertEqual(owned.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(list(owned.iterdir()), [])
+
+    def test_rejects_an_unsafe_database_before_opening_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir()
+            target = Path(directory) / "target"
+            target.write_bytes(b"do not touch")
+            database = state / "catalog.db"
+            database.symlink_to(target)
+
+            with patch(
+                "immich_on_demand.catalog.sqlite3.connect",
+                side_effect=AssertionError("opened an unsafe database"),
+            ) as connect:
+                with self.assertRaisesRegex(PermissionError, "catalog database"):
+                    Catalog(database)
+
+            connect.assert_not_called()
+            self.assertTrue(database.is_symlink())
+            self.assertEqual(target.read_bytes(), b"do not touch")
+
+            database.unlink()
+            database.mkdir()
+            with patch(
+                "immich_on_demand.catalog.sqlite3.connect",
+                side_effect=AssertionError("opened an unsafe database"),
+            ) as connect:
+                with self.assertRaisesRegex(PermissionError, "catalog database"):
+                    Catalog(database)
+            connect.assert_not_called()
+            self.assertTrue(database.is_dir())
+
+            database.rmdir()
+            database.write_bytes(b"")
+            real_lstat = os.lstat
+
+            def wrong_owner(candidate: os.PathLike[str]) -> os.stat_result | SimpleNamespace:
+                info = real_lstat(candidate)
+                if Path(candidate) == database:
+                    return SimpleNamespace(st_mode=info.st_mode, st_uid=os.getuid() + 1)
+                return info
+
+            with (
+                patch("immich_on_demand.catalog.os.lstat", side_effect=wrong_owner),
+                patch(
+                    "immich_on_demand.catalog.sqlite3.connect",
+                    side_effect=AssertionError("opened an unsafe database"),
+                ) as connect,
+            ):
+                with self.assertRaisesRegex(PermissionError, "catalog database"):
+                    Catalog(database)
+            connect.assert_not_called()
+
+    def test_creates_a_private_catalog_and_state_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            database = state / "catalog.db"
+
+            with Catalog(database):
+                pass
+
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(database.stat().st_mode & 0o777, 0o600)
+
     def test_refresh_preserves_existing_name_and_inode_on_collision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with Catalog(Path(directory) / "catalog.db") as catalog:

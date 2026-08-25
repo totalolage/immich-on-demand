@@ -126,6 +126,8 @@ class ContentCache:
         self.acquire(asset.id)
         try:
             path = await self.hydrate(asset)
+            if self._complete_info(path) is None:
+                raise CacheError(f"cached original disappeared: {asset.id}")
             async with await trio.open_file(path, "rb") as stream:
                 await stream.seek(offset)
                 return await stream.read(size)
@@ -242,9 +244,8 @@ class ContentCache:
     async def _cached_path(self, asset: Asset) -> Path | None:
         UUID(asset.id)
         path = self.root / asset.id
-        try:
-            info = path.stat()
-        except FileNotFoundError:
+        info = self._complete_info(path)
+        if info is None:
             return None
         if asset.size is None or info.st_size != asset.size:
             self._discard(asset.id, path)
@@ -259,7 +260,10 @@ class ContentCache:
         if self._validated.get(asset.id) != validation:
             try:
                 actual = await trio.to_thread.run_sync(self._file_sha1, path)
-                unchanged = self._validation(asset, path.stat()) == validation
+                current = self._complete_info(path)
+                unchanged = (
+                    current is not None and self._validation(asset, current) == validation
+                )
             except FileNotFoundError:
                 self._validated.pop(asset.id, None)
                 return None
@@ -285,9 +289,26 @@ class ContentCache:
         return digest.digest()
 
     def _touch(self, path: Path, asset: Asset) -> None:
-        info = path.stat()
-        os.utime(path, ns=(time.time_ns(), info.st_mtime_ns))
-        self._validated[asset.id] = self._validation(asset, path.stat())
+        info = self._complete_info(path)
+        if info is None:
+            raise CacheError(f"cached original disappeared: {asset.id}")
+        os.utime(path, ns=(time.time_ns(), info.st_mtime_ns), follow_symlinks=False)
+        current = self._complete_info(path)
+        if current is None:
+            raise CacheError(f"cached original disappeared: {asset.id}")
+        self._validated[asset.id] = self._validation(asset, current)
+
+    @staticmethod
+    def _complete_info(path: Path) -> os.stat_result | None:
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if not stat_module.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError(
+                f"cached original must be a regular file owned by this user: {path}"
+            )
+        return info
 
     @staticmethod
     def _validation(asset: Asset, info: os.stat_result) -> _Validation:
@@ -390,11 +411,14 @@ class ContentCache:
         entries: dict[str, tuple[Path, os.stat_result]] = {}
         with os.scandir(self.root) as directory:
             for entry in directory:
-                if entry.name.startswith(".") or not entry.is_file(follow_symlinks=False):
+                if entry.name.startswith("."):
                     continue
                 try:
                     UUID(entry.name)
-                except ValueError:
+                    info = entry.stat(follow_symlinks=False)
+                except (FileNotFoundError, ValueError):
                     continue
-                entries[entry.name] = (Path(entry.path), entry.stat(follow_symlinks=False))
+                if not stat_module.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                    continue
+                entries[entry.name] = (Path(entry.path), info)
         return entries
