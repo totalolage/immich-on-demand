@@ -12,6 +12,7 @@ class PackagingTests(unittest.TestCase):
         package = PKGBUILD.read_text(encoding="utf-8")
 
         for dependency in (
+            "libsecret",
             "org.freedesktop.secrets",
             "python-httpx",
             "python-pillow",

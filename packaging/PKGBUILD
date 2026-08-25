@@ -1,11 +1,12 @@
 pkgname=immich-on-demand
-pkgver=0.1.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc='Expose an Immich library as a Linux filesystem with files on demand'
 arch=('any')
 url='https://github.com/totalolage/immich-on-demand'
 license=('GPL-3.0-or-later')
 depends=(
+  'libsecret'
   'org.freedesktop.secrets'
   'python'
   'python-httpx'

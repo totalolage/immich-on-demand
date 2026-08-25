@@ -48,7 +48,7 @@ class CliTest(unittest.TestCase):
             main(["--version"])
 
         self.assertEqual(exit.exception.code, 0)
-        self.assertEqual(output.getvalue(), "0.1.0\n")
+        self.assertEqual(output.getvalue(), "1.0.0\n")
 
     def test_configure_writes_only_non_secret_settings(self) -> None:
         import json
