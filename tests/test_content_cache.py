@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime
 import base64
 import hashlib
 import os
@@ -15,6 +16,7 @@ import trio
 
 from immich_on_demand.content_cache import (
     CacheBusyError,
+    CacheError,
     CacheIntegrityError,
     ContentCache,
 )
@@ -141,6 +143,101 @@ class ContentCacheTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory) / "originals")
 
+    def test_managed_asset_rehydrates_same_size_cache_corruption(self) -> None:
+        content = b"trusted original"
+
+        async def scenario(root: Path) -> None:
+            client = Client([content])
+            cache = ContentCache(root, client)  # type: ignore[arg-type]
+            item = asset(content)
+
+            path = await cache.hydrate(item)
+            path.write_bytes(b"x" * len(content))
+
+            self.assertEqual((await cache.hydrate(item)).read_bytes(), content)
+            self.assertEqual(client.calls, 2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_unchanged_managed_asset_is_not_rehashed_on_each_open(self) -> None:
+        content = b"trusted original"
+
+        async def scenario(root: Path) -> None:
+            cache = ContentCache(root, Client([content]))  # type: ignore[arg-type]
+            item = asset(content)
+            cache.acquire(item.id)
+            first = await cache.hydrate(item)
+            cache.release(item.id)
+
+            with patch.object(
+                cache,
+                "_file_sha1",
+                side_effect=AssertionError("unchanged cache was rehashed"),
+            ):
+                cache.acquire(item.id)
+                second = await cache.hydrate(item)
+                cache.release(item.id)
+
+            self.assertEqual(second, first)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_concurrent_cached_validation_is_shared_after_restart(self) -> None:
+        content = b"trusted original"
+
+        async def scenario(root: Path) -> None:
+            await ContentCache(root, Client([content])).hydrate(  # type: ignore[arg-type]
+                asset(content)
+            )
+            client = Client([content])
+            cache = ContentCache(root, client)  # type: ignore[arg-type]
+            hash_started = trio.Event()
+            second_started = trio.Event()
+            first_touched = trio.Event()
+            hash_calls = 0
+            original_touch = cache._touch
+
+            async def ordered_hash(function, *args, **kwargs):
+                nonlocal hash_calls
+                hash_calls += 1
+                if hash_calls == 1:
+                    hash_started.set()
+                    await second_started.wait()
+                else:
+                    await first_touched.wait()
+                return function(*args, **kwargs)
+
+            def noticed_touch(path: Path, item: Asset) -> None:
+                original_touch(path, item)
+                first_touched.set()
+
+            results: list[Path] = []
+
+            async def first() -> None:
+                results.append(await cache.hydrate(asset(content)))
+
+            async def second() -> None:
+                second_started.set()
+                results.append(await cache.hydrate(asset(content)))
+
+            with (
+                patch("immich_on_demand.content_cache.trio.to_thread.run_sync", ordered_hash),
+                patch.object(cache, "_touch", noticed_touch),
+            ):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(first)
+                    await hash_started.wait()
+                    nursery.start_soon(second)
+
+            self.assertEqual(hash_calls, 1)
+            self.assertEqual(client.calls, 0)
+            self.assertEqual([path.read_bytes() for path in results], [content, content])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_concurrent_readers_share_one_hydration(self) -> None:
         content = b"one network response"
 
@@ -164,6 +261,102 @@ class ContentCacheTest(unittest.TestCase):
             self.assertEqual(results, [content, content])
             self.assertEqual(client.calls, 1)
 
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_parallel_hydrations_reserve_expected_bytes_before_streaming(self) -> None:
+        first_content = b"one!"
+        second_content = b"two!"
+
+        class ParallelClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.first_started = trio.Event()
+                self.release_first = trio.Event()
+
+            @asynccontextmanager
+            async def original(self, asset_id: str):
+                self.calls.append(asset_id)
+                if asset_id == ASSET_ID:
+                    self.first_started.set()
+                    yield Response([first_content], self.release_first)
+                else:
+                    yield Response([second_content])
+
+        async def scenario(root: Path) -> None:
+            client = ParallelClient()
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=6,
+                minimum_free_bytes=0,
+            )
+            idle = root / THIRD_ID
+            idle.write_bytes(b"ok")
+
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(cache.hydrate, asset(first_content))
+                await client.first_started.wait()
+                with self.assertRaisesRegex(CacheError, "cache capacity"):
+                    await cache.hydrate(asset(second_content, OTHER_ID))
+                self.assertEqual(client.calls, [ASSET_ID])
+                self.assertTrue(idle.exists())
+                client.release_first.set()
+
+            self.assertEqual((root / ASSET_ID).read_bytes(), first_content)
+            self.assertFalse((root / OTHER_ID).exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_free_space_reservations_count_only_bytes_left_to_write(self) -> None:
+        first_content = b"aabb"
+        second_content = b"ccdd"
+
+        class ProgressResponse(Response):
+            async def aiter_bytes(self):
+                yield self.chunks[0]
+                progress.set()
+                await finish.wait()
+                yield self.chunks[1]
+
+        class ParallelClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            @asynccontextmanager
+            async def original(self, asset_id: str):
+                self.calls.append(asset_id)
+                if asset_id == ASSET_ID:
+                    yield ProgressResponse([b"aa", b"bb"])
+                else:
+                    yield Response([second_content])
+
+        async def scenario(root: Path) -> None:
+            client = ParallelClient()
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=8,
+                minimum_free_bytes=3,
+            )
+
+            with patch(
+                "immich_on_demand.content_cache.shutil.disk_usage",
+                return_value=SimpleNamespace(free=10),
+            ):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(cache.hydrate, asset(first_content))
+                    await progress.wait()
+                    await cache.hydrate(asset(second_content, OTHER_ID))
+                    finish.set()
+
+            self.assertEqual(client.calls, [ASSET_ID, OTHER_ID])
+            self.assertEqual((root / ASSET_ID).read_bytes(), first_content)
+            self.assertEqual((root / OTHER_ID).read_bytes(), second_content)
+
+        progress = trio.Event()
+        finish = trio.Event()
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
@@ -195,6 +388,108 @@ class ContentCacheTest(unittest.TestCase):
             assert client.response is not None
             self.assertEqual(client.response.yielded, 1)
             self.assertEqual(list(root.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_aborts_before_a_chunk_crosses_the_free_space_floor(self) -> None:
+        content = b"aabb"
+
+        async def scenario(root: Path) -> None:
+            client = Client([b"aa", b"bb"])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=10,
+                minimum_free_bytes=3,
+            )
+
+            with patch(
+                "immich_on_demand.content_cache.shutil.disk_usage",
+                side_effect=(
+                    SimpleNamespace(free=10),
+                    SimpleNamespace(free=5),
+                    SimpleNamespace(free=4),
+                ),
+            ):
+                with self.assertRaisesRegex(CacheError, "free-space floor"):
+                    await cache.hydrate(asset(content))
+
+            self.assertEqual(client.calls, 1)
+            self.assertEqual(list(root.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_rejects_an_original_that_cannot_fit_before_streaming(self) -> None:
+        content = b"too large"
+
+        async def scenario(root: Path) -> None:
+            client = Client([content])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=len(content) - 1,
+                minimum_free_bytes=0,
+            )
+
+            with self.assertRaisesRegex(CacheError, "cache capacity"):
+                await cache.hydrate(asset(content))
+
+            self.assertEqual(client.calls, 0)
+            self.assertEqual(list(root.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_hydration_admission_evicts_complete_lru_to_fit_both_limits(self) -> None:
+        content = b"new!"
+
+        async def scenario(root: Path) -> None:
+            client = Client([content])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=6,
+                minimum_free_bytes=3,
+            )
+            old = root / OTHER_ID
+            old.write_bytes(b"old!")
+            os.utime(old, ns=(1, 1))
+
+            with patch(
+                "immich_on_demand.content_cache.shutil.disk_usage",
+                side_effect=(SimpleNamespace(free=5), SimpleNamespace(free=9)),
+            ):
+                hydrated = await cache.hydrate(asset(content))
+
+            self.assertEqual(hydrated.read_bytes(), content)
+            self.assertFalse(old.exists())
+            self.assertEqual(client.calls, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_failed_hydration_releases_its_capacity_reservation(self) -> None:
+        content = b"good"
+
+        async def scenario(root: Path) -> None:
+            client = Client([b"bad!"])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=len(content),
+                minimum_free_bytes=0,
+            )
+
+            with self.assertRaises(CacheIntegrityError):
+                await cache.hydrate(asset(content))
+
+            client.chunks = [content]
+            hydrated = await cache.hydrate(asset(content, OTHER_ID))
+
+            self.assertEqual(hydrated.read_bytes(), content)
+            self.assertEqual(client.calls, 2)
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -237,6 +532,38 @@ class ContentCacheTest(unittest.TestCase):
             item = replace(asset(content, library_id="library"), checksum="not-content-sha1")
             cache = ContentCache(root, Client([content]))  # type: ignore[arg-type]
             self.assertEqual((await cache.hydrate(item)).read_bytes(), content)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_external_asset_rehydrates_after_same_size_original_change(self) -> None:
+        original = b"external"
+        changed = b"changed!"
+
+        async def scenario(root: Path) -> None:
+            client = Client([original])
+            cache = ContentCache(root, client)  # type: ignore[arg-type]
+            first = asset(original, library_id="library")
+
+            path = await cache.hydrate(first)
+            old_atime = 1_000_000_000
+            os.utime(path, ns=(old_atime, path.stat().st_mtime_ns))
+            client.chunks = [changed]
+            updated = replace(
+                first,
+                updated_at="2026-08-25T12:01:00Z",
+            )
+
+            refreshed = await cache.hydrate(updated)
+
+            self.assertEqual(refreshed.read_bytes(), changed)
+            expected_token = int(
+                datetime.fromisoformat(updated.updated_at.replace("Z", "+00:00")).timestamp()
+                * 1_000_000_000
+            )
+            self.assertEqual(refreshed.stat().st_mtime_ns, expected_token)
+            self.assertGreater(refreshed.stat().st_atime_ns, old_atime)
+            self.assertEqual(client.calls, 2)
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import aclosing
 from dataclasses import dataclass
+from datetime import datetime
 import base64
 import binascii
 import hashlib
@@ -32,18 +33,36 @@ class CacheBusyError(CacheError):
     pass
 
 
+class CacheCapacityError(CacheError):
+    pass
+
+
 @dataclass(slots=True)
 class _Hydration:
     done: trio.Event
     error: BaseException | None = None
 
 
+_Validation = tuple[int, int, int, int, int, str]
+
+
 class ContentCache:
     """Atomic cache of complete Immich originals."""
 
-    def __init__(self, root: Path, client: ImmichClient) -> None:
+    def __init__(
+        self,
+        root: Path,
+        client: ImmichClient,
+        *,
+        max_bytes: int | None = None,
+        minimum_free_bytes: int = 0,
+    ) -> None:
+        if (max_bytes is not None and max_bytes < 0) or minimum_free_bytes < 0:
+            raise ValueError("cache limits must be non-negative")
         self.root = root
         self.client = client
+        self.max_bytes = max_bytes
+        self.minimum_free_bytes = minimum_free_bytes
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = os.lstat(root)
         if not stat_module.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
@@ -52,6 +71,9 @@ class ContentCache:
         self._clean_stale_downloads()
         self._hydrations: dict[str, _Hydration] = {}
         self._open: dict[str, int] = {}
+        self._reservations: dict[str, int] = {}
+        self._written: dict[str, int] = {}
+        self._validated: dict[str, _Validation] = {}
 
     def acquire(self, asset_id: str) -> None:
         UUID(asset_id)
@@ -67,34 +89,34 @@ class ContentCache:
             self._open[asset_id] = count - 1
 
     async def hydrate(self, asset: Asset) -> Path:
-        path = self._cached_path(asset)
-        if path is not None:
-            self._touch(path)
-            return path
-
         hydration = self._hydrations.get(asset.id)
         if hydration is not None:
             await hydration.done.wait()
             if hydration.error is not None:
                 raise CacheError(f"shared hydration of {asset.id} failed") from hydration.error
-            path = self._cached_path(asset)
+            path = await self._cached_path(asset)
             if path is None:
-                raise CacheError(f"shared hydration of {asset.id} produced no cache file")
-            self._touch(path)
+                return await self.hydrate(asset)
+            self._touch(path, asset)
             return path
 
         hydration = _Hydration(trio.Event())
         self._hydrations[asset.id] = hydration
         try:
-            # ponytail: whole-file caching is the 1.0 ceiling; add sparse ranges only
-            # when Immich documents original-download range semantics.
-            path = await self._download(asset)
-            self._touch(path)
+            path = await self._cached_path(asset)
+            if path is None:
+                self._reserve(asset)
+                # ponytail: whole-file caching is the 1.0 ceiling; add sparse ranges only
+                # when Immich documents original-download range semantics.
+                path = await self._download(asset)
+            self._touch(path, asset)
             return path
         except BaseException as error:
             hydration.error = error
             raise
         finally:
+            self._reservations.pop(asset.id, None)
+            self._written.pop(asset.id, None)
             hydration.done.set()
             self._hydrations.pop(asset.id, None)
 
@@ -119,6 +141,7 @@ class ContentCache:
             path.unlink()
         except FileNotFoundError:
             return False
+        self._validated.pop(asset_id, None)
         return True
 
     def evict_to_limits(
@@ -151,6 +174,7 @@ class ContentCache:
                 path.unlink()
             except FileNotFoundError:
                 continue
+            self._validated.pop(asset_id, None)
             total -= stat.st_size
             free += stat.st_size
             removed.append(asset_id)
@@ -168,7 +192,7 @@ class ContentCache:
         received = 0
         try:
             os.fchmod(handle, 0o600)
-            with os.fdopen(handle, "wb") as stream:
+            with os.fdopen(handle, "wb", buffering=0) as stream:
                 async with self.client.original(asset.id) as response:
                     async with aclosing(response.aiter_bytes()) as chunks:
                         async for chunk in chunks:
@@ -178,9 +202,18 @@ class ContentCache:
                                 raise CacheIntegrityError(
                                     f"asset {asset.id} exceeds its expected {asset.size} bytes"
                                 )
-                            stream.write(chunk)
+                            if (
+                                shutil.disk_usage(self.root).free - len(chunk)
+                                < self.minimum_free_bytes
+                            ):
+                                raise CacheCapacityError(
+                                    f"asset {asset.id} would cross the cache free-space floor"
+                                )
+                            if stream.write(chunk) != len(chunk):
+                                raise CacheError(f"short cache write for asset {asset.id}")
                             digest.update(chunk)
                             received += len(chunk)
+                            self._written[asset.id] = received
 
                 if received != asset.size:
                     raise CacheIntegrityError(
@@ -191,6 +224,8 @@ class ContentCache:
                 ):
                     raise CacheIntegrityError(f"asset {asset.id} checksum does not match")
                 stream.flush()
+                os.fsync(stream.fileno())
+                os.utime(stream.fileno(), ns=(time.time_ns(), self._cache_mtime_ns(asset)))
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
             os.chmod(destination, 0o600)
@@ -204,16 +239,33 @@ class ContentCache:
             temporary.unlink(missing_ok=True)
             raise
 
-    def _cached_path(self, asset: Asset) -> Path | None:
+    async def _cached_path(self, asset: Asset) -> Path | None:
         UUID(asset.id)
         path = self.root / asset.id
         try:
-            size = path.stat().st_size
+            info = path.stat()
         except FileNotFoundError:
             return None
-        if asset.size is None or size != asset.size:
-            path.unlink(missing_ok=True)
+        if asset.size is None or info.st_size != asset.size:
+            self._discard(asset.id, path)
             return None
+        if asset.library_id is not None:
+            if info.st_mtime_ns != self._cache_mtime_ns(asset):
+                self._discard(asset.id, path)
+                return None
+            return path
+
+        validation = self._validation(asset, info)
+        if self._validated.get(asset.id) != validation:
+            try:
+                actual = await trio.to_thread.run_sync(self._file_sha1, path)
+                unchanged = self._validation(asset, path.stat()) == validation
+            except FileNotFoundError:
+                self._validated.pop(asset.id, None)
+                return None
+            if not unchanged or not self._checksum_matches(asset.checksum, actual):
+                self._discard(asset.id, path)
+                return None
         return path
 
     @staticmethod
@@ -225,12 +277,100 @@ class ContentCache:
         return hmac.compare_digest(decoded, actual)
 
     @staticmethod
-    def _touch(path: Path) -> None:
-        stat = path.stat()
-        os.utime(path, ns=(time.time_ns(), stat.st_mtime_ns))
+    def _file_sha1(path: Path) -> bytes:
+        digest = hashlib.sha1(usedforsecurity=False)
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.digest()
+
+    def _touch(self, path: Path, asset: Asset) -> None:
+        info = path.stat()
+        os.utime(path, ns=(time.time_ns(), info.st_mtime_ns))
+        self._validated[asset.id] = self._validation(asset, path.stat())
+
+    @staticmethod
+    def _validation(asset: Asset, info: os.stat_result) -> _Validation:
+        source = (
+            f"managed:{asset.checksum}"
+            if asset.library_id is None
+            else f"external:{asset.updated_at}"
+        )
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+            source,
+        )
+
+    @staticmethod
+    def _cache_mtime_ns(asset: Asset) -> int:
+        if asset.library_id is None:
+            return asset.modified_ns
+        parsed = datetime.fromisoformat(asset.updated_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("external asset updated_at has no timezone")
+        return int(parsed.timestamp() * 1_000_000_000)
+
+    def _discard(self, asset_id: str, path: Path) -> None:
+        path.unlink(missing_ok=True)
+        self._validated.pop(asset_id, None)
 
     def _busy(self, asset_id: str) -> bool:
         return asset_id in self._hydrations or self._open.get(asset_id, 0) > 0
+
+    def _reserve(self, asset: Asset) -> None:
+        if asset.size is None:
+            raise CacheIntegrityError(f"asset {asset.id} has no expected size")
+        if self.max_bytes is not None and asset.size > self.max_bytes:
+            raise CacheCapacityError(f"asset {asset.id} exceeds cache capacity")
+
+        reserved = sum(self._reservations.values())
+        remaining = sum(
+            size - self._written.get(asset_id, 0)
+            for asset_id, size in self._reservations.items()
+        )
+        entries = self._complete_entries()
+        total = sum(info.st_size for _, info in entries.values())
+        free = shutil.disk_usage(self.root).free
+
+        def fits(candidate_total: int, candidate_free: int) -> bool:
+            return (
+                (
+                    self.max_bytes is None
+                    or candidate_total + reserved + asset.size <= self.max_bytes
+                )
+                and candidate_free - remaining - asset.size >= self.minimum_free_bytes
+            )
+
+        evictable = [
+            (asset_id, path, info)
+            for asset_id, (path, info) in sorted(
+                entries.items(), key=lambda item: (item[1][1].st_atime_ns, item[0])
+            )
+            if not self._busy(asset_id)
+        ]
+        reclaimable = sum(info.st_size for _, _, info in evictable)
+        if not fits(total - reclaimable, free + reclaimable):
+            raise CacheCapacityError(f"asset {asset.id} cannot fit within cache capacity")
+
+        for asset_id, path, info in evictable:
+            if fits(total, free):
+                break
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            self._validated.pop(asset_id, None)
+            total -= info.st_size
+            free += info.st_size
+
+        if not fits(total, free):
+            raise CacheCapacityError(f"asset {asset.id} cannot fit within cache capacity")
+        self._reservations[asset.id] = asset.size
+        self._written[asset.id] = 0
 
     def _clean_stale_downloads(self) -> None:
         with os.scandir(self.root) as directory:
