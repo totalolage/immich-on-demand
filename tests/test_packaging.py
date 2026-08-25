@@ -29,6 +29,8 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("license=('GPL-3.0-or-later')", package)
         self.assertIn("arch=('any')", package)
         self.assertIn("/usr/lib/systemd/user/immich-on-demand.service", package)
+        self.assertRegex(package, r"b2sums=\('[0-9a-f]{128}'\)")
+        self.assertNotIn("SKIP", package)
         self.assertNotIn("nautilus-python", package)
 
     def test_service_runs_unprivileged_foreground_process(self) -> None:

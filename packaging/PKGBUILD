@@ -18,7 +18,7 @@ depends=(
 )
 makedepends=('python-build' 'python-flit-core' 'python-installer')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-b2sums=('SKIP') # ponytail: replace with the release archive checksum before publishing.
+b2sums=('7e596c5c1478c8352fd6dc2951bfde5e1e70e91d2bbbf0289f783bac314e1fd63861f7aa8acceefe2d453b22bc1ed0f3ccc22ac4764ef9f5504dad8370742716')
 
 build() {
   cd "$pkgname-$pkgver"
