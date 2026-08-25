@@ -141,6 +141,7 @@ class ImmichClient:
         if not 1 <= page_size <= 1000:
             raise ValueError("page_size must be between 1 and 1000")
         page = 1
+        seen_asset_ids: set[str] = set()
         while True:
             value = await self._json(
                 "POST",
@@ -157,12 +158,38 @@ class ImmichClient:
             assets_value = value.get("assets")
             if not isinstance(assets_value, dict) or not isinstance(assets_value.get("items"), list):
                 raise ImmichError("Immich search response has no asset list")
-            assets = [Asset.from_api(item) for item in assets_value["items"] if isinstance(item, dict)]
-            yield [asset for asset in assets if asset.owner_id == owner_id]
+            items = assets_value["items"]
+            if any(not isinstance(item, dict) for item in items):
+                raise ImmichError("Immich search response contains a non-object asset")
             next_page = assets_value.get("nextPage")
+            if next_page is not None:
+                if type(next_page) is int:
+                    parsed_next_page = next_page
+                elif (
+                    isinstance(next_page, str)
+                    and next_page.isascii()
+                    and next_page.isdecimal()
+                ):
+                    try:
+                        parsed_next_page = int(next_page)
+                    except ValueError as error:
+                        raise ImmichError("Immich search response has an invalid next page") from error
+                    if str(parsed_next_page) != next_page:
+                        raise ImmichError("Immich search response has an invalid next page")
+                else:
+                    raise ImmichError("Immich search response has an invalid next page")
+                if parsed_next_page <= page:
+                    raise ImmichError("Immich search response has an invalid next page")
+
+            assets = [Asset.from_api(item) for item in items]
+            for asset in assets:
+                if asset.id in seen_asset_ids:
+                    raise ImmichError("Immich search response contains a duplicate asset")
+                seen_asset_ids.add(asset.id)
+            yield [asset for asset in assets if asset.owner_id == owner_id]
             if next_page is None:
                 return
-            page = int(next_page)
+            page = parsed_next_page
 
     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
         UUID(asset_id)

@@ -1,4 +1,5 @@
 import unittest
+from contextlib import aclosing
 from pathlib import Path
 import tempfile
 
@@ -10,6 +11,7 @@ from immich_on_demand.immich import ImmichClient, ImmichError
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+OTHER_ID = "22345678-1234-4234-8234-123456789abc"
 
 
 def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
@@ -31,6 +33,70 @@ def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
 
 
 class ImmichClientTest(unittest.TestCase):
+    def test_rejects_non_object_asset_items(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"assets": {"items": [asset(), "not-an-asset"], "nextPage": None}},
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                async with aclosing(client.asset_pages(OWNER_ID)) as pages:
+                    with self.assertRaisesRegex(ImmichError, "non-object asset"):
+                        await anext(pages)
+
+        trio.run(scenario)
+
+    def test_rejects_invalid_next_pages(self) -> None:
+        async def scenario(next_page: object) -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={"assets": {"items": [asset()], "nextPage": next_page}},
+                )
+
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                async with aclosing(client.asset_pages(OWNER_ID)) as pages:
+                    with self.assertRaisesRegex(ImmichError, "invalid next page"):
+                        await anext(pages)
+
+        for next_page in (True, 2.0, "02", "2.0", " 2", 1, "1", 0, -1):
+            with self.subTest(next_page=next_page):
+                trio.run(scenario, next_page)
+
+    def test_rejects_duplicate_asset_ids_across_pages(self) -> None:
+        requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "assets": {
+                        "items": [asset()],
+                        "nextPage": "2" if requests == 1 else None,
+                    }
+                },
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                async with aclosing(client.asset_pages(OWNER_ID)) as pages:
+                    await anext(pages)
+                    with self.assertRaisesRegex(ImmichError, "duplicate asset"):
+                        await anext(pages)
+
+        trio.run(scenario)
+        self.assertEqual(requests, 2)
+
     def test_thumbnail_stream_stops_at_the_memory_limit(self) -> None:
         class Oversized(httpx.AsyncByteStream):
             chunks = 0
@@ -105,7 +171,12 @@ class ImmichClientTest(unittest.TestCase):
                 seen_pages.append(requested_page)
                 return httpx.Response(
                     200,
-                    json={"assets": {"items": [asset()], "nextPage": 2 if requested_page == 1 else None}},
+                    json={
+                        "assets": {
+                            "items": [asset(ASSET_ID if requested_page == 1 else OTHER_ID)],
+                            "nextPage": "2" if requested_page == 1 else None,
+                        }
+                    },
                 )
             raise AssertionError(path)
 
@@ -117,7 +188,7 @@ class ImmichClientTest(unittest.TestCase):
                 pages = [page async for page in client.asset_pages(session.owner_id)]
                 self.assertEqual(session.version, "3.0.3")
                 self.assertEqual(session.media_types, frozenset({".jpg", ".mp4"}))
-                self.assertEqual([page[0].id for page in pages], [ASSET_ID, ASSET_ID])
+                self.assertEqual([page[0].id for page in pages], [ASSET_ID, OTHER_ID])
 
         trio.run(scenario)
         self.assertEqual(seen_pages, [1, 2])
