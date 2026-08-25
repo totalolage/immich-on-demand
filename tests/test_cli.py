@@ -1,9 +1,14 @@
 import contextlib
 import io
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
-from immich_on_demand.catalog import CatalogStats
-from immich_on_demand.cli import _print_stats, main
+from immich_on_demand.cli import _print_result, main
+
+
+ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 
 
 class CliTest(unittest.TestCase):
@@ -17,8 +22,6 @@ class CliTest(unittest.TestCase):
 
     def test_configure_writes_only_non_secret_settings(self) -> None:
         import json
-        from pathlib import Path
-        import tempfile
 
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.json"
@@ -41,11 +44,40 @@ class CliTest(unittest.TestCase):
             self.assertEqual(value["server_url"], "https://photos.example.test")
             self.assertNotIn("key", value)
 
-    def test_prints_slotted_catalog_stats(self) -> None:
+    def test_prints_flat_results_in_key_order(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            _print_stats(CatalogStats(3, 2, 1, 0, 0, 0))
-        self.assertEqual(
-            output.getvalue(),
-            "total=3 visible=2 missing_size=1 trashed=0 hidden=0 offline=0\n",
+            _print_result({"visible": 2, "total": 3})
+        self.assertEqual(output.getvalue(), "total=3 visible=2\n")
+
+    def test_control_commands_route_without_catalog_settings_or_secrets(self) -> None:
+        cases = (
+            (["status"], "status", {}),
+            (["refresh"], "refresh", {}),
+            (["evict"], "evict", {}),
+            (["evict", "--asset", ASSET_ID], "evict", {"asset": ASSET_ID}),
         )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            for arguments, method, params in cases:
+                with self.subTest(command=arguments):
+                    request = AsyncMock(return_value={"z": 2, "a": 1})
+                    output = io.StringIO()
+                    with (
+                        patch("immich_on_demand.cli.send_request", request),
+                        patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                        patch("immich_on_demand.cli.secrets.randbits", return_value=0),
+                        patch("immich_on_demand.cli.load") as load,
+                        patch("immich_on_demand.cli.load_api_key") as load_api_key,
+                        patch("immich_on_demand.cli.Catalog", create=True) as catalog,
+                        contextlib.redirect_stdout(output),
+                    ):
+                        self.assertEqual(main(arguments), 0)
+
+                    request.assert_awaited_once_with(
+                        runtime / "control.sock", 1, method, params
+                    )
+                    load.assert_not_called()
+                    load_api_key.assert_not_called()
+                    catalog.assert_not_called()
+                    self.assertEqual(output.getvalue(), "a=1 z=2\n")
