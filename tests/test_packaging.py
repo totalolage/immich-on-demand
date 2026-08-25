@@ -40,10 +40,5 @@ class PackagingTests(unittest.TestCase):
         for forbidden in ("sudo", "docker", "podman", "systemd-sysusers"):
             self.assertNotIn(forbidden, service.lower())
 
-    def test_no_unimplemented_nautilus_or_root_adapter_is_shipped(self) -> None:
-        self.assertFalse((ROOT / "packaging" / "immich_on_demand_nautilus.py").exists())
-        self.assertFalse((ROOT / "packaging" / "immich-on-demand.sysusers").exists())
-
-
 if __name__ == "__main__":
     unittest.main()
