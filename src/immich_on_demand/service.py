@@ -74,6 +74,7 @@ async def _refresh_worker(
     catalog_lock: trio.Lock,
     content_cache: ContentCache,
     settings: Settings,
+    mount_ready: trio.Event,
     initial_entries: list[CatalogAsset],
     requests: trio.MemoryReceiveChannel[None],
     fatal_errors: list[str],
@@ -84,6 +85,7 @@ async def _refresh_worker(
         initial_entries,
         read_client,
         settings.mount_path,
+        mount_ready=mount_ready,
         task_status=task_status,
     )
 
@@ -100,7 +102,12 @@ async def _refresh_worker(
         try:
             # Keep this as the next Trio checkpoint: populate_previews installs every
             # failure record synchronously before it starts any network work.
-            await populate_previews(library.list(), read_client, settings.mount_path)
+            await populate_previews(
+                library.list(),
+                read_client,
+                settings.mount_path,
+                mount_ready=mount_ready,
+            )
         except Exception as error:
             LOGGER.error("preview suppression failed; terminating mount: %s", error)
             fatal_errors.append("preview suppression failed; mount terminated")
@@ -167,6 +174,7 @@ async def run_service(settings: Settings) -> None:
             await refresh_catalog(catalog, read_client, read_session, catalog_lock)
 
             requests, refreshes = trio.open_memory_channel[None](1)
+            mount_ready = trio.Event()
             fatal_errors: list[str] = []
 
             async def on_uploaded(entry: CatalogAsset) -> None:
@@ -238,6 +246,7 @@ async def run_service(settings: Settings) -> None:
                     catalog_lock,
                     content_cache,
                     settings,
+                    mount_ready,
                     library.list(),
                     refreshes,
                     fatal_errors,
@@ -252,6 +261,7 @@ async def run_service(settings: Settings) -> None:
                     str(settings.mount_path),
                     set(pyfuse3.default_options) | {"fsname=immich-on-demand", "auto_unmount"},
                 )
+                mount_ready.set()
                 try:
                     await nursery.start(
                         serve_control,

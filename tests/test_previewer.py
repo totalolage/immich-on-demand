@@ -141,6 +141,7 @@ class PreviewerTest(unittest.TestCase):
                     entry(3, modified_ns=2),
                 ]
                 fetched: list[str] = []
+                mount_ready = trio.Event()
                 read_started = Event()
                 release_read = Event()
 
@@ -161,13 +162,21 @@ class PreviewerTest(unittest.TestCase):
                 with patch("immich_on_demand.previewer._read_nautilus_sort", read_sort):
                     async with trio.open_nursery() as nursery:
                         nursery.start_soon(allow_read)
-                        await populate_previews(
-                            entries,
-                            Client(),  # type: ignore[arg-type]
-                            root / "mount",
-                            cache_home=root / "cache",
-                            concurrency=1,
+                        await nursery.start(
+                            partial(
+                                populate_previews,
+                                entries,
+                                Client(),  # type: ignore[arg-type]
+                                root / "mount",
+                                cache_home=root / "cache",
+                                concurrency=1,
+                                mount_ready=mount_ready,
+                            )
                         )
+                        self.assertFalse(read_started.is_set())
+                        mount_ready.set()
+                        while len(fetched) < len(entries):
+                            await trio.sleep(0)
                         nursery.cancel_scope.cancel()
 
                 self.assertEqual(

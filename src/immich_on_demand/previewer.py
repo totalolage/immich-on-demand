@@ -95,6 +95,7 @@ async def populate_previews(
     *,
     cache_home: Path | None = None,
     concurrency: int = 4,
+    mount_ready: trio.Event | None = None,
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> PreviewStats:
     """Suppress desktop fallbacks, then populate supported previews concurrently."""
@@ -103,8 +104,6 @@ async def populate_previews(
     entries = tuple(entries)
     if any(entry.asset.size is None for entry in entries):
         raise ValueError("visible catalog entries must have a size")
-    entries = await _sort_for_nautilus(entries, mount_path)
-
     jobs: list[tuple[CatalogAsset, Path, int, int]] = []
     current_count = 0
     for entry in entries:
@@ -126,8 +125,17 @@ async def populate_previews(
         if supported:
             jobs.append((entry, source_path, mtime, original_size))
 
-    installed = [False] * len(jobs)
     task_status.started()
+    if mount_ready is not None:
+        await mount_ready.wait()
+    if jobs:
+        ordered_entries = await _sort_for_nautilus(
+            tuple(job[0] for job in jobs), mount_path
+        )
+        rank = {entry.asset.id: index for index, entry in enumerate(ordered_entries)}
+        jobs.sort(key=lambda job: rank[job[0].asset.id])
+
+    installed = [False] * len(jobs)
 
     async def fetch(index: int, job: tuple[CatalogAsset, Path, int, int]) -> None:
         entry, source_path, mtime, original_size = job

@@ -159,12 +159,15 @@ class ServiceFakes:
         client: object,
         mount: Path,
         *,
+        mount_ready: trio.Event,
         task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
     ) -> object:
         self.events.append("suppress")
         if self.events.count("suppress") == self.preview_error_call:
             raise OSError("thumbnail cache unavailable")
         task_status.started()
+        await mount_ready.wait()
+        self.events.append("sort")
         self.events.append("fetch")
         if self.block_preview and self.events.count("fetch") == 1:
             await self.preview_gate.wait()
@@ -248,6 +251,7 @@ class ServiceTest(unittest.TestCase):
                     await fakes.main_started.wait()
                     self.assertLess(fakes.events.index("refresh"), fakes.events.index("suppress"))
                     self.assertLess(fakes.events.index("suppress"), fakes.events.index("fuse-init"))
+                    self.assertLess(fakes.events.index("fuse-init"), fakes.events.index("sort"))
                     self.assertLess(fakes.events.index("evict:11"), fakes.events.index("fuse-init"))
                     self.assertNotIn("preview-done", fakes.events)
                     self.assertIn("auto_unmount", fakes.fuse_options)
