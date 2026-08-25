@@ -11,6 +11,15 @@ from uuid import UUID
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
+def _truncate_utf8(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    return encoded[:limit].decode("utf-8", errors="ignore")
+
+
 def _nanoseconds(value: str) -> int:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -20,6 +29,8 @@ def _nanoseconds(value: str) -> int:
 
 def safe_filename(original: str, asset_id: str, limit: int = 255) -> str:
     UUID(asset_id)
+    if limit <= 0:
+        raise ValueError("filename byte limit must be positive")
     name = unicodedata.normalize("NFC", PurePath(original).name)
     name = _CONTROL.sub("_", name).replace("/", "_")
     if name in {"", ".", ".."}:
@@ -35,19 +46,33 @@ def safe_filename(original: str, asset_id: str, limit: int = 255) -> str:
     suffix_bytes = suffix.encode("utf-8")
     stem = name[: -len(suffix)] if suffix else name
     budget = limit - len(suffix_bytes)
-    while len(stem.encode("utf-8")) > budget:
-        stem = stem[:-1]
-    return f"{stem}{suffix}"
+    truncated_stem = _truncate_utf8(stem, budget)
+    if suffix and truncated_stem:
+        return f"{truncated_stem}{suffix}"
+    truncated = _truncate_utf8(name, limit)
+    return truncated or _truncate_utf8(asset_id, limit)
 
 
-def collision_name(name: str, asset_id: str, limit: int = 255) -> str:
+def collision_name(
+    name: str, asset_id: str, limit: int = 255, *, ordinal: int = 1
+) -> str:
+    UUID(asset_id)
+    if limit <= 0:
+        raise ValueError("filename byte limit must be positive")
+    if isinstance(ordinal, bool) or ordinal <= 0:
+        raise ValueError("collision ordinal must be positive")
     suffix = PurePath(name).suffix
     stem = name[: -len(suffix)] if suffix else name
-    marker = f"__{asset_id}"
-    budget = limit - len((marker + suffix).encode("utf-8"))
-    while len(stem.encode("utf-8")) > budget:
-        stem = stem[:-1]
-    return f"{stem}{marker}{suffix}"
+    marker = f"__{asset_id}" if ordinal == 1 else f"__{asset_id}__{ordinal}"
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= limit:
+        return _truncate_utf8(marker, limit)
+
+    suffix_bytes = suffix.encode("utf-8")
+    stem_budget = limit - len(marker_bytes) - len(suffix_bytes)
+    if suffix and stem_budget >= 0:
+        return f"{_truncate_utf8(stem, stem_budget)}{marker}{suffix}"
+    return f"{_truncate_utf8(stem, limit - len(marker_bytes))}{marker}"
 
 
 @dataclass(frozen=True, slots=True)

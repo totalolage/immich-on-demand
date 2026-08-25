@@ -1,3 +1,4 @@
+import signal
 import unittest
 from uuid import UUID
 
@@ -6,6 +7,10 @@ from immich_on_demand.model import Asset, collision_name, safe_filename
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
+
+
+def raise_timeout(*_: object) -> None:
+    raise TimeoutError("filename function did not return")
 
 
 class ModelTest(unittest.TestCase):
@@ -17,6 +22,51 @@ class ModelTest(unittest.TestCase):
         name = collision_name("photo.jpg", ASSET_ID)
         self.assertEqual(name, f"photo__{ASSET_ID}.jpg")
         self.assertLessEqual(len(name.encode()), 255)
+
+    def test_collision_name_terminates_when_the_suffix_consumes_the_budget(self) -> None:
+        name = "a." + "x" * 252
+        previous = signal.signal(
+            signal.SIGALRM,
+            raise_timeout,
+        )
+        signal.setitimer(signal.ITIMER_REAL, 0.1)
+        try:
+            result = collision_name(name, ASSET_ID)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+        self.assertLessEqual(len(result.encode("utf-8")), 255)
+        self.assertIn(ASSET_ID, result)
+        self.assertFalse(result.startswith("."))
+
+    def test_safe_filename_terminates_when_an_overlong_suffix_cannot_fit(self) -> None:
+        name = "a." + "x" * 255
+        previous = signal.signal(
+            signal.SIGALRM,
+            raise_timeout,
+        )
+        signal.setitimer(signal.ITIMER_REAL, 0.1)
+        try:
+            result = safe_filename(name, ASSET_ID)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+        self.assertLessEqual(len(result.encode("utf-8")), 255)
+        self.assertEqual(safe_filename(result, ASSET_ID), result)
+
+    def test_utf8_truncation_preserves_a_useful_extension(self) -> None:
+        name = "é" * 200 + ".jpg"
+
+        safe = safe_filename(name, ASSET_ID)
+        collided = collision_name(safe, ASSET_ID)
+
+        self.assertLessEqual(len(safe.encode("utf-8")), 255)
+        self.assertLessEqual(len(collided.encode("utf-8")), 255)
+        self.assertTrue(safe.endswith(".jpg"))
+        self.assertTrue(collided.endswith(".jpg"))
+        self.assertEqual(safe_filename("é", ASSET_ID, limit=1), ASSET_ID[0])
 
     def test_parses_asset_at_the_trust_boundary(self) -> None:
         asset = Asset.from_api(

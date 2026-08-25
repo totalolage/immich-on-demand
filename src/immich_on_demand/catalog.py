@@ -12,6 +12,17 @@ from .model import Asset, collision_name, safe_filename
 ROOT_INODE = 1
 
 
+def _available_name(original: str, asset_id: str, used: set[str]) -> str:
+    base = safe_filename(original, asset_id)
+    if base not in used:
+        return base
+    for ordinal in range(1, len(used) + 2):
+        candidate = collision_name(base, asset_id, ordinal=ordinal)
+        if candidate not in used:
+            return candidate
+    raise AssertionError("bounded collision search exhausted")
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogAsset:
     asset: Asset
@@ -145,9 +156,7 @@ class Catalog:
                 else:
                     inode = next_inode
                     next_inode += 1
-                    name = safe_filename(row["original_name"], row["id"])
-                    if name in used_names:
-                        name = collision_name(name, row["id"])
+                    name = _available_name(row["original_name"], row["id"], used_names)
                     used_names.add(name)
                 self._connection.execute(
                     """
@@ -213,9 +222,11 @@ class Catalog:
                 self._connection.execute(
                     "UPDATE metadata SET value = ? WHERE key = 'next_inode'", (inode + 1,)
                 )
-                name = safe_filename(requested_name, asset.id)
-                if self.by_name(name) is not None:
-                    name = collision_name(name, asset.id)
+                used_names = {
+                    row["name"]
+                    for row in self._connection.execute("SELECT name FROM assets")
+                }
+                name = _available_name(requested_name, asset.id, used_names)
             self._connection.execute(
                 """
                 INSERT OR REPLACE INTO assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

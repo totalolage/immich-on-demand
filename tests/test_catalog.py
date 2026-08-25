@@ -8,6 +8,7 @@ from immich_on_demand.model import Asset
 
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+LITERAL_ID = "17345678-1234-4234-8234-123456789abc"
 OTHER_ID = "22345678-1234-4234-8234-123456789abc"
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 
@@ -49,6 +50,25 @@ class CatalogTest(unittest.TestCase):
                 self.assertEqual(existing and existing.name, "photo.jpg")
                 self.assertEqual(existing and existing.asset.id, ASSET_ID)
                 self.assertEqual(added and added.asset.id, OTHER_ID)
+
+    def test_refresh_retries_when_a_literal_name_matches_the_collision_name(self) -> None:
+        generated = f"photo__{OTHER_ID}.jpg"
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage(
+                    [
+                        asset(ASSET_ID, "photo.jpg"),
+                        asset(LITERAL_ID, generated),
+                        asset(OTHER_ID, "photo.jpg"),
+                    ]
+                )
+                catalog.finish_refresh()
+
+                names = {entry.asset.id: entry.name for entry in catalog.list_visible()}
+                self.assertEqual(names[ASSET_ID], "photo.jpg")
+                self.assertEqual(names[LITERAL_ID], generated)
+                self.assertEqual(names[OTHER_ID], f"photo__{OTHER_ID}__2.jpg")
 
     def test_incomplete_refresh_does_not_change_live_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -96,6 +116,20 @@ class CatalogTest(unittest.TestCase):
                 self.assertEqual(added.name, f"photo__{OTHER_ID}.jpg")
                 self.assertEqual((added.inode, added.name), (refreshed.inode, refreshed.name))
                 self.assertEqual(refreshed.asset.modified_ns, 99)
+
+    def test_uploaded_asset_retries_an_occupied_generated_name(self) -> None:
+        generated = f"photo__{OTHER_ID}.jpg"
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage(
+                    [asset(ASSET_ID, "photo.jpg"), asset(LITERAL_ID, generated)]
+                )
+                catalog.finish_refresh()
+
+                added = catalog.add_uploaded(asset(OTHER_ID), "photo.jpg")
+
+                self.assertEqual(added.name, f"photo__{OTHER_ID}__2.jpg")
 
     def test_marks_only_a_known_asset_trashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
