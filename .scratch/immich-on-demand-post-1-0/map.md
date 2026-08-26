@@ -40,7 +40,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 
 - [Asset replacement](issues/11-add-asset-replacement.md) is implemented. Reference-system acceptance with project-owned Test assets remains.
 - [RAW, HEIF, and Live Photo Previews](issues/12-broaden-preview-support.md) are implemented. Reference-format and visual acceptance remain.
-- [Evaluate partial Hydration](issues/13-evaluate-partial-hydration.md)
+- [Partial Hydration](issues/13-evaluate-partial-hydration.md) was evaluated and deferred. Complete-file Hydration remains until the reopening gates pass.
 
 ### 2.0: support more environments
 

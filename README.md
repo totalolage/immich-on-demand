@@ -123,6 +123,8 @@ The development tree can start from trusted cached state after one successful on
 
 Development 1.4 uses Immich's bounded generated Preview for every image MIME type, including RAW and HEIF originals. Live Photo stills retain their explicit motion-video relationship across refreshes and Views, but the mount exposes and previews only the still. Composite playback, paired export/upload, and Asset replacement of Live Photos are not implemented.
 
+Partial Hydration remains intentionally absent. Immich 3.0.3 does not promise Range behavior for original downloads or expose a strong byte validator or chunk hashes, so original reads continue to download, validate, and cache the complete file atomically.
+
 Trusted Profile format v1 remains valid for offline startup after namespace migration. The service writes format v2 only after an online refresh validates and publishes both Album and People relations with the rich six-scope read key.
 
 In the development tree, routine background refreshes request only assets updated within an overlapping time window. These refreshes never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete asset sweeps before removing rows.
