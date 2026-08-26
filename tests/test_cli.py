@@ -118,6 +118,11 @@ class CliTest(unittest.TestCase):
                 {"asset": ASSET_ID, "pinned": False},
             ),
             (["pin-status", "--asset", ASSET_ID], "pin", {"asset": ASSET_ID}),
+            (
+                ["restore", "--asset", ASSET_ID.upper()],
+                "restore",
+                {"asset": ASSET_ID},
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory)
@@ -143,6 +148,16 @@ class CliTest(unittest.TestCase):
                     load_api_key.assert_not_called()
                     catalog.assert_not_called()
                     self.assertEqual(output.getvalue(), "a=1 z=2\n")
+
+    def test_restore_requires_an_asset_uuid(self) -> None:
+        for arguments in (["restore"], ["restore", "--asset", "not-a-uuid"]):
+            with (
+                self.subTest(arguments=arguments),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as exit,
+            ):
+                main(arguments)
+            self.assertEqual(exit.exception.code, 2)
 
     def test_status_before_service_start_is_a_concise_unavailable_error(self) -> None:
         error = io.StringIO()

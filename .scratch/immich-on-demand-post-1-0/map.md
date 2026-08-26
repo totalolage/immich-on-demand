@@ -2,7 +2,7 @@
 
 ## Destination
 
-Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, and the first desktop controls are implemented but await target acceptance. Later releases may add Restore, offline behavior, Views, broader media support, Asset replacement, multiple Profiles, and more platforms.
+Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, and the first desktop controls are implemented but await target acceptance. Later releases may add offline behavior, Views, broader media support, Asset replacement, multiple Profiles, and more platforms.
 
 ## Rules
 
@@ -24,7 +24,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 
 - [Nautilus actions and a settings GUI](issues/05-add-desktop-controls.md) are implemented in the source tree. Package integration and target acceptance remain.
 - [Pinning](issues/04-add-pinning.md), including CLI `pin-status`, is implemented. Target acceptance remains.
-- [Add an explicit trash restore command](issues/06-add-trash-restore.md)
+- [Explicit trash Restore](issues/06-add-trash-restore.md) is implemented. Target Test-asset acceptance remains.
 
 ### 1.2: work through outages
 

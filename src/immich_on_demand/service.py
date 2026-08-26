@@ -35,6 +35,15 @@ LOGGER = logging.getLogger(__name__)
 FULL_REFRESH_SECONDS = 24 * 60 * 60
 
 
+class _RestoreJob:
+    __slots__ = ("asset_id", "done", "failed")
+
+    def __init__(self, asset_id: str) -> None:
+        self.asset_id = asset_id
+        self.done = trio.Event()
+        self.failed = False
+
+
 def _check_mountpoint(path: Path) -> None:
     info = path.stat(follow_symlinks=False)
     if stat.S_ISLNK(info.st_mode):
@@ -179,6 +188,31 @@ async def _pin_worker(
                 inflight.discard(asset_id)
 
 
+async def _restore_worker(
+    library: Library,
+    notifications: trio.MemoryReceiveChannel[bool],
+    pending: list[_RestoreJob],
+    jobs: dict[str, _RestoreJob],
+    refreshes: trio.MemorySendChannel[bool],
+) -> None:
+    async for _ in notifications:
+        while pending:
+            job = pending.pop()
+            try:
+                await library.remote_restore(job.asset_id)
+            except Exception as error:
+                job.failed = True
+                LOGGER.warning("restore failed: %s", type(error).__name__)
+            finally:
+                try:
+                    refreshes.send_nowait(False)
+                except trio.WouldBlock:
+                    pass
+                if job.failed and jobs.get(job.asset_id) is job:
+                    del jobs[job.asset_id]
+                job.done.set()
+
+
 def _missing_mutation_key(error: RuntimeError) -> bool:
     return "expected one mutation API key" in str(error) and str(error).endswith("found 0")
 
@@ -244,8 +278,12 @@ async def run_service(settings: Settings) -> None:
 
             requests, refreshes = trio.open_memory_channel[bool](1)
             pin_requests, pins = trio.open_memory_channel[bool](1)
+            restore_requests, restores = trio.open_memory_channel[bool](1)
             pin_pending: dict[str, CatalogAsset] = {}
             pin_inflight: set[str] = set()
+            restore_pending: list[_RestoreJob] = []
+            # ponytail: one terminal success per asset; replace it when the row is trashed again.
+            restore_jobs: dict[str, _RestoreJob] = {}
             persisted_pins = catalog.pinned_ids()
             for entry in library.list():
                 if (
@@ -433,7 +471,46 @@ async def run_service(settings: Settings) -> None:
                     raise ValueError("evict accepts an asset UUID or mounted file URI")
                 return {"evicted": content_cache.evict(asset_id)}
 
-            async with requests, refreshes, pin_requests, pins, trio.open_nursery() as nursery:
+            async def restore(params: dict[str, Any]) -> dict[str, bool]:
+                if set(params) != {"asset"} or not isinstance(
+                    params["asset"], str
+                ):
+                    raise ValueError("restore requires one canonical asset UUID")
+                asset_id = str(UUID(params["asset"]))
+                if asset_id != params["asset"]:
+                    raise ValueError("restore requires one canonical asset UUID")
+                job = restore_jobs.get(asset_id)
+                if job is not None and job.done.is_set():
+                    current = catalog.by_id(asset_id)
+                    if (
+                        not job.failed
+                        and current is not None
+                        and not current.asset.is_trashed
+                    ):
+                        return {"restored": True, "scheduled": True}
+                    job = None
+                if job is None:
+                    job = _RestoreJob(asset_id)
+                    restore_jobs[asset_id] = job
+                    restore_pending.append(job)
+                    try:
+                        restore_requests.send_nowait(True)
+                    except trio.WouldBlock:
+                        pass
+                await job.done.wait()
+                if job.failed:
+                    raise RuntimeError("restore failed")
+                return {"restored": True, "scheduled": True}
+
+            async with (
+                requests,
+                refreshes,
+                pin_requests,
+                pins,
+                restore_requests,
+                restores,
+                trio.open_nursery() as nursery,
+            ):
                 await nursery.start(
                     _refresh_worker,
                     catalog,
@@ -470,6 +547,7 @@ async def run_service(settings: Settings) -> None:
                             "evict": evict,
                             "describe": describe,
                             "pin": pin,
+                            "restore": restore,
                         },
                     )
                     nursery.start_soon(
@@ -479,6 +557,14 @@ async def run_service(settings: Settings) -> None:
                         pins,
                         pin_pending,
                         pin_inflight,
+                    )
+                    nursery.start_soon(
+                        _restore_worker,
+                        library,
+                        restores,
+                        restore_pending,
+                        restore_jobs,
+                        requests,
                     )
                     nursery.start_soon(
                         _periodic_refresh,

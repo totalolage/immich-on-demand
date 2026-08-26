@@ -8,6 +8,9 @@ import trio
 from immich_on_demand.desktop import run_action
 
 
+ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+
+
 class DesktopTest(unittest.TestCase):
     def test_actions_use_only_the_bounded_local_control_client(self) -> None:
         async def scenario(runtime: Path) -> None:
@@ -36,6 +39,10 @@ class DesktopTest(unittest.TestCase):
                 )
                 self.assertEqual(await run_action("pin", uri), {"scheduled": True})
                 self.assertEqual(await run_action("unpin", uri), {"scheduled": True})
+                self.assertEqual(
+                    await run_action("restore", ASSET_ID.upper()),
+                    {"scheduled": True},
+                )
 
             self.assertEqual(
                 request.await_args_list,
@@ -66,6 +73,12 @@ class DesktopTest(unittest.TestCase):
                         "pin",
                         {"uri": uri, "pinned": False},
                     ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "restore",
+                        {"asset": ASSET_ID},
+                    ),
                 ],
             )
 
@@ -83,6 +96,9 @@ class DesktopTest(unittest.TestCase):
                 ("describe", ["file:///Photos/photo.jpg"] * 65),
                 ("pin", None),
                 ("unpin", "https://photos.example.test/photo.jpg"),
+                ("restore", None),
+                ("restore", "not-a-uuid"),
+                ("restore", "file:///Photos/photo.jpg"),
                 ("unknown", None),
             ):
                 with self.subTest(action=action, uri=uri), self.assertRaises(ValueError):

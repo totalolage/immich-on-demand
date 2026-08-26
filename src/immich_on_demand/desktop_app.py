@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+from uuid import UUID
 
 import gi
 import trio
@@ -225,6 +226,8 @@ class DesktopApplication(Adw.Application):
         self._window = None
         self._entries: dict[str, object] = {}
         self._remote_delete = None
+        self._restore_entry = None
+        self._restore_button = None
         self._message = None
         self._save_button = None
 
@@ -295,11 +298,25 @@ class DesktopApplication(Adw.Application):
 
         self._remote_delete = Gtk.CheckButton(label="Enable remote deletion")
         grid.attach(self._remote_delete, 1, len(fields), 1, 1)
+        grid.attach(
+            Gtk.Label(label="Restore asset UUID", xalign=0),
+            0,
+            len(fields) + 1,
+            1,
+            1,
+        )
+        restore_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._restore_entry = Gtk.Entry(hexpand=True)
+        restore_controls.append(self._restore_entry)
+        self._restore_button = Gtk.Button(label="Restore Asset")
+        self._restore_button.connect("clicked", self._restore_asset)
+        restore_controls.append(self._restore_button)
+        grid.attach(restore_controls, 1, len(fields) + 1, 1, 1)
         self._message = Gtk.Label(label="", xalign=0)
-        grid.attach(self._message, 0, len(fields) + 1, 2, 1)
+        grid.attach(self._message, 0, len(fields) + 2, 2, 1)
         self._save_button = Gtk.Button(label="Save Settings")
         self._save_button.connect("clicked", self._save_settings)
-        grid.attach(self._save_button, 1, len(fields) + 2, 1, 1)
+        grid.attach(self._save_button, 1, len(fields) + 3, 1, 1)
         self._window.set_content(content)
 
     def _finish_load(self, success: bool, result) -> bool:
@@ -366,6 +383,36 @@ class DesktopApplication(Adw.Application):
             "Settings saved." if success else "Could not save settings."
         )
         return False
+
+    def _restore_asset(self, _button) -> None:
+        try:
+            asset_id = str(UUID(self._restore_entry.get_text().strip()))
+        except ValueError:
+            self._message.set_text("Restore asset UUID is invalid.")
+            return
+
+        def restore():
+            return trio.run(run_action, "restore", asset_id)
+
+        if not self._worker.submit(restore, self._finish_restore):
+            self._message.set_text("Desktop worker is busy.")
+            return
+        self._restore_entry.set_text("")
+        self._message.set_text("Requesting restore.")
+
+    def _finish_restore(self, success: bool, result) -> bool:
+        confirmed = (
+            success
+            and isinstance(result, dict)
+            and set(result) == {"restored", "scheduled"}
+            and result["restored"] is True
+            and result["scheduled"] is True
+        )
+        self._message.set_text(
+            "Restore requested." if confirmed else "Could not restore asset."
+        )
+        return False
+
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv

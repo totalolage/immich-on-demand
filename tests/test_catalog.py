@@ -372,3 +372,24 @@ class CatalogTest(unittest.TestCase):
                 self.assertTrue(trashed and trashed.asset.is_trashed)
                 with self.assertRaises(KeyError):
                     catalog.mark_trashed(OTHER_ID)
+
+    def test_restores_only_a_known_asset_without_changing_its_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                entry = catalog.add_uploaded(
+                    replace(asset(), is_trashed=True), "stable-photo.jpg"
+                )
+
+                self.assertEqual(catalog.by_id(entry.asset.id), entry)
+                catalog.mark_restored(entry.asset.id)
+
+                restored = catalog.by_id(entry.asset.id)
+                assert restored is not None
+                self.assertFalse(restored.asset.is_trashed)
+                self.assertEqual(
+                    (restored.inode, restored.name), (entry.inode, entry.name)
+                )
+                self.assertEqual(catalog.list_visible(), [restored])
+                self.assertIsNone(catalog.by_id(OTHER_ID))
+                with self.assertRaises(KeyError):
+                    catalog.mark_restored(OTHER_ID)

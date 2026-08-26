@@ -135,6 +135,16 @@ immich-on-demand unpin --asset 12345678-1234-4234-8234-123456789abc
 
 `pin-status` reports `pinned`, `cached`, `busy`, and `scheduled`. `unpin` removes the protection but keeps any cached bytes until normal Eviction removes them.
 
+Development builds also provide an explicit Restore command:
+
+```bash
+immich-on-demand restore --asset 12345678-1234-4234-8234-123456789abc
+```
+
+Restore requires `--enable-remote-delete` and a mutation key with exactly `user.read`, `asset.read`, `asset.view`, `asset.download`, `asset.upload`, and `asset.delete`. The service accepts only a canonical asset UUID for a known, trashed asset owned by the mutation user. Immediately before the restore request, the client fetches the current server features and requires literal `trash: true`.
+
+A successful response must report that Immich restored exactly one asset. The service then exposes the existing catalog row and schedules a refresh. The Library name and inode do not change. Restore is never a filesystem side effect.
+
 After a configuration change, restart the service:
 
 ```bash
@@ -145,6 +155,8 @@ systemctl --user restart immich-on-demand.service
 
 The development tree contains a GTK 4 and libadwaita settings application plus a Nautilus 50 extension. The settings application edits the single configured server, mount, cache policy, refresh interval, and remote-delete policy. Nonblank API key fields replace the matching Secret Service item. Saving settings does not restart the service.
 
+The GUI Restore control accepts one asset UUID. The UUID is transient and is not saved in configuration. The GUI sends the canonical UUID through the private control socket from its bounded worker and displays only fixed success or failure text.
+
 Inside the configured mount, Nautilus adds folder actions for Refresh and Settings. A one-file selection can Pin, Unpin, retry a failed pinned download, or Evict its local copy. Emblems report cached, pinned, and busy state. The extension returns no actions or emblems outside the configured mount.
 
 The released version 1.0 Arch recipe does not install this desktop entry, the Nautilus loader, or the emblem icons. The following target-system checks remain open:
@@ -153,6 +165,7 @@ The released version 1.0 Arch recipe does not install this desktop entry, the Na
 - Load the extension in Nautilus 50 and verify mount scoping, menus, emblem changes, and failure behavior.
 - Save settings and replacement keys through the GUI, then restart the user service and verify the new configuration.
 - Pin one recorded Test asset, verify restart and Eviction behavior, inspect it with `pin-status`, then Unpin it. Do not use a Protected-library asset.
+- Restore only the recorded trashed Test asset. Verify that its Library name and inode remain stable. Never use Restore on a Protected-library asset.
 - Run routine incremental refresh and complete-reconciliation checks through the installed target service.
 
 ## Local data and upload recovery
@@ -188,7 +201,7 @@ Version 1.0 is available on GitHub. The package has not been published to the AU
 
 Albums, people, dates, and other views are also deferred. A future version may expose paths such as `{Albums,People,All,by Date}/asset.ext` and hardlink repeated views of the same asset.
 
-The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, and desktop controls. It also tracks AUR publication, Restore, offline behavior, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
+The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, and desktop controls. It also tracks AUR publication, offline behavior, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
 
 ## License
 

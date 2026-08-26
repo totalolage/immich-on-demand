@@ -520,8 +520,83 @@ class ImmichClientTest(unittest.TestCase):
         trio.run(scenario)
         self.assertEqual(requests, [("GET", "/api/server/features")])
 
+    def test_restore_refetches_feature_and_restores_exactly_one_asset(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/api/server/features":
+                return httpx.Response(200, json={"trash": True})
+            self.assertEqual(
+                (request.method, request.url.path),
+                ("POST", "/api/trash/restore/assets"),
+            )
+            self.assertEqual(
+                request.read(),
+                b'{"ids":["12345678-1234-4234-8234-123456789abc"]}',
+            )
+            return httpx.Response(200, json={"count": 1})
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                await client.restore(ASSET_ID)
+                await client.restore(ASSET_ID)
+
+        trio.run(scenario)
+        self.assertEqual(
+            requests,
+            [
+                ("GET", "/api/server/features"),
+                ("POST", "/api/trash/restore/assets"),
+                ("GET", "/api/server/features"),
+                ("POST", "/api/trash/restore/assets"),
+            ],
+        )
+
+    def test_restore_requires_literal_true_from_fresh_feature_response(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            return httpx.Response(200, json={"trash": 1})
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichError, "^Immich trash is disabled; refusing restore$"
+                ):
+                    await client.restore(ASSET_ID)
+
+        trio.run(scenario)
+        self.assertEqual(requests, [("GET", "/api/server/features")])
+
+    def test_restore_rejects_non_object_server_responses(self) -> None:
+        payloads = iter(([], {"trash": True}, []))
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=next(payloads))
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(ImmichError, "non-object response"):
+                    await client.restore(ASSET_ID)
+                with self.assertRaisesRegex(ImmichError, "non-object response"):
+                    await client.restore(ASSET_ID)
+
+        trio.run(scenario)
+
     def test_restore_requires_a_literal_integer_count(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/server/features":
+                return httpx.Response(200, json={"trash": True})
             return httpx.Response(200, json={"count": True})
 
         async def scenario() -> None:

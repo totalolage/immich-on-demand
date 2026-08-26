@@ -10,6 +10,7 @@ from unittest.mock import patch
 import trio
 
 from immich_on_demand.catalog import CatalogAsset, CatalogStats
+from immich_on_demand.control import ControlError, send_request, serve_control
 from immich_on_demand.immich import (
     ImmichPageLimitError,
     ImmichResponseError,
@@ -20,8 +21,10 @@ from immich_on_demand.immich import (
 from immich_on_demand.model import Asset
 from immich_on_demand.service import (
     FULL_REFRESH_SECONDS,
+    _RestoreJob,
     _periodic_refresh,
     _pin_worker,
+    _restore_worker,
     run_service,
 )
 from immich_on_demand.settings import Settings
@@ -67,6 +70,8 @@ class ServiceFakes:
         incremental_page_limit: bool = False,
         incremental_response_error: bool = False,
         pin_persist_error: bool = False,
+        restore_error: Exception | None = None,
+        block_restore: bool = False,
     ) -> None:
         self.root = root
         self.mutation = mutation
@@ -76,6 +81,8 @@ class ServiceFakes:
         self.incremental_page_limit = incremental_page_limit
         self.incremental_response_error = incremental_response_error
         self.pin_persist_error = pin_persist_error
+        self.restore_error = restore_error
+        self.block_restore = block_restore
         self.events: list[str] = []
         self.clients: list[ServiceFakes.Client] = []
         self.handlers: dict[str, object] = {}
@@ -90,6 +97,10 @@ class ServiceFakes:
         self.on_uploaded: object = None
         self.fuse_options: set[str] = set()
         self.catalog_locks: list[object] = []
+        self.restore_attempts: list[str] = []
+        self.restored_ids: list[str] = []
+        self.restore_started = trio.Event()
+        self.restore_gate = trio.Event()
         self.persisted_pins = {PINNED_ID}
         self.pin_hydrated = trio.Event()
         outer = self
@@ -132,6 +143,9 @@ class ServiceFakes:
 
             def unpin(self, asset_id: str) -> None:
                 outer.persisted_pins.discard(asset_id)
+
+            def by_id(self, asset_id: str) -> CatalogAsset | None:
+                return upload_entry() if asset_id == ASSET_ID else None
 
         class Cache:
             def __init__(
@@ -199,6 +213,15 @@ class ServiceFakes:
 
             def lookup(self, identity: str | int) -> CatalogAsset | None:
                 return upload_entry() if identity == "new.jpg" else None
+
+            async def remote_restore(self, asset_id: str) -> None:
+                outer.restore_attempts.append(asset_id)
+                outer.restore_started.set()
+                if outer.block_restore:
+                    await outer.restore_gate.wait()
+                if outer.restore_error is not None:
+                    raise outer.restore_error
+                outer.restored_ids.append(asset_id)
 
         class Filesystem:
             def __init__(self, library: object, path: Path, *, on_uploaded: object) -> None:
@@ -300,7 +323,7 @@ class ServiceFakes:
         self.terminated.set()
         self.stop_main.set()
 
-    def patches(self) -> ExitStack:
+    def patches(self, *, real_control: bool = False) -> ExitStack:
         stack = ExitStack()
         replacements = {
             "ImmichClient": self.Client,
@@ -312,11 +335,12 @@ class ServiceFakes:
             "refresh_catalog": self.refresh,
             "refresh_catalog_incremental": self.incremental_refresh,
             "populate_previews": self.previews,
-            "serve_control": self.control,
             "state_path": lambda: self.root / "state",
             "cache_path": lambda: self.root / "cache",
             "runtime_path": lambda: self.root / "runtime",
         }
+        if not real_control:
+            replacements["serve_control"] = self.control
         for name, value in replacements.items():
             stack.enter_context(patch(f"immich_on_demand.service.{name}", value))
         stack.enter_context(patch("immich_on_demand.service.pyfuse3.init", self.fuse_init))
@@ -329,6 +353,225 @@ class ServiceFakes:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_restore_worker_does_not_retain_failed_jobs(self) -> None:
+        async def scenario() -> None:
+            class Library:
+                async def remote_restore(self, asset_id: str) -> None:
+                    raise RuntimeError("restore failed")
+
+            notifications, received = trio.open_memory_channel[bool](1)
+            refreshes, refreshed = trio.open_memory_channel[bool](1)
+            jobs = {
+                asset_id: _RestoreJob(asset_id)
+                for asset_id in (
+                    ASSET_ID,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                )
+            }
+            pending = list(jobs.values())
+            async with notifications, received, refreshes, refreshed:
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(
+                        _restore_worker,
+                        Library(),
+                        received,
+                        pending,
+                        jobs,
+                        refreshes,
+                    )
+                    await notifications.send(True)
+                    for job in tuple(jobs.values()):
+                        await job.done.wait()
+                    self.assertEqual(jobs, {})
+                    nursery.cancel_scope.cancel()
+
+        with self.assertLogs("immich_on_demand.service", level="WARNING"):
+            trio.run(scenario)
+
+    def test_restore_control_schedules_repair_and_sanitizes_failure(self) -> None:
+        async def run_case(root: Path, error: Exception | None) -> ServiceFakes:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                restore_error=error,
+            )
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+            with fakes.patches(real_control=True):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    socket = root / "runtime" / "control.sock"
+                    if error is None:
+                        self.assertEqual(
+                            await send_request(
+                                socket,
+                                1,
+                                "restore",
+                                {"asset": ASSET_ID},
+                            ),
+                            {"restored": True, "scheduled": True},
+                        )
+                        with trio.fail_after(0.2):
+                            await fakes.incremental_done.wait()
+                    else:
+                        with self.assertRaisesRegex(
+                            ControlError, "^request failed$"
+                        ):
+                            await send_request(
+                                socket,
+                                1,
+                                "restore",
+                                {"asset": ASSET_ID},
+                            )
+                        self.assertEqual(
+                            (await send_request(socket, 2, "status", {}))["total"],
+                            7,
+                        )
+                        with trio.fail_after(0.2):
+                            await fakes.incremental_done.wait()
+                    fakes.stop_main.set()
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory:
+            success = trio.run(run_case, Path(directory) / "success", None)
+            with self.assertLogs(
+                "immich_on_demand.service", level="WARNING"
+            ) as logs:
+                failure = trio.run(
+                    run_case,
+                    Path(directory) / "failure",
+                    RuntimeError("api-key=do-not-display"),
+                )
+
+        self.assertEqual(success.restored_ids, [ASSET_ID])
+        self.assertEqual(failure.restored_ids, [])
+        self.assertNotIn("api-key", "\n".join(logs.output))
+        self.assertNotIn("fuse-terminate", success.events + failure.events)
+
+    def test_restore_survives_the_request_timeout_and_repairs_catalog(self) -> None:
+        async def scenario(root: Path) -> ServiceFakes:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                block_restore=True,
+            )
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+            with fakes.patches(real_control=True):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    socket = root / "runtime" / "control.sock"
+                    with self.assertRaisesRegex(
+                        ControlError, "^control request timed out$"
+                    ):
+                        await send_request(
+                            socket,
+                            1,
+                            "restore",
+                            {"asset": ASSET_ID},
+                            timeout=0.05,
+                        )
+                    await fakes.restore_started.wait()
+                    self.assertEqual(
+                        (await send_request(socket, 2, "status", {}))["total"],
+                        7,
+                    )
+                    fakes.restore_gate.set()
+                    with trio.fail_after(0.2):
+                        await fakes.incremental_done.wait()
+                    self.assertEqual(
+                        await send_request(
+                            socket,
+                            3,
+                            "restore",
+                            {"asset": ASSET_ID},
+                        ),
+                        {"restored": True, "scheduled": True},
+                    )
+                    fakes.stop_main.set()
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory:
+            fakes = trio.run(scenario, Path(directory))
+
+        self.assertEqual(fakes.restored_ids, [ASSET_ID])
+        self.assertEqual(fakes.restore_attempts, [ASSET_ID])
+        self.assertIn("fuse-close:True", fakes.events)
+        self.assertNotIn("fuse-terminate", fakes.events)
+
+    def test_failed_restore_is_retried_after_the_server_handler_times_out(self) -> None:
+        async def short_control(
+            path: Path,
+            handlers: object,
+            *,
+            task_status: trio.TaskStatus[object] = trio.TASK_STATUS_IGNORED,
+        ) -> None:
+            await serve_control(
+                path,
+                handlers,
+                timeout=0.05,
+                task_status=task_status,
+            )
+
+        async def scenario(root: Path) -> ServiceFakes:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                block_restore=True,
+                restore_error=RuntimeError("api-key=do-not-display"),
+            )
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+            with fakes.patches(real_control=True), patch(
+                "immich_on_demand.service.serve_control", short_control
+            ):
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    socket = root / "runtime" / "control.sock"
+                    with self.assertRaisesRegex(ControlError, "^request timed out$"):
+                        await send_request(
+                            socket,
+                            1,
+                            "restore",
+                            {"asset": ASSET_ID},
+                        )
+                    fakes.restore_gate.set()
+                    with trio.fail_after(0.2):
+                        await fakes.incremental_done.wait()
+                    fakes.restore_error = None
+                    self.assertEqual(
+                        await send_request(
+                            socket,
+                            2,
+                            "restore",
+                            {"asset": ASSET_ID},
+                        ),
+                        {"restored": True, "scheduled": True},
+                    )
+                    fakes.stop_main.set()
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory, self.assertLogs(
+            "immich_on_demand.service", level="WARNING"
+        ) as logs:
+            fakes = trio.run(scenario, Path(directory))
+
+        self.assertEqual(fakes.restore_attempts, [ASSET_ID, ASSET_ID])
+        self.assertEqual(fakes.restored_ids, [ASSET_ID])
+        self.assertNotIn("api-key", "\n".join(logs.output))
+
     def test_failed_pinned_hydration_keeps_the_worker_retryable(self) -> None:
         async def scenario() -> None:
             entry = upload_entry()
@@ -523,6 +766,7 @@ class ServiceTest(unittest.TestCase):
                     evict = fakes.handlers["evict"]
                     describe = fakes.handlers["describe"]
                     pin = fakes.handlers["pin"]
+                    restore = fakes.handlers["restore"]
                     self.assertEqual(
                         await status({}),  # type: ignore[operator]
                         {
@@ -605,6 +849,20 @@ class ServiceTest(unittest.TestCase):
                         },
                     )  # type: ignore[operator]
                     self.assertNotIn(ASSET_ID, fakes.persisted_pins)
+                    self.assertEqual(
+                        await restore({"asset": ASSET_ID}),
+                        {"restored": True, "scheduled": True},
+                    )  # type: ignore[operator]
+                    self.assertEqual(fakes.restored_ids, [ASSET_ID])
+                    for invalid in (
+                        {},
+                        {"asset": "not-a-uuid"},
+                        {"asset": ASSET_ID.upper()},
+                        {"asset": ASSET_ID, "extra": True},
+                    ):
+                        with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                            await restore(invalid)  # type: ignore[operator]
+                    self.assertEqual(fakes.restored_ids, [ASSET_ID])
                     for params in (
                         {},
                         {"uris": []},

@@ -68,7 +68,9 @@ class MutationClient:
         self.created = created
         self.uploads = 0
         self.trashes: list[str] = []
+        self.restores: list[str] = []
         self.on_upload = lambda: None
+        self.on_restore = lambda: None
 
     async def upload(self, path: Path, media_types: frozenset[str]) -> UploadResult:
         self.uploads += 1
@@ -81,6 +83,12 @@ class MutationClient:
         if self.error is not None:
             raise self.error
         self.trashes.append(asset_id)
+
+    async def restore(self, asset_id: str) -> None:
+        self.on_restore()
+        self.restores.append(asset_id)
+        if self.error is not None:
+            raise self.error
 
 
 class Cache:
@@ -293,6 +301,98 @@ class LibraryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_remote_restore_rejects_every_failed_guard_without_network(self) -> None:
+        async def scenario(root: Path) -> None:
+            cases = (
+                (False, MutationClient(), session(), True, ASSET_ID),
+                (True, None, session(), True, ASSET_ID),
+                (True, MutationClient(), None, True, ASSET_ID),
+                (True, MutationClient(), session(trash_enabled=False), True, ASSET_ID),
+                (True, MutationClient(), session(), True, OTHER_ID),
+                (True, MutationClient(), session(), False, ASSET_ID),
+                (True, MutationClient(), session(owner_id=OTHER_ID), True, ASSET_ID),
+            )
+            for index, (
+                enabled,
+                mutation,
+                mutation_session,
+                trashed,
+                requested_id,
+            ) in enumerate(cases):
+                with self.subTest(index=index), Catalog(
+                    root / f"restore-guard-{index}.db"
+                ) as catalog:
+                    entry = catalog.add_uploaded(
+                        replace(asset(), is_trashed=trashed), "photo.jpg"
+                    )
+                    with self.assertRaises((LibraryError, PermissionError)):
+                        await library(
+                            catalog,
+                            root,
+                            mutation=mutation,
+                            mutation_session=mutation_session,
+                            remote_delete=enabled,
+                        ).remote_restore(requested_id)
+
+                    self.assertEqual(mutation.restores if mutation else [], [])
+                    current = catalog.by_id(entry.asset.id)
+                    self.assertEqual(
+                        current and current.asset.is_trashed, entry.asset.is_trashed
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_remote_restore_commits_locally_only_after_remote_success(self) -> None:
+        async def scenario(root: Path) -> None:
+            with Catalog(root / "restore-success.db") as catalog:
+                entry = catalog.add_uploaded(
+                    replace(asset(), is_trashed=True), "stable-photo.jpg"
+                )
+                mutation = MutationClient()
+
+                def observe_remote_call() -> None:
+                    current = catalog.by_id(entry.asset.id)
+                    self.assertTrue(current and current.asset.is_trashed)
+
+                mutation.on_restore = observe_remote_call
+                await library(
+                    catalog,
+                    root,
+                    mutation=mutation,
+                    mutation_session=session(),
+                    remote_delete=True,
+                ).remote_restore(entry.asset.id)
+
+                restored = catalog.by_id(entry.asset.id)
+                assert restored is not None
+                self.assertEqual(mutation.restores, [entry.asset.id])
+                self.assertFalse(restored.asset.is_trashed)
+                self.assertEqual(
+                    (restored.inode, restored.name), (entry.inode, entry.name)
+                )
+
+            with Catalog(root / "restore-failure.db") as catalog:
+                entry = catalog.add_uploaded(
+                    replace(asset(), is_trashed=True), "photo.jpg"
+                )
+                mutation = MutationClient(OSError("restore failed"))
+                with self.assertRaisesRegex(OSError, "restore failed"):
+                    await library(
+                        catalog,
+                        root,
+                        mutation=mutation,
+                        mutation_session=session(),
+                        remote_delete=True,
+                    ).remote_restore(entry.asset.id)
+
+                current = catalog.by_id(entry.asset.id)
+                self.assertTrue(current and current.asset.is_trashed)
+                self.assertEqual(mutation.restores, [entry.asset.id])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_refresh_cannot_erase_a_concurrent_upload(self) -> None:
         async def scenario(root: Path) -> None:
             refresh_paused = trio.Event()
@@ -379,6 +479,60 @@ class LibraryTest(unittest.TestCase):
                     await trash_done.wait()
 
                 self.assertEqual(catalog.list_visible(), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_refresh_serializes_with_remote_restore(self) -> None:
+        async def scenario(root: Path) -> None:
+            refresh_paused = trio.Event()
+            finish_refresh = trio.Event()
+            restore_done = trio.Event()
+
+            class RefreshClient:
+                async def asset_pages(self, owner_id: str):
+                    if owner_id != OWNER_ID:
+                        raise AssertionError(owner_id)
+                    yield [replace(asset(), is_trashed=True)]
+                    refresh_paused.set()
+                    await finish_refresh.wait()
+
+            with Catalog(root / "catalog.db") as catalog:
+                entry = catalog.add_uploaded(
+                    replace(asset(), is_trashed=True), "stable-photo.jpg"
+                )
+                lock = trio.Lock()
+                mutation = MutationClient()
+                mounted = library(
+                    catalog,
+                    root,
+                    mutation=mutation,
+                    mutation_session=session(),
+                    remote_delete=True,
+                    catalog_lock=lock,
+                )
+
+                async def restore() -> None:
+                    await mounted.remote_restore(entry.asset.id)
+                    restore_done.set()
+
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(
+                        refresh_catalog, catalog, RefreshClient(), session(), lock
+                    )
+                    await refresh_paused.wait()
+                    nursery.start_soon(restore)
+                    await wait_all_tasks_blocked()
+                    self.assertEqual(mutation.restores, [])
+                    finish_refresh.set()
+                    await restore_done.wait()
+
+                restored = catalog.by_id(entry.asset.id)
+                assert restored is not None
+                self.assertFalse(restored.asset.is_trashed)
+                self.assertEqual(
+                    (restored.inode, restored.name), (entry.inode, entry.name)
+                )
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

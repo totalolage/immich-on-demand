@@ -95,6 +95,24 @@ class Library:
             await mutation.trash(current.asset.id)
             self._catalog.mark_trashed(current.asset.id)
 
+    async def remote_restore(self, asset_id: str) -> None:
+        if not self._settings.remote_delete:
+            raise PermissionError("remote deletion is disabled")
+        mutation, session = self._mutation_access()
+        if not session.trash_enabled:
+            raise PermissionError("Immich trash is disabled")
+        async with self._catalog_lock:
+            current = self._catalog.by_id(asset_id)
+            if current is None:
+                raise LibraryError("asset is not in the catalog")
+            if not current.asset.is_trashed:
+                raise LibraryError("asset is not trashed")
+            if current.asset.owner_id != session.owner_id:
+                raise PermissionError("only owned assets can be remotely restored")
+
+            await mutation.restore(current.asset.id)
+            self._catalog.mark_restored(current.asset.id)
+
     def _mutation_access(self) -> tuple[ImmichClient, ServerSession]:
         if self._mutation_client is None or self._mutation_session is None:
             raise LibraryError("a validated mutation client and session are required")

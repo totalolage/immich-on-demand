@@ -324,6 +324,9 @@ class ImmichClient:
 
     async def restore(self, asset_id: str) -> None:
         UUID(asset_id)
+        features = await self._json("GET", "server/features")
+        if features.get("trash") is not True:
+            raise ImmichError("Immich trash is disabled; refusing restore")
         value = await self._json("POST", "trash/restore/assets", json={"ids": [asset_id]})
         if type(value.get("count")) is not int or value["count"] != 1:
             raise ImmichError("Immich did not restore the requested asset")

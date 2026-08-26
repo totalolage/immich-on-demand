@@ -90,6 +90,13 @@ class ControlTests(unittest.TestCase):
                     await send_request(path, 10, "pin", {"pinned": True}),
                     {"pinned": True},
                 )
+                with self.assertRaisesRegex(ControlError, "^method unavailable$"):
+                    await send_request(
+                        path,
+                        11,
+                        "restore",
+                        {"asset": "12345678-1234-4234-8234-123456789abc"},
+                    )
                 nursery.cancel_scope.cancel()
             self.assertFalse(path.exists())
             self.assertEqual(seen, [{"path": "/Photos"}, {}])

@@ -347,6 +347,12 @@ class Catalog:
         row = self._connection.execute("SELECT * FROM assets WHERE inode = ?", (inode,)).fetchone()
         return self._catalog_asset(row) if row else None
 
+    def by_id(self, asset_id: str) -> CatalogAsset | None:
+        row = self._connection.execute(
+            "SELECT * FROM assets WHERE id = ?", (asset_id,)
+        ).fetchone()
+        return self._catalog_asset(row) if row else None
+
     def by_name(self, name: str) -> CatalogAsset | None:
         row = self._connection.execute("SELECT * FROM assets WHERE name = ?", (name,)).fetchone()
         return self._catalog_asset(row) if row else None
@@ -402,6 +408,14 @@ class Catalog:
         with self._connection:
             updated = self._connection.execute(
                 "UPDATE assets SET is_trashed = 1 WHERE id = ?", (asset_id,)
+            )
+            if updated.rowcount != 1:
+                raise KeyError(asset_id)
+
+    def mark_restored(self, asset_id: str) -> None:
+        with self._connection:
+            updated = self._connection.execute(
+                "UPDATE assets SET is_trashed = 0 WHERE id = ?", (asset_id,)
             )
             if updated.rowcount != 1:
                 raise KeyError(asset_id)

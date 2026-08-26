@@ -62,6 +62,8 @@ def parser() -> argparse.ArgumentParser:
         pin.add_argument("--asset", type=_asset_id, required=True)
     pin_status = commands.add_parser("pin-status", help="show an original's Pin state")
     pin_status.add_argument("--asset", type=_asset_id, required=True)
+    restore = commands.add_parser("restore", help="restore a trashed asset")
+    restore.add_argument("--asset", type=_asset_id, required=True)
     return result
 
 
@@ -95,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
             "pin",
             "unpin",
             "pin-status",
+            "restore",
         }:
             if arguments.command in {"pin", "unpin"}:
                 method = "pin"
@@ -104,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
                 }
             elif arguments.command == "pin-status":
                 method = "pin"
+                params = {"asset": arguments.asset}
+            elif arguments.command == "restore":
+                method = "restore"
                 params = {"asset": arguments.asset}
             else:
                 method = arguments.command

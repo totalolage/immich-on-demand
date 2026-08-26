@@ -10,6 +10,9 @@ from unittest import mock
 from immich_on_demand.settings import Settings
 
 
+ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+
+
 class _IdleQueue:
     def __init__(self) -> None:
         self.callbacks: queue.Queue[tuple[object, tuple[object, ...]]] = queue.Queue()
@@ -314,6 +317,90 @@ class DesktopApplicationTests(unittest.TestCase):
         self.assertEqual(
             application._message.get_text(), "Could not save settings."
         )
+        application.do_shutdown()
+
+    def test_restore_uses_the_bounded_worker_with_a_canonical_asset_id(self) -> None:
+        module, idle = _load_desktop_app()
+        calls: list[tuple[str, object, int]] = []
+
+        async def restore(action: str, target=None):
+            calls.append((action, target, threading.get_ident()))
+            return {"restored": True, "scheduled": True}
+
+        with (
+            mock.patch.object(
+                module,
+                "load",
+                return_value=Settings(
+                    "https://photos.example.test", Path("/home/user/Immich")
+                ),
+            ),
+            mock.patch.object(module, "run_action", side_effect=restore),
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            idle.run_next()
+            application._restore_entry.set_text(ASSET_ID.upper())
+
+            application._restore_button.click()
+
+            self.assertEqual(application._restore_entry.get_text(), "")
+            self.assertEqual(application._message.get_text(), "Requesting restore.")
+            idle.run_next()
+
+        self.assertEqual(
+            [(action, target) for action, target, _thread in calls],
+            [("restore", ASSET_ID)],
+        )
+        self.assertNotEqual(calls[0][2], threading.get_ident())
+        self.assertEqual(application._message.get_text(), "Restore requested.")
+        application.do_shutdown()
+
+    def test_restore_rejects_invalid_identity_and_sanitizes_failures(self) -> None:
+        module, idle = _load_desktop_app()
+        responses = iter(
+            (
+                RuntimeError("private path and api-key must not be shown"),
+                {"restored": True, "scheduled": 1},
+            )
+        )
+
+        async def restore(_action: str, _target=None):
+            result = next(responses)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with (
+            mock.patch.object(
+                module,
+                "load",
+                return_value=Settings(
+                    "https://photos.example.test", Path("/home/user/Immich")
+                ),
+            ),
+            mock.patch.object(module, "run_action", side_effect=restore) as action,
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            idle.run_next()
+            application._restore_entry.set_text("not-a-uuid")
+            application._restore_button.click()
+            self.assertEqual(
+                application._message.get_text(), "Restore asset UUID is invalid."
+            )
+            action.assert_not_called()
+
+            for _ in range(2):
+                application._restore_entry.set_text(ASSET_ID)
+                application._restore_button.click()
+                idle.run_next()
+                self.assertEqual(
+                    application._message.get_text(), "Could not restore asset."
+                )
+                self.assertNotIn("private path", application._message.get_text())
+                self.assertNotIn("api-key", application._message.get_text())
+
         application.do_shutdown()
 
     def test_result_relay_uses_only_fixed_messages(self) -> None:

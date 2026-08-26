@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from .control import send_request
 from .settings import runtime_path
@@ -29,6 +30,12 @@ async def run_action(action: str, target: str | list[str] | None = None):
     elif action in {"pin", "unpin"} and _is_local_uri(target):
         assert isinstance(target, str)
         method, params = "pin", {"uri": target, "pinned": action == "pin"}
+    elif action == "restore" and isinstance(target, str):
+        try:
+            asset_id = str(UUID(target))
+        except ValueError as error:
+            raise ValueError("invalid desktop action") from error
+        method, params = "restore", {"asset": asset_id}
     elif (
         action == "describe"
         and isinstance(target, list)
