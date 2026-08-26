@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
-from uuid import UUID
-
 import trio
 
 from .catalog import Catalog, CatalogAsset
 from .content_cache import ContentCache
 from .immich import ImmichClient, ServerSession
-from .model import safe_filename
 from .settings import Settings
 
 
@@ -22,7 +18,6 @@ class Library:
     def __init__(
         self,
         catalog: Catalog,
-        read_client: ImmichClient,
         content_cache: ContentCache,
         settings: Settings,
         *,
@@ -31,7 +26,6 @@ class Library:
         catalog_lock: trio.Lock,
     ) -> None:
         self._catalog = catalog
-        self._read_client = read_client
         self._mutation_client = mutation_client
         self._mutation_session = mutation_session
         self._content_cache = content_cache
@@ -51,6 +45,9 @@ class Library:
     ) -> None:
         self._mutation_client, self._mutation_session = mutation_client, mutation_session
 
+    def upload_access(self) -> tuple[ImmichClient, ServerSession]:
+        return self._mutation_access()
+
     def lookup(self, identity: str | int) -> CatalogAsset | None:
         entry = (
             self._catalog.by_inode(identity)
@@ -67,22 +64,6 @@ class Library:
 
     def release(self, entry: CatalogAsset) -> None:
         self._content_cache.release(entry.asset.id)
-
-    async def upload_new(self, staged_path: Path, requested_name: str) -> CatalogAsset:
-        if safe_filename(requested_name, str(UUID(int=0))) != requested_name:
-            raise ValueError("requested library name is not safe")
-        async with self._catalog_lock:
-            if self._catalog.by_name(requested_name) is not None:
-                raise FileExistsError(requested_name)
-            mutation, session = self._mutation_access()
-
-            result = await mutation.upload(staged_path, session.media_types)
-            if not result.created:
-                raise FileExistsError("Immich already contains an asset with identical content")
-            uploaded = await self._read_client.asset(result.asset_id)
-            if uploaded.owner_id != session.owner_id:
-                raise LibraryError("uploaded asset is not owned by the mutation user")
-            return self._catalog.add_uploaded(uploaded, requested_name)
 
     async def remote_trash(self, entry: CatalogAsset) -> None:
         if not self._settings.remote_delete:

@@ -11,6 +11,7 @@ from immich_on_demand.settings import Settings
 
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+NEXT_ID = "87654321-4321-4321-8321-cba987654321"
 
 
 class _IdleQueue:
@@ -403,6 +404,272 @@ class DesktopApplicationTests(unittest.TestCase):
 
         application.do_shutdown()
 
+    def test_pending_upload_refresh_fetches_all_pages_off_thread(self) -> None:
+        module, idle = _load_desktop_app()
+        calls: list[tuple[str, object, int]] = []
+        pages = iter(
+            (
+                {
+                    "items": [
+                        {
+                            "id": ASSET_ID,
+                            "name": "First image.jpg",
+                            "state": "blocked",
+                            "size": None,
+                            "error": "interrupted-write",
+                            "revision": 2,
+                        }
+                    ],
+                    "next": NEXT_ID,
+                },
+                {
+                    "items": [
+                        {
+                            "id": NEXT_ID,
+                            "name": "second.png",
+                            "state": "pending",
+                            "size": 456,
+                            "error": None,
+                            "revision": 3,
+                        }
+                    ],
+                    "next": None,
+                },
+            )
+        )
+
+        async def action(name: str, target=None):
+            calls.append((name, target, threading.get_ident()))
+            return next(pages)
+
+        with (
+            mock.patch.object(
+                module,
+                "load",
+                return_value=Settings(
+                    "https://photos.example.test", Path("/home/user/Immich")
+                ),
+            ),
+            mock.patch.object(module, "run_action", side_effect=action),
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            idle.run_next()
+
+            application._uploads_refresh_button.click()
+            self.assertEqual(
+                application._uploads_label.get_text(), "Loading Pending uploads."
+            )
+            idle.run_next()
+
+        self.assertEqual(
+            [(name, target) for name, target, _thread in calls],
+            [("uploads", None), ("uploads", NEXT_ID)],
+        )
+        self.assertTrue(
+            all(thread != threading.get_ident() for _name, _target, thread in calls)
+        )
+        self.assertEqual(
+            application._uploads_label.get_text(),
+            'id=12345678-1234-4234-8234-123456789abc name="First image.jpg" state=blocked size=null error="interrupted-write" revision=2\n'
+            'id=87654321-4321-4321-8321-cba987654321 name="second.png" state=pending size=456 error=null revision=3',
+        )
+        application.do_shutdown()
+
+    def test_pending_upload_refresh_rejects_malformed_or_private_results(self) -> None:
+        module, idle = _load_desktop_app()
+        response = {
+            "items": [
+                {
+                    "id": ASSET_ID,
+                    "name": "image.jpg",
+                    "state": "blocked",
+                    "size": 123,
+                    "error": "upload-unavailable",
+                    "revision": 2,
+                    "path": "/private/recovery/api-key",
+                }
+            ]
+        }
+        with (
+            mock.patch.object(
+                module,
+                "load",
+                return_value=Settings(
+                    "https://photos.example.test", Path("/home/user/Immich")
+                ),
+            ),
+            mock.patch.object(
+                module, "run_action", mock.AsyncMock(return_value=response)
+            ),
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            idle.run_next()
+            application._uploads_refresh_button.click()
+            idle.run_next()
+
+        self.assertEqual(
+            application._uploads_label.get_text(),
+            "Could not load Pending uploads.",
+        )
+        self.assertNotIn("private", application._uploads_label.get_text())
+        self.assertNotIn("api-key", application._uploads_label.get_text())
+        application.do_shutdown()
+
+    def test_pending_upload_retry_and_cancel_refresh_after_queue_acceptance(self) -> None:
+        module, idle = _load_desktop_app()
+        calls: list[tuple[object, ...]] = []
+        responses = iter(
+            (
+                {"id": ASSET_ID, "scheduled": True},
+                {"items": [], "next": None},
+                {"id": ASSET_ID, "cancelled": True},
+                {"items": [], "next": None},
+            )
+        )
+
+        async def action(*arguments):
+            calls.append((*arguments, threading.get_ident()))
+            return next(responses)
+
+        with (
+            mock.patch.object(
+                module,
+                "load",
+                return_value=Settings(
+                    "https://photos.example.test", Path("/home/user/Immich")
+                ),
+            ),
+            mock.patch.object(module, "run_action", side_effect=action),
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            idle.run_next()
+            application._upload_id_entry.set_text(ASSET_ID)
+            application._upload_name_entry.set_text("Exact name.jpg")
+            application._upload_revision_entry.set_text("7")
+
+            application._retry_upload_button.click()
+            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
+            self.assertEqual(
+                application._message.get_text(), "Requesting upload retry."
+            )
+            idle.run_next()
+            self.assertEqual(application._upload_id_entry.get_text(), "")
+            self.assertEqual(application._upload_name_entry.get_text(), "")
+            self.assertEqual(application._upload_revision_entry.get_text(), "")
+            idle.run_next()
+
+            application._upload_id_entry.set_text(ASSET_ID)
+            application._upload_name_entry.set_text("Exact name.jpg")
+            application._upload_revision_entry.set_text("7")
+            application._cancel_upload_button.click()
+            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
+            self.assertEqual(
+                application._message.get_text(),
+                "Requesting Pending upload cancellation.",
+            )
+            idle.run_next()
+            self.assertEqual(application._upload_id_entry.get_text(), "")
+            self.assertEqual(application._upload_name_entry.get_text(), "")
+            self.assertEqual(application._upload_revision_entry.get_text(), "")
+            idle.run_next()
+
+        self.assertEqual(
+            [call[:-1] for call in calls],
+            [
+                ("retry-upload", ASSET_ID),
+                ("uploads", None),
+                ("cancel-upload", ASSET_ID, 7, "Exact name.jpg"),
+                ("uploads", None),
+            ],
+        )
+        self.assertTrue(
+            all(call[-1] != threading.get_ident() for call in calls)
+        )
+        self.assertEqual(application._uploads_label.get_text(), "No Pending uploads.")
+        self.assertEqual(
+            application._message.get_text(), "Pending upload cancelled."
+        )
+        application.do_shutdown()
+
+    def test_pending_upload_actions_keep_fields_and_sanitize_failures(self) -> None:
+        module, idle = _load_desktop_app()
+        responses = iter(
+            (
+                RuntimeError("private path and api-key must not be shown"),
+                {"id": ASSET_ID, "cancelled": 1},
+            )
+        )
+
+        async def action(*_arguments):
+            result = next(responses)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with (
+            mock.patch.object(
+                module,
+                "load",
+                return_value=Settings(
+                    "https://photos.example.test", Path("/home/user/Immich")
+                ),
+            ),
+            mock.patch.object(module, "run_action", side_effect=action) as request,
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            idle.run_next()
+
+            application._upload_id_entry.set_text(ASSET_ID.upper())
+            application._retry_upload_button.click()
+            self.assertEqual(
+                application._message.get_text(), "Pending upload UUID is invalid."
+            )
+
+            application._upload_id_entry.set_text(ASSET_ID)
+            application._upload_revision_entry.set_text("-1")
+            application._upload_name_entry.set_text("Exact name.jpg")
+            application._cancel_upload_button.click()
+            self.assertEqual(
+                application._message.get_text(),
+                "Pending upload revision is invalid.",
+            )
+
+            application._upload_revision_entry.set_text("7")
+            application._upload_name_entry.set_text("   ")
+            application._cancel_upload_button.click()
+            self.assertEqual(
+                application._message.get_text(),
+                "Pending upload confirmation name is required.",
+            )
+            request.assert_not_called()
+
+            application._upload_name_entry.set_text("Exact name.jpg")
+            application._retry_upload_button.click()
+            idle.run_next()
+            self.assertEqual(
+                application._message.get_text(), "Could not request upload retry."
+            )
+            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
+
+            application._cancel_upload_button.click()
+            idle.run_next()
+            self.assertEqual(
+                application._message.get_text(), "Could not cancel Pending upload."
+            )
+            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
+            self.assertEqual(
+                application._upload_name_entry.get_text(), "Exact name.jpg"
+            )
+            self.assertEqual(application._upload_revision_entry.get_text(), "7")
+
+        self.assertNotIn("private path", application._message.get_text())
+        self.assertNotIn("api-key", application._message.get_text())
+        application.do_shutdown()
+
     def test_result_relay_uses_only_fixed_messages(self) -> None:
         module, idle = _load_desktop_app()
         with mock.patch.object(
@@ -455,6 +722,8 @@ class DesktopApplicationTests(unittest.TestCase):
             "trashed": 0,
             "hidden": 0,
             "offline": 0,
+            "pending_uploads": 2,
+            "upload_quarantined": 1,
             "mutation_enabled": False,
         }
 
@@ -474,10 +743,13 @@ class DesktopApplicationTests(unittest.TestCase):
             self.assertEqual(relayed, [expected])
 
         malformed = (
-            base,
+            {key: value for key, value in base.items() if key != "pending_uploads"},
+            {key: value for key, value in base.items() if key != "upload_quarantined"},
             {**base, "online": 1},
             {**base, "online": True, "mutation_enabled": 0},
             {**base, "online": True, "total": True},
+            {**base, "online": True, "pending_uploads": False},
+            {**base, "online": True, "upload_quarantined": False},
             {**base, "online": True, "extra": 0},
         )
         for response in malformed:

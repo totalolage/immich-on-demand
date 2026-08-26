@@ -16,6 +16,7 @@ from immich_on_demand.settings import Settings
 
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+NEXT_ID = "87654321-4321-4321-8321-cba987654321"
 
 
 class CliTest(unittest.TestCase):
@@ -47,7 +48,7 @@ class CliTest(unittest.TestCase):
             main(["--version"])
 
         self.assertEqual(exit.exception.code, 0)
-        self.assertEqual(output.getvalue(), "1.0.0\n")
+        self.assertEqual(output.getvalue(), "1.2.0.dev0\n")
 
     def test_configure_writes_only_non_secret_settings(self) -> None:
         import json
@@ -148,6 +149,156 @@ class CliTest(unittest.TestCase):
                     load_api_key.assert_not_called()
                     catalog.assert_not_called()
                     self.assertEqual(output.getvalue(), "a=1 z=2\n")
+
+    def test_upload_mutations_route_canonical_ids_and_exact_confirmation_name(self) -> None:
+        cases = (
+            (
+                ["retry-upload", "--id", ASSET_ID.upper()],
+                "retry-upload",
+                {"id": ASSET_ID},
+            ),
+            (
+                [
+                    "cancel-upload",
+                    "--id",
+                    ASSET_ID.upper(),
+                    "--revision",
+                    "7",
+                    "--confirm-name",
+                    "Test image.jpg",
+                ],
+                "cancel-upload",
+                {
+                    "id": ASSET_ID,
+                    "revision": 7,
+                    "confirm_name": "Test image.jpg",
+                },
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            for arguments, method, params in cases:
+                with self.subTest(command=arguments):
+                    request = AsyncMock(return_value={"scheduled": True, "id": ASSET_ID})
+                    with (
+                        patch("immich_on_demand.cli.send_request", request),
+                        patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                        patch("immich_on_demand.cli.secrets.randbits", return_value=0),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        self.assertEqual(main(arguments), 0)
+                    request.assert_awaited_once_with(
+                        runtime / "control.sock", 1, method, params
+                    )
+
+    def test_uploads_prints_valid_pages_as_json_lines(self) -> None:
+        pages = (
+            {
+                "items": [
+                    {
+                        "id": ASSET_ID,
+                        "name": "First image.jpg",
+                        "state": "blocked",
+                        "size": 123,
+                        "error": "upload-unavailable",
+                        "revision": 1,
+                    }
+                ],
+                "next": NEXT_ID,
+            },
+            {
+                "items": [
+                    {
+                        "id": NEXT_ID,
+                        "name": "second.png",
+                        "state": "pending",
+                        "size": None,
+                        "error": None,
+                        "revision": 2,
+                    }
+                ],
+                "next": None,
+            },
+        )
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            request = AsyncMock(side_effect=pages)
+            with (
+                patch("immich_on_demand.cli.send_request", request),
+                patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                patch("immich_on_demand.cli.secrets.randbits", return_value=0),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(main(["uploads"]), 0)
+
+        self.assertEqual(
+            request.await_args_list,
+            [
+                unittest.mock.call(
+                    runtime / "control.sock",
+                    1,
+                    "uploads",
+                    {"after": None, "limit": 32},
+                ),
+                unittest.mock.call(
+                    runtime / "control.sock",
+                    1,
+                    "uploads",
+                    {"after": NEXT_ID, "limit": 32},
+                ),
+            ],
+        )
+        self.assertEqual(
+            output.getvalue(),
+            '{"error": "upload-unavailable", "id": "12345678-1234-4234-8234-123456789abc", "name": "First image.jpg", "revision": 1, "size": 123, "state": "blocked"}\n'
+            '{"error": null, "id": "87654321-4321-4321-8321-cba987654321", "name": "second.png", "revision": 2, "size": null, "state": "pending"}\n',
+        )
+
+    def test_uploads_rejects_a_malformed_page_with_a_fixed_error(self) -> None:
+        error = io.StringIO()
+        request = AsyncMock(return_value={"items": [], "next": "not-a-uuid"})
+        with (
+            patch("immich_on_demand.cli.send_request", request),
+            contextlib.redirect_stderr(error),
+        ):
+            self.assertEqual(main(["uploads"]), 1)
+        self.assertEqual(
+            error.getvalue(),
+            "immich-on-demand: control returned an invalid uploads page\n",
+        )
+
+    def test_upload_mutations_require_an_id_and_cancel_confirmation(self) -> None:
+        for arguments in (
+            ["retry-upload"],
+            ["retry-upload", "--id", "not-a-uuid"],
+            ["cancel-upload", "--id", ASSET_ID],
+            [
+                "cancel-upload",
+                "--id",
+                ASSET_ID,
+                "--revision",
+                "0",
+                "--confirm-name",
+                "",
+            ],
+            [
+                "cancel-upload",
+                "--id",
+                ASSET_ID,
+                "--revision",
+                "-1",
+                "--confirm-name",
+                "Test image.jpg",
+            ],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as exit,
+            ):
+                main(arguments)
+            self.assertEqual(exit.exception.code, 2)
 
     def test_restore_requires_an_asset_uuid(self) -> None:
         for arguments in (["restore"], ["restore", "--asset", "not-a-uuid"]):

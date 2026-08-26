@@ -10,6 +10,7 @@ from immich_on_demand.settings import (
     Settings,
     cache_path,
     config_path,
+    data_path,
     load,
     load_api_key,
     runtime_path,
@@ -71,6 +72,7 @@ class SettingsTest(unittest.TestCase):
     def test_rejects_relative_xdg_paths(self) -> None:
         for variable, resolve in (
             ("XDG_CONFIG_HOME", config_path),
+            ("XDG_DATA_HOME", data_path),
             ("XDG_STATE_HOME", state_path),
             ("XDG_CACHE_HOME", cache_path),
             ("XDG_RUNTIME_DIR", runtime_path),
@@ -81,6 +83,10 @@ class SettingsTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, f"{variable} must be an absolute path"),
             ):
                 resolve()
+
+    def test_data_path_uses_xdg_data_home(self) -> None:
+        with patch.dict(os.environ, {"XDG_DATA_HOME": "/data"}):
+            self.assertEqual(data_path(), Path("/data/immich-on-demand"))
 
     def test_server_origin_is_canonical_and_ipv6_safe(self) -> None:
         cases = (

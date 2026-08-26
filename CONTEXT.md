@@ -36,6 +36,14 @@ _Avoid_: Delete, trash
 Creating a new Immich asset from a new file written to the Flat library. Upload never replaces an existing asset.
 _Avoid_: Update, overwrite, synchronization
 
+**Pending upload**:
+A complete private local file whose close finished but whose Immich creation has not been confirmed. It stays outside the Flat library until a retry succeeds. The user can retry it idempotently or explicitly cancel its local bytes.
+_Avoid_: Staged file, cached original, upload recovery
+
+**Upload recovery**:
+Private local bytes retained because the write did not finish or Upload completion is unknown. An incomplete recovery file is never retried automatically. A complete closed recovery file is a Pending upload.
+_Avoid_: Pending upload, backup, cached original
+
 **Asset replacement**:
 A future operation that creates a new Immich asset from changed bytes and resolves the old asset separately. Immich On-Demand never overwrites an original in place.
 _Avoid_: Update, overwrite, synchronization

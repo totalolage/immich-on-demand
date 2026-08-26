@@ -1,7 +1,9 @@
 import unittest
 from contextlib import aclosing
+from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import ssl
 import tempfile
@@ -13,6 +15,8 @@ from immich_on_demand.immich import (
     ImmichClient,
     ImmichError,
     ImmichPageLimitError,
+    ImmichResponseError,
+    ImmichRetryableError,
     ImmichUnavailableError,
 )
 
@@ -20,6 +24,7 @@ from immich_on_demand.immich import (
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 OTHER_ID = "22345678-1234-4234-8234-123456789abc"
+UPLOAD_ID = "32345678-1234-4234-8234-123456789abc"
 
 
 def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
@@ -495,41 +500,400 @@ class ImmichClientTest(unittest.TestCase):
 
         trio.run(scenario)
 
-    def test_upload_checks_duplicates_before_sending_bytes(self) -> None:
+    def test_upload_posts_checksum_marker_and_accepts_created(self) -> None:
         requests: list[str] = []
+        expected_times: dict[str, bytes] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request.url.path)
-            if request.url.path == "/api/assets/bulk-upload-check":
-                return httpx.Response(
-                    200,
-                    json={
-                        "results": [
-                            {
-                                "id": "photo.jpg",
-                                "action": "reject",
-                                "reason": "duplicate",
-                                "assetId": ASSET_ID,
-                                "isTrashed": False,
-                            }
-                        ]
-                    },
-                )
-            raise AssertionError(request.url.path)
+            self.assertEqual((request.method, request.url.path), ("POST", "/api/assets"))
+            self.assertEqual(
+                request.headers["x-immich-checksum"],
+                "BA8G/XdAkkeNRQd09bowxdp4rMg=",
+            )
+            body = request.read()
+            self.assertIn(b'name="fileCreatedAt"', body)
+            self.assertIn(b'name="fileModifiedAt"', body)
+            self.assertIn(expected_times["created"], body)
+            self.assertIn(expected_times["modified"], body)
+            self.assertIn(b'name="filename"\r\n\r\nphoto.jpg', body)
+            self.assertIn(
+                b'[{"key":"immich-on-demand.upload","value":{"formatVersion":1,'
+                b'"uploadId":"32345678-1234-4234-8234-123456789abc"}}]',
+                body,
+            )
+            self.assertIn(b'name="assetData"; filename="photo.jpg"', body)
+            self.assertIn(b"content", body)
+            return httpx.Response(201, json={"status": "created", "id": ASSET_ID})
 
-        async def scenario(path: Path) -> None:
+        async def scenario(descriptor: int) -> None:
             async with ImmichClient(
                 "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
             ) as client:
-                result = await client.upload(path, frozenset({".jpg"}))
+                result = await client.upload(
+                    descriptor, "photo.jpg", frozenset({".jpg"}), UPLOAD_ID
+                )
                 self.assertEqual(result.asset_id, ASSET_ID)
-                self.assertFalse(result.created)
+                self.assertTrue(result.created)
+                self.assertEqual(result.status, "created")
 
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "photo.jpg"
+            path = Path(directory) / "payload"
             path.write_bytes(b"content")
-            trio.run(scenario, path)
-        self.assertEqual(requests, ["/api/assets/bulk-upload-check"])
+            stats = path.stat()
+            expected_times["created"] = datetime.fromtimestamp(
+                stats.st_ctime, timezone.utc
+            ).isoformat().encode()
+            expected_times["modified"] = datetime.fromtimestamp(
+                stats.st_mtime, timezone.utc
+            ).isoformat().encode()
+            with path.open("rb") as payload:
+                trio.run(scenario, payload.fileno())
+        self.assertEqual(requests, ["/api/assets"])
+
+    def test_upload_uses_the_supplied_validated_descriptor(self) -> None:
+        bodies: list[bytes] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(request.read())
+            return httpx.Response(201, json={"status": "created", "id": ASSET_ID})
+
+        async def scenario(descriptor: int) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                await client.upload(
+                    descriptor, "photo.jpg", frozenset({".jpg"}), UPLOAD_ID
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "payload"
+            path.write_bytes(b"validated bytes")
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                path.unlink()
+                path.symlink_to(root / "replacement")
+                (root / "replacement").write_bytes(b"different bytes")
+                trio.run(scenario, descriptor)
+            finally:
+                os.close(descriptor)
+
+        self.assertIn(b"validated bytes", bodies[0])
+        self.assertNotIn(b"different bytes", bodies[0])
+
+    def test_upload_returns_duplicate_candidate_and_reads_its_marker(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.method == "POST":
+                return httpx.Response(
+                    200, json={"status": "duplicate", "id": ASSET_ID}
+                )
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "key": "unrelated",
+                        "value": {"kept": True},
+                        "updatedAt": "2026-08-26T10:00:00.000Z",
+                    },
+                    {
+                        "key": "immich-on-demand.upload",
+                        "value": {"formatVersion": 1, "uploadId": UPLOAD_ID},
+                        "updatedAt": "2026-08-26T10:00:01.000Z",
+                    },
+                ],
+            )
+
+        async def scenario(descriptor: int) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                result = await client.upload(
+                    descriptor, "photo.jpg", frozenset({".jpg"}), UPLOAD_ID
+                )
+                self.assertEqual(result.asset_id, ASSET_ID)
+                self.assertFalse(result.created)
+                self.assertEqual(result.status, "duplicate")
+                self.assertEqual(await client.asset_metadata(ASSET_ID), UPLOAD_ID)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            path.write_bytes(b"content")
+            with path.open("rb") as payload:
+                trio.run(scenario, payload.fileno())
+        self.assertEqual(
+            requests,
+            [
+                ("POST", "/api/assets"),
+                ("GET", f"/api/assets/{ASSET_ID}/metadata"),
+            ],
+        )
+
+    def test_upload_rejects_malformed_success_responses(self) -> None:
+        cases: tuple[tuple[int, object | None], ...] = (
+            (302, None),
+            (202, {"status": "created", "id": ASSET_ID}),
+            (201, {"status": "duplicate", "id": ASSET_ID}),
+            (200, {"status": "created", "id": ASSET_ID}),
+            (201, {"status": "unknown", "id": ASSET_ID}),
+            (201, {"status": "created", "id": ASSET_ID, "extra": True}),
+            (201, {"status": "created"}),
+            (201, {"status": "created", "id": ASSET_ID.upper()}),
+            (201, {"status": "created", "id": True}),
+            (201, ["not", "an", "object"]),
+            (201, None),
+        )
+
+        async def scenario(descriptor: int, status: int, value: object | None) -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.assertEqual(request.url.path, "/api/assets")
+                if value is None:
+                    return httpx.Response(status, content=b"api-secret malformed")
+                return httpx.Response(status, json=value)
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "api-secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichError, "^Immich returned an invalid upload response$"
+                ) as raised:
+                    await client.upload(
+                        descriptor, "photo.jpg", frozenset({".jpg"}), UPLOAD_ID
+                    )
+                self.assertNotIn("api-secret", str(raised.exception))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            path.write_bytes(b"content")
+            for status, value in cases:
+                with self.subTest(status=status, value=value):
+                    with path.open("rb") as payload:
+                        trio.run(scenario, payload.fileno(), status, value)
+
+    def test_asset_metadata_requires_one_exact_upload_marker(self) -> None:
+        updated_at = "2026-08-26T10:00:00.000Z"
+        valid_marker = {
+            "key": "immich-on-demand.upload",
+            "value": {"formatVersion": 1, "uploadId": UPLOAD_ID},
+            "updatedAt": updated_at,
+        }
+        unrelated = {
+            "key": "unrelated",
+            "value": {"kept": True},
+            "updatedAt": updated_at,
+        }
+        cases: tuple[object, ...] = (
+            {},
+            ["not-an-object"],
+            [{"key": "unrelated", "value": {}, "updatedAt": updated_at, "extra": 1}],
+            [{"key": 1, "value": {}, "updatedAt": updated_at}],
+            [{"key": "unrelated", "value": [], "updatedAt": updated_at}],
+            [{"key": "unrelated", "value": {}, "updatedAt": 1}],
+            [{"key": "unrelated", "value": {}, "updatedAt": "not-a-date"}],
+            [],
+            [unrelated],
+            [valid_marker, valid_marker],
+            [
+                {
+                    **valid_marker,
+                    "value": {"formatVersion": True, "uploadId": UPLOAD_ID},
+                }
+            ],
+            [
+                {
+                    **valid_marker,
+                    "value": {"formatVersion": 2, "uploadId": UPLOAD_ID},
+                }
+            ],
+            [
+                {
+                    **valid_marker,
+                    "value": {"formatVersion": 1, "uploadId": True},
+                }
+            ],
+            [
+                {
+                    **valid_marker,
+                    "value": {"formatVersion": 1, "uploadId": UPLOAD_ID.upper()},
+                }
+            ],
+            [
+                {
+                    **valid_marker,
+                    "value": {
+                        "formatVersion": 1,
+                        "uploadId": UPLOAD_ID,
+                        "extra": True,
+                    },
+                }
+            ],
+        )
+
+        async def scenario(value: object) -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.assertEqual(
+                    request.url.path, f"/api/assets/{ASSET_ID}/metadata"
+                )
+                return httpx.Response(200, json=value)
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichError, "^Immich returned invalid upload metadata$"
+                ):
+                    await client.asset_metadata(ASSET_ID)
+
+        for value in cases:
+            with self.subTest(value=value):
+                trio.run(scenario, value)
+
+    def test_upload_candidate_verification_retries_transient_http_statuses(self) -> None:
+        async def scenario(operation: str) -> None:
+            def handler(_request: httpx.Request) -> httpx.Response:
+                return httpx.Response(503, content=b"private response")
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichRetryableError,
+                    "^Immich upload is temporarily unavailable$",
+                ):
+                    if operation == "asset":
+                        await client.asset(ASSET_ID)
+                    else:
+                        await client.asset_metadata(ASSET_ID)
+
+        for operation in ("asset", "metadata"):
+            with self.subTest(operation=operation):
+                trio.run(scenario, operation)
+
+    def test_upload_candidate_rejects_malformed_asset_schema(self) -> None:
+        async def scenario(value: object) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(200, json=value)
+                ),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichResponseError,
+                    "^Immich returned an invalid upload candidate$",
+                ):
+                    await client.asset(ASSET_ID)
+
+        for value in ({"id": ASSET_ID}, asset(OTHER_ID)):
+            with self.subTest(value=value):
+                trio.run(scenario, value)
+
+    def test_upload_checks_requested_name_extension_before_network(self) -> None:
+        requests = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            raise AssertionError("upload made a request")
+
+        async def scenario(descriptor: int) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(ImmichError, "does not accept the .raw"):
+                    await client.upload(
+                        descriptor, "photo.raw", frozenset({".jpg"}), UPLOAD_ID
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            path.write_bytes(b"content")
+            with path.open("rb") as payload:
+                trio.run(scenario, payload.fileno())
+        self.assertEqual(requests, 0)
+
+    def test_only_upload_retry_statuses_use_the_retryable_error(self) -> None:
+        async def upload_scenario(descriptor: int, status: int) -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.assertEqual(request.url.path, "/api/assets")
+                return httpx.Response(status, content=b"api-secret response")
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "api-secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichRetryableError,
+                    "^Immich upload is temporarily unavailable$",
+                ) as raised:
+                    await client.upload(
+                        descriptor, "photo.jpg", frozenset({".jpg"}), UPLOAD_ID
+                    )
+                self.assertNotIsInstance(raised.exception, ImmichUnavailableError)
+                self.assertNotIn("api-secret", str(raised.exception))
+
+        async def authoritative_upload_scenario(descriptor: int, status: int) -> None:
+            def handler(_request: httpx.Request) -> httpx.Response:
+                return httpx.Response(status)
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaises(ImmichError) as raised:
+                    await client.upload(
+                        descriptor, "photo.jpg", frozenset({".jpg"}), UPLOAD_ID
+                    )
+                self.assertNotIsInstance(raised.exception, ImmichRetryableError)
+                self.assertNotIsInstance(raised.exception, ImmichUnavailableError)
+                self.assertIn(str(status), str(raised.exception))
+
+        async def non_upload_scenario() -> None:
+            def handler(_request: httpx.Request) -> httpx.Response:
+                return httpx.Response(503)
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaises(ImmichError) as raised:
+                    await client.trash(ASSET_ID)
+                self.assertNotIsInstance(raised.exception, ImmichRetryableError)
+                self.assertNotIsInstance(raised.exception, ImmichUnavailableError)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            path.write_bytes(b"content")
+            with path.open("rb") as payload:
+                for status in (408, 425, 429, 500, 503, 599):
+                    with self.subTest(retryable=status):
+                        trio.run(upload_scenario, payload.fileno(), status)
+                for status in (400, 401, 403, 404, 409, 422, 499):
+                    with self.subTest(authoritative=status):
+                        trio.run(
+                            authoritative_upload_scenario,
+                            payload.fileno(),
+                            status,
+                        )
+        trio.run(non_upload_scenario)
 
     def test_trash_refetches_feature_and_never_requests_permanent_deletion(self) -> None:
         requests: list[tuple[str, str]] = []

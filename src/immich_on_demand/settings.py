@@ -94,6 +94,10 @@ def state_path() -> Path:
     return _xdg("XDG_STATE_HOME", ".local/state") / APP_ID
 
 
+def data_path() -> Path:
+    return _xdg("XDG_DATA_HOME", ".local/share") / APP_ID
+
+
 def cache_path() -> Path:
     return _xdg("XDG_CACHE_HOME", ".cache") / APP_ID
 

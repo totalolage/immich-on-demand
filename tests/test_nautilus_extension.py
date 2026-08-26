@@ -247,16 +247,22 @@ class NautilusExtensionTests(unittest.TestCase):
 
             self.assertEqual(
                 [item.properties["label"] for item in items],
-                ["Refresh Immich", "Immich On-Demand Settings"],
+                [
+                    "Refresh Immich",
+                    "Manage Pending Uploads",
+                    "Immich On-Demand Settings",
+                ],
             )
             self.assertEqual(_Subprocess.calls, [])
 
             items[0].activate()
             items[1].activate()
+            items[2].activate()
             self.assertEqual(
                 _Subprocess.calls,
                 [
                     (["immich-on-demand-desktop", "--action", "refresh"], 0),
+                    (["immich-on-demand-desktop"], 0),
                     (["immich-on-demand-desktop"], 0),
                 ],
             )
@@ -824,7 +830,7 @@ class NautilusExtensionTests(unittest.TestCase):
                             _FileInfo(str(mount_path / "folder"), directory=True)
                         )
                     ),
-                    2,
+                    3,
                 )
                 self.assertEqual(
                     extension.get_background_items(

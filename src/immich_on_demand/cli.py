@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 from pathlib import Path
 import secrets
@@ -20,6 +21,7 @@ from .settings import (
     runtime_path,
     save,
 )
+from .uploads import UploadErrorCode, UploadState
 
 
 def _asset_id(value: str) -> str:
@@ -34,6 +36,19 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
     return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must not be negative")
+    return parsed
+
+
+def _confirmation_name(value: str) -> str:
+    if not value:
+        raise argparse.ArgumentTypeError("confirmation name must not be empty")
+    return value
 
 
 def parser() -> argparse.ArgumentParser:
@@ -64,6 +79,17 @@ def parser() -> argparse.ArgumentParser:
     pin_status.add_argument("--asset", type=_asset_id, required=True)
     restore = commands.add_parser("restore", help="restore a trashed asset")
     restore.add_argument("--asset", type=_asset_id, required=True)
+    commands.add_parser("uploads", help="list Pending uploads")
+    retry_upload = commands.add_parser("retry-upload", help="retry a Pending upload")
+    retry_upload.add_argument("--id", type=_asset_id, required=True)
+    cancel_upload = commands.add_parser(
+        "cancel-upload", help="cancel a Pending upload"
+    )
+    cancel_upload.add_argument("--id", type=_asset_id, required=True)
+    cancel_upload.add_argument("--revision", type=_nonnegative_int, required=True)
+    cancel_upload.add_argument(
+        "--confirm-name", type=_confirmation_name, required=True
+    )
     return result
 
 
@@ -90,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
             logging.basicConfig(level=logging.INFO)
             trio.run(run_service, load(arguments.config))
             return 0
+        if arguments.command == "uploads":
+            return trio.run(_uploads)
         if arguments.command in {
             "refresh",
             "status",
@@ -98,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
             "unpin",
             "pin-status",
             "restore",
+            "retry-upload",
+            "cancel-upload",
         }:
             if arguments.command in {"pin", "unpin"}:
                 method = "pin"
@@ -111,6 +141,16 @@ def main(argv: list[str] | None = None) -> int:
             elif arguments.command == "restore":
                 method = "restore"
                 params = {"asset": arguments.asset}
+            elif arguments.command == "retry-upload":
+                method = "retry-upload"
+                params = {"id": arguments.id}
+            elif arguments.command == "cancel-upload":
+                method = "cancel-upload"
+                params = {
+                    "id": arguments.id,
+                    "revision": arguments.revision,
+                    "confirm_name": arguments.confirm_name,
+                }
             else:
                 method = arguments.command
                 params = (
@@ -142,6 +182,71 @@ async def _control(method: str, params: dict[str, object]) -> int:
     )
     _print_result(result)
     return 0
+
+
+async def _uploads() -> int:
+    after: str | None = None
+    seen: set[str] = set()
+    while True:
+        result = await send_request(
+            runtime_path() / "control.sock",
+            secrets.randbits(63) or 1,
+            "uploads",
+            {"after": after, "limit": 32},
+        )
+        items, next_id = _upload_page(result)
+        for item in items:
+            print(json.dumps(item, ensure_ascii=False, sort_keys=True))
+        if next_id is None:
+            return 0
+        if next_id in seen:
+            raise RuntimeError("control returned an invalid uploads page")
+        seen.add(next_id)
+        after = next_id
+
+
+def _is_canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _upload_page(result: object) -> tuple[list[dict[str, object]], str | None]:
+    expected_item = {"id", "name", "state", "size", "error", "revision"}
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"items", "next"}
+        or not isinstance(result["items"], list)
+        or len(result["items"]) > 32
+    ):
+        raise RuntimeError("control returned an invalid uploads page")
+    items = result["items"]
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or set(item) != expected_item
+            or not _is_canonical_uuid(item["id"])
+            or not isinstance(item["name"], str)
+            or item["state"] not in {state.value for state in UploadState}
+            or not (
+                item["size"] is None
+                or (type(item["size"]) is int and item["size"] >= 0)
+            )
+            or not (
+                item["error"] is None
+                or item["error"] in {error.value for error in UploadErrorCode}
+            )
+            or type(item["revision"]) is not int
+            or item["revision"] < 0
+        ):
+            raise RuntimeError("control returned an invalid uploads page")
+    next_id = result.get("next")
+    if next_id is not None and not _is_canonical_uuid(next_id):
+        raise RuntimeError("control returned an invalid uploads page")
+    return items, next_id
 
 
 def _print_result(result: object) -> None:

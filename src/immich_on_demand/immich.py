@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import base64
 import hashlib
+import json
 import logging
+import os
 from pathlib import Path
 import ssl
 from urllib.parse import urljoin, urlsplit
@@ -15,13 +17,15 @@ from uuid import UUID
 import httpx
 import trio
 
-from .model import Asset
+from .model import Asset, timestamp_nanoseconds
 
 
 READ_PERMISSIONS = frozenset({"user.read", "asset.read", "asset.view", "asset.download"})
 UPLOAD_PERMISSIONS = READ_PERMISSIONS | {"asset.upload"}
 MUTATION_PERMISSIONS = UPLOAD_PERMISSIONS | {"asset.delete"}
 LOGGER = logging.getLogger(__name__)
+UPLOAD_MARKER_KEY = "immich-on-demand.upload"
+UPLOAD_RETRY_STATUSES = frozenset({408, 425, 429}) | frozenset(range(500, 600))
 
 
 class ImmichError(RuntimeError):
@@ -37,6 +41,10 @@ class ImmichResponseError(ImmichError):
 
 
 class ImmichUnavailableError(ImmichError):
+    pass
+
+
+class ImmichRetryableError(ImmichError):
     pass
 
 
@@ -71,6 +79,10 @@ class UploadResult:
     asset_id: str
     created: bool
 
+    @property
+    def status(self) -> str:
+        return "created" if self.created else "duplicate"
+
 
 class ImmichClient:
     def __init__(
@@ -99,7 +111,15 @@ class ImmichClient:
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def _request(self, method: str, path: str, **kwargs: object) -> httpx.Response:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        retry_statuses: frozenset[int] = frozenset(),
+        passthrough_statuses: frozenset[int] = frozenset(),
+        **kwargs: object,
+    ) -> httpx.Response:
         url = urljoin(self._api_root, path.lstrip("/"))
         display_path = urlsplit(path).path.lstrip("/") if urlsplit(path).scheme else path
         try:
@@ -110,7 +130,11 @@ class ImmichClient:
             raise ImmichUnavailableError("Immich is unavailable") from error
         except httpx.TransportError as error:
             raise ImmichError("Immich transport validation failed") from error
-        self._raise_for_status(response, method, display_path)
+        if response.status_code in retry_statuses:
+            LOGGER.info("Immich %s %s -> %s", method, display_path, response.status_code)
+            raise ImmichRetryableError("Immich upload is temporarily unavailable")
+        if response.status_code not in passthrough_statuses:
+            self._raise_for_status(response, method, display_path)
         return response
 
     @staticmethod
@@ -305,47 +329,156 @@ class ImmichClient:
 
     async def asset(self, asset_id: str) -> Asset:
         UUID(asset_id)
-        return Asset.from_api(await self._json("GET", f"assets/{asset_id}"))
+        try:
+            result = Asset.from_api(
+                await self._json(
+                    "GET",
+                    f"assets/{asset_id}",
+                    retry_statuses=UPLOAD_RETRY_STATUSES,
+                )
+            )
+        except ValueError as error:
+            raise ImmichResponseError("Immich returned an invalid upload candidate") from error
+        if result.id != asset_id:
+            raise ImmichResponseError("Immich returned an invalid upload candidate")
+        return result
 
-    async def upload(self, path: Path, media_types: frozenset[str]) -> UploadResult:
-        extension = path.suffix.lower()
+    async def asset_metadata(self, asset_id: str) -> str:
+        if not isinstance(asset_id, str):
+            raise ValueError("asset ID must be a canonical UUID")
+        try:
+            canonical_asset_id = str(UUID(asset_id))
+        except ValueError as error:
+            raise ValueError("asset ID must be a canonical UUID") from error
+        if canonical_asset_id != asset_id:
+            raise ValueError("asset ID must be a canonical UUID")
+        response = await self._request(
+            "GET",
+            f"assets/{asset_id}/metadata",
+            retry_statuses=UPLOAD_RETRY_STATUSES,
+        )
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise ImmichResponseError("Immich returned invalid upload metadata") from error
+        if not isinstance(value, list):
+            raise ImmichResponseError("Immich returned invalid upload metadata")
+        markers: list[dict[str, object]] = []
+        for item in value:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"key", "value", "updatedAt"}
+                or not isinstance(item.get("key"), str)
+                or not isinstance(item.get("value"), dict)
+                or not isinstance(item.get("updatedAt"), str)
+            ):
+                raise ImmichResponseError("Immich returned invalid upload metadata")
+            try:
+                timestamp_nanoseconds(item["updatedAt"])
+            except ValueError as error:
+                raise ImmichResponseError("Immich returned invalid upload metadata") from error
+            if item["key"] == UPLOAD_MARKER_KEY:
+                marker = item["value"]
+                assert isinstance(marker, dict)
+                markers.append(marker)
+        if len(markers) != 1:
+            raise ImmichResponseError("Immich returned invalid upload metadata")
+        marker = markers[0]
+        upload_id = marker.get("uploadId")
+        if (
+            set(marker) != {"formatVersion", "uploadId"}
+            or type(marker.get("formatVersion")) is not int
+            or marker["formatVersion"] != 1
+            or not isinstance(upload_id, str)
+        ):
+            raise ImmichResponseError("Immich returned invalid upload metadata")
+        try:
+            canonical_upload_id = str(UUID(upload_id))
+        except ValueError as error:
+            raise ImmichResponseError("Immich returned invalid upload metadata") from error
+        if canonical_upload_id != upload_id:
+            raise ImmichResponseError("Immich returned invalid upload metadata")
+        return upload_id
+
+    async def upload(
+        self,
+        descriptor: int,
+        requested_name: str,
+        media_types: frozenset[str],
+        upload_id: str,
+    ) -> UploadResult:
+        if not isinstance(requested_name, str):
+            raise ValueError("requested upload name must be a string")
+        extension = Path(requested_name).suffix.lower()
         if extension not in media_types:
             raise ImmichError(f"Immich does not accept the {extension or 'extensionless'} file type")
-        checksum = await trio.to_thread.run_sync(_sha1, path)
-        token = path.name
-        check = await self._json(
-            "POST",
-            "assets/bulk-upload-check",
-            json={"assets": [{"id": token, "checksum": checksum.hex()}]},
-        )
-        results = check.get("results")
-        if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
-            raise ImmichError("Immich returned an invalid bulk upload check")
-        result = results[0]
-        if result.get("action") == "reject":
-            existing_id = result.get("assetId")
-            if result.get("reason") != "duplicate" or not isinstance(existing_id, str):
-                raise ImmichError(f"Immich rejected upload: {result.get('reason', 'unknown reason')}")
-            UUID(existing_id)
-            return UploadResult(existing_id, False)
-
-        stats = path.stat()
+        if not isinstance(upload_id, str):
+            raise ValueError("upload ID must be a canonical UUID")
+        try:
+            canonical_upload_id = str(UUID(upload_id))
+        except ValueError as error:
+            raise ValueError("upload ID must be a canonical UUID") from error
+        if canonical_upload_id != upload_id:
+            raise ValueError("upload ID must be a canonical UUID")
+        if type(descriptor) is not int or descriptor < 0:
+            raise ValueError("upload payload descriptor is invalid")
+        checksum = await trio.to_thread.run_sync(_sha1, descriptor)
+        stats = os.fstat(descriptor)
         created = datetime.fromtimestamp(stats.st_ctime, timezone.utc).isoformat()
         modified = datetime.fromtimestamp(stats.st_mtime, timezone.utc).isoformat()
-        with path.open("rb") as stream:
+        metadata = json.dumps(
+            [
+                {
+                    "key": UPLOAD_MARKER_KEY,
+                    "value": {"formatVersion": 1, "uploadId": upload_id},
+                }
+            ],
+            separators=(",", ":"),
+        )
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            stream.seek(0)
             response = await self._request(
                 "POST",
                 "assets",
+                retry_statuses=UPLOAD_RETRY_STATUSES,
+                passthrough_statuses=frozenset(range(200, 400)),
                 headers={"x-immich-checksum": base64.b64encode(checksum).decode("ascii")},
-                data={"fileCreatedAt": created, "fileModifiedAt": modified},
-                files={"assetData": (path.name, stream, "application/octet-stream")},
+                data={
+                    "fileCreatedAt": created,
+                    "fileModifiedAt": modified,
+                    "filename": requested_name,
+                    "metadata": metadata,
+                },
+                files={
+                    "assetData": (
+                        requested_name,
+                        stream,
+                        "application/octet-stream",
+                    )
+                },
             )
-        value = response.json()
-        if not isinstance(value, dict) or not isinstance(value.get("id"), str):
-            raise ImmichError("Immich returned an invalid upload response")
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise ImmichResponseError("Immich returned an invalid upload response") from error
+        expected_status = {200: "duplicate", 201: "created"}.get(response.status_code)
+        if (
+            expected_status is None
+            or not isinstance(value, dict)
+            or set(value) != {"status", "id"}
+            or value.get("status") != expected_status
+            or not isinstance(value.get("id"), str)
+        ):
+            raise ImmichResponseError("Immich returned an invalid upload response")
         asset_id = value["id"]
-        UUID(asset_id)
-        return UploadResult(asset_id, response.status_code == 201)
+        assert isinstance(asset_id, str)
+        try:
+            canonical_asset_id = str(UUID(asset_id))
+        except ValueError as error:
+            raise ImmichResponseError("Immich returned an invalid upload response") from error
+        if canonical_asset_id != asset_id:
+            raise ImmichResponseError("Immich returned an invalid upload response")
+        return UploadResult(asset_id, expected_status == "created")
 
     async def trash(self, asset_id: str) -> None:
         UUID(asset_id)
@@ -372,9 +505,10 @@ class ImmichClient:
             yield response
 
 
-def _sha1(path: Path) -> bytes:
+def _sha1(descriptor: int) -> bytes:
     digest = hashlib.sha1(usedforsecurity=False)
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
+    offset = 0
+    while block := os.pread(descriptor, 1024 * 1024, offset):
+        digest.update(block)
+        offset += len(block)
     return digest.digest()

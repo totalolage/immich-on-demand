@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from dataclasses import replace
+import base64
 import hashlib
+import os
 from pathlib import Path
 import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import trio
 
-from immich_on_demand.catalog import CatalogAsset, CatalogStats, TrustedProfile
+from immich_on_demand.catalog import Catalog, CatalogAsset, CatalogStats, TrustedProfile
 from immich_on_demand.control import ControlError, send_request, serve_control
 from immich_on_demand.immich import (
     ImmichPageLimitError,
@@ -18,6 +22,7 @@ from immich_on_demand.immich import (
     ImmichUnavailableError,
     MUTATION_PERMISSIONS,
     ServerSession,
+    UploadResult,
     UPLOAD_PERMISSIONS,
 )
 from immich_on_demand.model import Asset
@@ -26,15 +31,19 @@ from immich_on_demand.service import (
     _RestoreJob,
     _periodic_refresh,
     _pin_worker,
+    _upload_matches,
+    _process_upload,
     _restore_worker,
     run_service,
 )
 from immich_on_demand.settings import Settings
+from immich_on_demand.uploads import UploadErrorCode, UploadQueue, UploadState
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 PINNED_ID = "aaaaaaaa-1234-4234-8234-123456789abc"
+OTHER_UPLOAD_ID = "bbbbbbbb-1234-4234-8234-123456789abc"
 
 
 def trusted_profile(read_key: str = "read") -> TrustedProfile:
@@ -103,6 +112,7 @@ class ServiceFakes:
         self.clients: list[ServiceFakes.Client] = []
         self.handlers: dict[str, object] = {}
         self.cache: ServiceFakes.Cache | None = None
+        self.upload_queue: ServiceFakes.Queue | None = None
         self.preview_gate = trio.Event()
         self.main_started = trio.Event()
         self.stop_main = trio.Event()
@@ -120,6 +130,8 @@ class ServiceFakes:
         self.persisted_pins = {PINNED_ID}
         self.pin_hydrated = trio.Event()
         self.promoted = trio.Event()
+        self.upload_retries: list[str] = []
+        self.upload_cancellations: list[tuple[str, str, int]] = []
         outer = self
 
         class Client:
@@ -228,7 +240,6 @@ class ServiceFakes:
             def __init__(
                 self,
                 catalog: object,
-                read_client: object,
                 content_cache: object,
                 settings: Settings,
                 *,
@@ -250,6 +261,13 @@ class ServiceFakes:
                 outer.events.append("mutations-enabled")
                 outer.promoted.set()
 
+            def upload_access(self):
+                if not self.mutation_enabled:
+                    raise RuntimeError("mutations are disabled")
+                return outer.clients[-1], ServerSession(
+                    OWNER_ID, "3.0.3", frozenset({".jpg"}), True
+                )
+
             def lookup(self, identity: str | int) -> CatalogAsset | None:
                 return upload_entry() if identity == "new.jpg" else None
 
@@ -265,15 +283,59 @@ class ServiceFakes:
                 outer.restored_ids.append(asset_id)
 
         class Filesystem:
-            def __init__(self, library: object, path: Path, *, on_uploaded: object) -> None:
-                outer.on_uploaded = on_uploaded
-                outer.events.append(f"filesystem:{path.relative_to(root)}")
+            def __init__(
+                self,
+                library: object,
+                queue: object,
+                server_origin: str,
+                owner_id: str,
+                *,
+                on_pending: object,
+            ) -> None:
+                outer.events.append("filesystem:uploads")
+
+        class Queue:
+            def __init__(self, path: Path, *, minimum_free_bytes: int) -> None:
+                self.jobs: list[object] = []
+                self.quarantined_count = 0
+                outer.upload_queue = self
+                outer.events.append(f"uploads:{path.relative_to(root)}")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                outer.events.append("uploads-close")
+
+            def list(self) -> tuple[object, ...]:
+                return tuple(self.jobs)
+
+            def next_due(self):
+                return None
+
+            def status(self, job_id: str):
+                return next(
+                    (job for job in self.jobs if job.id == job_id), None
+                )
+
+            def retry(self, job_id: str, *, at_ns: int, revision: int | None = None):
+                outer.upload_retries.append(job_id)
+                return self.status(job_id)
+
+            def cancel(
+                self, job_id: str, *, requested_name: str, revision: int
+            ) -> None:
+                outer.upload_cancellations.append(
+                    (job_id, requested_name, revision)
+                )
+                self.jobs = [job for job in self.jobs if job.id != job_id]
 
         self.Client = Client
         self.Catalog = Catalog
         self.Cache = Cache
         self.Library = Library
         self.Filesystem = Filesystem
+        self.Queue = Queue
 
     def key(self, settings: Settings, purpose: str) -> str:
         if purpose == "read-only":
@@ -360,12 +422,17 @@ class ServiceFakes:
         finally:
             self.events.append("control-close")
 
+    async def upload_worker(self, *args: object) -> None:
+        self.on_uploaded = args[-1]
+        await trio.sleep_forever()
+
     def fuse_init(self, filesystem: object, mountpoint: str, options: set[str]) -> None:
         self.fuse_options = options
         self.events.append("fuse-init")
 
     async def fuse_main(self) -> None:
         self.events.append("fuse-main")
+        await trio.lowlevel.checkpoint()
         self.main_started.set()
         await self.stop_main.wait()
 
@@ -385,11 +452,14 @@ class ServiceFakes:
             "ContentCache": self.Cache,
             "Library": self.Library,
             "ImmichFilesystem": self.Filesystem,
+            "UploadQueue": self.Queue,
             "load_api_key": self.key,
             "refresh_catalog": self.refresh,
             "refresh_catalog_incremental": self.incremental_refresh,
             "populate_previews": self.previews,
+            "_upload_worker": self.upload_worker,
             "state_path": lambda: self.root / "state",
+            "data_path": lambda: self.root / "data",
             "cache_path": lambda: self.root / "cache",
             "runtime_path": lambda: self.root / "runtime",
         }
@@ -407,6 +477,203 @@ class ServiceFakes:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_upload_candidate_must_be_visible_in_the_upload_library(self) -> None:
+        content = b"queued original"
+        uploaded = Asset(
+            ASSET_ID,
+            OWNER_ID,
+            "photo.jpg",
+            "image/jpeg",
+            len(content),
+            1,
+            2,
+            "2026-08-26T00:00:00Z",
+            base64.b64encode(
+                hashlib.sha1(content, usedforsecurity=False).digest()
+            ).decode(),
+            "timeline",
+            False,
+            False,
+            None,
+        )
+        job = SimpleNamespace(
+            id=PINNED_ID,
+            owner_id=OWNER_ID,
+            size=len(content),
+            sha1=hashlib.sha1(content, usedforsecurity=False).hexdigest(),
+        )
+
+        self.assertTrue(_upload_matches(job, uploaded, PINNED_ID))  # type: ignore[arg-type]
+        for unsafe in (
+            replace(uploaded, is_trashed=True),
+            replace(uploaded, is_offline=True),
+            replace(uploaded, visibility="hidden"),
+            replace(uploaded, library_id=ASSET_ID),
+        ):
+            self.assertFalse(_upload_matches(job, unsafe, PINNED_ID))  # type: ignore[arg-type]
+
+    def test_pending_upload_resumes_candidate_verification_without_reposting(self) -> None:
+        content = b"queued original"
+        checksum = base64.b64encode(
+            hashlib.sha1(content, usedforsecurity=False).digest()
+        ).decode()
+        uploaded = Asset(
+            ASSET_ID,
+            OWNER_ID,
+            "photo.jpg",
+            "image/jpeg",
+            len(content),
+            1,
+            2,
+            "2026-08-26T00:00:00Z",
+            checksum,
+            "timeline",
+            False,
+            False,
+            None,
+        )
+
+        class Mutation:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, str, frozenset[str], str]] = []
+
+            async def upload(
+                self,
+                descriptor: int,
+                name: str,
+                media_types: frozenset[str],
+                upload_id: str,
+            ) -> UploadResult:
+                self.calls.append((descriptor, name, media_types, upload_id))
+                return UploadResult(ASSET_ID, True)
+
+        class ReadClient:
+            def __init__(self) -> None:
+                self.fail_once = True
+                self.error: Exception | None = None
+
+            async def asset(self, asset_id: str) -> Asset:
+                self.assert_id = asset_id
+                if self.error is not None:
+                    raise self.error
+                if self.fail_once:
+                    self.fail_once = False
+                    raise ImmichUnavailableError("offline")
+                return uploaded
+
+            async def asset_metadata(self, asset_id: str) -> str:
+                self.assert_metadata_id = asset_id
+                return job.id
+
+        class Mounted:
+            def __init__(self, mutation: Mutation) -> None:
+                self.mutation = mutation
+                self.mutation_enabled = True
+
+            def upload_access(self):
+                return self.mutation, ServerSession(
+                    OWNER_ID, "3.0.3", frozenset({".jpg"}), True
+                )
+
+        async def scenario(root: Path) -> None:
+            nonlocal job
+            mutation = Mutation()
+            read_client = ReadClient()
+            callbacks: list[CatalogAsset] = []
+            with (
+                Catalog(root / "state" / "catalog.db") as catalog,
+                UploadQueue(root / "data" / "uploads") as queue,
+            ):
+                draft = queue.begin("photo.jpg", "https://photos.example.test", OWNER_ID)
+                queue.write(draft, 0, content)
+                job = queue.seal(draft)
+                os.close(draft.descriptor)
+
+                async def published(entry: CatalogAsset) -> None:
+                    callbacks.append(entry)
+
+                class ReadOnly:
+                    mutation_enabled = False
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    ReadOnly(),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings("https://photos.example.test", root / "mount"),
+                    job,
+                    published,
+                )
+                self.assertEqual(queue.status(job.id), job)
+                self.assertEqual(mutation.calls, [])
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings("https://photos.example.test", root / "mount"),
+                    job,
+                    published,
+                )
+
+                waiting = queue.status(job.id)
+                assert waiting is not None
+                self.assertEqual(waiting.state, UploadState.ATTEMPTING)
+                self.assertEqual(waiting.candidate_asset_id, ASSET_ID)
+                self.assertEqual(waiting.error, UploadErrorCode.UPLOAD_UNAVAILABLE)
+                self.assertIsNone(catalog.by_id(ASSET_ID))
+
+                waiting = queue.retry(job.id, at_ns=0)
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings("https://photos.example.test", root / "mount"),
+                    waiting,
+                    published,
+                )
+
+                self.assertIsNone(queue.status(job.id))
+                entry = catalog.by_id(ASSET_ID)
+                assert entry is not None
+                self.assertEqual((entry.name, entry.asset), ("photo.jpg", uploaded))
+                self.assertEqual(callbacks, [entry])
+                self.assertEqual(
+                    [call[1:] for call in mutation.calls],
+                    [("photo.jpg", frozenset({".jpg"}), job.id)],
+                )
+
+                draft = queue.begin(
+                    "broken.jpg", "https://photos.example.test", OWNER_ID
+                )
+                queue.write(draft, 0, content)
+                broken = queue.seal(draft)
+                os.close(draft.descriptor)
+                read_client.error = ValueError("malformed remote state")
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings("https://photos.example.test", root / "mount"),
+                    broken,
+                    published,
+                )
+                blocked = queue.status(broken.id)
+                assert blocked is not None
+                self.assertEqual(blocked.state, UploadState.BLOCKED)
+                self.assertEqual(blocked.error, UploadErrorCode.LOCAL_STATE_FAILED)
+
+        job = None  # type: ignore[assignment]
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_matching_trust_mounts_offline_without_remote_or_eviction_work(self) -> None:
         async def scenario(root: Path) -> ServiceFakes:
             fakes = ServiceFakes(
@@ -436,6 +703,8 @@ class ServiceTest(unittest.TestCase):
                             "offline": 0,
                             "online": False,
                             "mutation_enabled": False,
+                            "pending_uploads": 0,
+                            "upload_quarantined": 0,
                         },
                     )
                     self.assertNotIn("refresh", fakes.events)
@@ -982,6 +1251,9 @@ class ServiceTest(unittest.TestCase):
                     describe = fakes.handlers["describe"]
                     pin = fakes.handlers["pin"]
                     restore = fakes.handlers["restore"]
+                    uploads = fakes.handlers["uploads"]
+                    retry_upload = fakes.handlers["retry-upload"]
+                    cancel_upload = fakes.handlers["cancel-upload"]
                     self.assertEqual(
                         await status({}),  # type: ignore[operator]
                         {
@@ -993,7 +1265,76 @@ class ServiceTest(unittest.TestCase):
                             "offline": 0,
                             "online": True,
                             "mutation_enabled": True,
+                            "pending_uploads": 0,
+                            "upload_quarantined": 0,
                         },
+                    )
+                    assert fakes.upload_queue is not None
+                    fakes.upload_queue.jobs = [
+                        SimpleNamespace(
+                            id=PINNED_ID,
+                            requested_name="foreign.jpg",
+                            server_origin=settings.server_origin,
+                            owner_id=PINNED_ID,
+                            state=UploadState.PENDING,
+                            size=1,
+                            error=None,
+                            revision=2,
+                        ),
+                        SimpleNamespace(
+                            id=ASSET_ID,
+                            requested_name="retry.jpg",
+                            server_origin=settings.server_origin,
+                            owner_id=OWNER_ID,
+                            state=UploadState.BLOCKED,
+                            size=2,
+                            error=UploadErrorCode.UPLOAD_UNAVAILABLE,
+                            revision=3,
+                        ),
+                        SimpleNamespace(
+                            id=OTHER_UPLOAD_ID,
+                            requested_name="cancel.jpg",
+                            server_origin=settings.server_origin,
+                            owner_id=OWNER_ID,
+                            state=UploadState.PENDING,
+                            size=3,
+                            error=None,
+                            revision=4,
+                        ),
+                    ]
+                    self.assertEqual((await status({}))["pending_uploads"], 2)  # type: ignore[index,operator]
+                    first_page = await uploads({"after": None, "limit": 1})  # type: ignore[operator]
+                    self.assertEqual(
+                        [item["id"] for item in first_page["items"]],  # type: ignore[index]
+                        [ASSET_ID],
+                    )
+                    self.assertEqual(first_page["next"], ASSET_ID)  # type: ignore[index]
+                    self.assertEqual(
+                        await retry_upload({"id": ASSET_ID}),  # type: ignore[operator]
+                        {"id": ASSET_ID, "scheduled": True},
+                    )
+                    with self.assertRaises(PermissionError):
+                        await cancel_upload(  # type: ignore[operator]
+                            {
+                                "id": PINNED_ID,
+                                "revision": 2,
+                                "confirm_name": "foreign.jpg",
+                            }
+                        )
+                    self.assertEqual(
+                        await cancel_upload(  # type: ignore[operator]
+                            {
+                                "id": OTHER_UPLOAD_ID,
+                                "revision": 4,
+                                "confirm_name": "cancel.jpg",
+                            }
+                        ),
+                        {"id": OTHER_UPLOAD_ID, "cancelled": True},
+                    )
+                    self.assertEqual(fakes.upload_retries, [ASSET_ID])
+                    self.assertEqual(
+                        fakes.upload_cancellations,
+                        [(OTHER_UPLOAD_ID, "cancel.jpg", 4)],
                     )
                     with trio.fail_after(0.1):
                         self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]

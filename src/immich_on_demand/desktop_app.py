@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -24,6 +25,22 @@ _APPLICATION_ID = "net.kalny.ImmichOnDemand"
 _PROGRAM_NAME = "immich-on-demand-desktop"
 _PIN_POLL_SECONDS = 0.5
 _ACTION_WAIT_SECONDS = 300
+_UPLOAD_STATES = frozenset(
+    {"writing", "pending", "attempting", "committed", "blocked", "cancelled"}
+)
+_UPLOAD_ERRORS = frozenset(
+    {
+        "interrupted-write",
+        "local-write-failed",
+        "upload-unavailable",
+        "upload-rejected",
+        "ambiguous-response",
+        "candidate-mismatch",
+        "profile-mismatch",
+        "payload-invalid",
+        "local-state-failed",
+    }
+)
 _RESULT_MESSAGES = {
     "status-online": "Service is online.",
     "status-offline": "Service is offline; cached files remain available.",
@@ -88,6 +105,74 @@ def _described_pin(response: object, uri: str) -> dict[str, object] | None:
     return item
 
 
+def _canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _upload_page(response: object) -> tuple[list[dict[str, object]], str | None]:
+    expected = {"id", "name", "state", "size", "error", "revision"}
+    if (
+        not isinstance(response, dict)
+        or set(response) != {"items", "next"}
+        or not isinstance(response["items"], list)
+        or len(response["items"]) > 32
+    ):
+        raise ValueError("invalid Pending uploads response")
+    items = response["items"]
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or set(item) != expected
+            or not _canonical_uuid(item["id"])
+            or not isinstance(item["name"], str)
+            or item["state"] not in _UPLOAD_STATES
+            or not (
+                item["size"] is None
+                or (type(item["size"]) is int and item["size"] >= 0)
+            )
+            or not (item["error"] is None or item["error"] in _UPLOAD_ERRORS)
+            or type(item["revision"]) is not int
+            or item["revision"] < 0
+        ):
+            raise ValueError("invalid Pending uploads response")
+    next_id = response.get("next")
+    if next_id is not None and not _canonical_uuid(next_id):
+        raise ValueError("invalid Pending uploads response")
+    return items, next_id
+
+
+async def _fetch_uploads() -> str:
+    after: str | None = None
+    seen: set[str] = set()
+    lines: list[str] = []
+    while True:
+        items, next_id = _upload_page(await run_action("uploads", after))
+        lines.extend(
+            " ".join(
+                (
+                    f"id={item['id']}",
+                    f"name={json.dumps(item['name'], ensure_ascii=False)}",
+                    f"state={item['state']}",
+                    f"size={json.dumps(item['size'])}",
+                    f"error={json.dumps(item['error'], ensure_ascii=False)}",
+                    f"revision={item['revision']}",
+                )
+            )
+            for item in items
+        )
+        if next_id is None:
+            return "\n".join(lines)
+        if next_id in seen:
+            raise ValueError("invalid Pending uploads response")
+        seen.add(next_id)
+        after = next_id
+
+
 async def _run_action_command(action: str, uri: str | None) -> int:
     try:
         result = await run_action(action, uri)
@@ -103,6 +188,8 @@ async def _run_action_command(action: str, uri: str | None) -> int:
             "trashed",
             "hidden",
             "offline",
+            "pending_uploads",
+            "upload_quarantined",
             "online",
             "mutation_enabled",
         }
@@ -232,6 +319,13 @@ class DesktopApplication(Adw.Application):
         self._remote_delete = None
         self._restore_entry = None
         self._restore_button = None
+        self._uploads_label = None
+        self._uploads_refresh_button = None
+        self._upload_id_entry = None
+        self._upload_name_entry = None
+        self._upload_revision_entry = None
+        self._retry_upload_button = None
+        self._cancel_upload_button = None
         self._message = None
         self._save_button = None
 
@@ -316,11 +410,60 @@ class DesktopApplication(Adw.Application):
         self._restore_button.connect("clicked", self._restore_asset)
         restore_controls.append(self._restore_button)
         grid.attach(restore_controls, 1, len(fields) + 1, 1, 1)
+        grid.attach(
+            Gtk.Label(label="Pending uploads", xalign=0),
+            0,
+            len(fields) + 2,
+            1,
+            1,
+        )
+        self._uploads_refresh_button = Gtk.Button(label="Refresh")
+        self._uploads_refresh_button.connect("clicked", self._refresh_uploads)
+        grid.attach(self._uploads_refresh_button, 1, len(fields) + 2, 1, 1)
+        self._uploads_label = Gtk.Label(
+            label="Pending uploads not loaded.", xalign=0, selectable=True
+        )
+        grid.attach(self._uploads_label, 0, len(fields) + 3, 2, 1)
+        grid.attach(
+            Gtk.Label(label="Pending upload UUID", xalign=0),
+            0,
+            len(fields) + 4,
+            1,
+            1,
+        )
+        self._upload_id_entry = Gtk.Entry(hexpand=True)
+        grid.attach(self._upload_id_entry, 1, len(fields) + 4, 1, 1)
+        grid.attach(
+            Gtk.Label(label="Current revision", xalign=0),
+            0,
+            len(fields) + 5,
+            1,
+            1,
+        )
+        self._upload_revision_entry = Gtk.Entry(hexpand=True)
+        grid.attach(self._upload_revision_entry, 1, len(fields) + 5, 1, 1)
+        grid.attach(
+            Gtk.Label(label="Exact name for Cancel", xalign=0),
+            0,
+            len(fields) + 6,
+            1,
+            1,
+        )
+        self._upload_name_entry = Gtk.Entry(hexpand=True)
+        grid.attach(self._upload_name_entry, 1, len(fields) + 6, 1, 1)
+        upload_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._retry_upload_button = Gtk.Button(label="Retry Upload")
+        self._retry_upload_button.connect("clicked", self._retry_upload)
+        upload_controls.append(self._retry_upload_button)
+        self._cancel_upload_button = Gtk.Button(label="Cancel Upload")
+        self._cancel_upload_button.connect("clicked", self._cancel_upload)
+        upload_controls.append(self._cancel_upload_button)
+        grid.attach(upload_controls, 1, len(fields) + 7, 1, 1)
         self._message = Gtk.Label(label="", xalign=0)
-        grid.attach(self._message, 0, len(fields) + 2, 2, 1)
+        grid.attach(self._message, 0, len(fields) + 8, 2, 1)
         self._save_button = Gtk.Button(label="Save Settings")
         self._save_button.connect("clicked", self._save_settings)
-        grid.attach(self._save_button, 1, len(fields) + 3, 1, 1)
+        grid.attach(self._save_button, 1, len(fields) + 9, 1, 1)
         self._window.set_content(content)
 
     def _finish_load(self, success: bool, result) -> bool:
@@ -386,6 +529,117 @@ class DesktopApplication(Adw.Application):
         self._message.set_text(
             "Settings saved." if success else "Could not save settings."
         )
+        return False
+
+    def _refresh_uploads(self, _button=None) -> None:
+        if not self._worker.submit(
+            lambda: trio.run(_fetch_uploads), self._finish_upload_refresh
+        ):
+            self._uploads_label.set_text("Desktop worker is busy.")
+            return
+        self._uploads_label.set_text("Loading Pending uploads.")
+
+    def _finish_upload_refresh(self, success: bool, result) -> bool:
+        self._uploads_label.set_text(
+            (result or "No Pending uploads.")
+            if success and isinstance(result, str)
+            else "Could not load Pending uploads."
+        )
+        return False
+
+    def _pending_upload_id(self) -> str:
+        upload_id = self._upload_id_entry.get_text()
+        if not _canonical_uuid(upload_id):
+            raise ValueError
+        return upload_id
+
+    def _clear_pending_upload_fields(self) -> None:
+        self._upload_id_entry.set_text("")
+        self._upload_name_entry.set_text("")
+        self._upload_revision_entry.set_text("")
+
+    def _retry_upload(self, _button) -> None:
+        try:
+            upload_id = self._pending_upload_id()
+        except ValueError:
+            self._message.set_text("Pending upload UUID is invalid.")
+            return
+
+        if not self._worker.submit(
+            lambda: trio.run(run_action, "retry-upload", upload_id),
+            lambda success, result: self._finish_retry_upload(
+                success, result, upload_id
+            ),
+        ):
+            self._message.set_text("Desktop worker is busy.")
+            return
+        self._message.set_text("Requesting upload retry.")
+
+    def _finish_retry_upload(self, success: bool, result, upload_id: str) -> bool:
+        accepted = (
+            success
+            and isinstance(result, dict)
+            and set(result) == {"id", "scheduled"}
+            and result["id"] == upload_id
+            and result["scheduled"] is True
+        )
+        if not accepted:
+            self._message.set_text("Could not request upload retry.")
+            return False
+        self._clear_pending_upload_fields()
+        self._message.set_text("Upload retry requested.")
+        self._refresh_uploads()
+        return False
+
+    def _cancel_upload(self, _button) -> None:
+        try:
+            upload_id = self._pending_upload_id()
+        except ValueError:
+            self._message.set_text("Pending upload UUID is invalid.")
+            return
+        revision_text = self._upload_revision_entry.get_text().strip()
+        try:
+            revision = int(revision_text)
+        except ValueError:
+            revision = -1
+        if revision < 0:
+            self._message.set_text("Pending upload revision is invalid.")
+            return
+        confirm_name = self._upload_name_entry.get_text()
+        if not confirm_name.strip():
+            self._message.set_text("Pending upload confirmation name is required.")
+            return
+
+        if not self._worker.submit(
+            lambda: trio.run(
+                run_action,
+                "cancel-upload",
+                upload_id,
+                revision,
+                confirm_name,
+            ),
+            lambda success, result: self._finish_cancel_upload(
+                success, result, upload_id
+            ),
+        ):
+            self._message.set_text("Desktop worker is busy.")
+            return
+        self._message.set_text("Requesting Pending upload cancellation.")
+
+    def _finish_cancel_upload(self, success: bool, result, upload_id: str) -> bool:
+        accepted = (
+            success
+            and isinstance(result, dict)
+            and set(result) == {"id", "cancelled"}
+            and result["id"] == upload_id
+            and result["cancelled"] is True
+        )
+        if not accepted:
+            self._message.set_text("Could not cancel Pending upload.")
+            return False
+        self._clear_pending_upload_fields()
+        self._message.set_text("Pending upload cancelled.")
+        self._refresh_uploads()
         return False
 
     def _restore_asset(self, _button) -> None:

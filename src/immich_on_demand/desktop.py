@@ -21,26 +21,89 @@ def _is_local_uri(value: object) -> bool:
     )
 
 
-async def run_action(action: str, target: str | list[str] | None = None):
-    if action in {"status", "refresh"} and target is None:
+def _canonical_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid desktop action")
+    try:
+        return str(UUID(value))
+    except ValueError as error:
+        raise ValueError("invalid desktop action") from error
+
+
+async def run_action(
+    action: str,
+    target: str | list[str] | None = None,
+    revision: int | None = None,
+    confirm_name: str | None = None,
+):
+    if (
+        action in {"status", "refresh"}
+        and target is None
+        and revision is None
+        and confirm_name is None
+    ):
         method, params = action, {}
-    elif action == "evict" and _is_local_uri(target):
+    elif (
+        action == "evict"
+        and _is_local_uri(target)
+        and revision is None
+        and confirm_name is None
+    ):
         assert isinstance(target, str)
         method, params = "evict", {"uri": target}
-    elif action in {"pin", "unpin"} and _is_local_uri(target):
+    elif (
+        action in {"pin", "unpin"}
+        and _is_local_uri(target)
+        and revision is None
+        and confirm_name is None
+    ):
         assert isinstance(target, str)
         method, params = "pin", {"uri": target, "pinned": action == "pin"}
-    elif action == "restore" and isinstance(target, str):
-        try:
-            asset_id = str(UUID(target))
-        except ValueError as error:
-            raise ValueError("invalid desktop action") from error
-        method, params = "restore", {"asset": asset_id}
+    elif (
+        action == "restore"
+        and isinstance(target, str)
+        and revision is None
+        and confirm_name is None
+    ):
+        method, params = "restore", {"asset": _canonical_id(target)}
+    elif (
+        action == "uploads"
+        and (target is None or isinstance(target, str))
+        and revision is None
+        and confirm_name is None
+    ):
+        method = "uploads"
+        params = {
+            "after": None if target is None else _canonical_id(target),
+            "limit": 32,
+        }
+    elif (
+        action == "retry-upload"
+        and isinstance(target, str)
+        and revision is None
+        and confirm_name is None
+    ):
+        method, params = "retry-upload", {"id": _canonical_id(target)}
+    elif (
+        action == "cancel-upload"
+        and isinstance(target, str)
+        and type(revision) is int
+        and revision >= 0
+        and isinstance(confirm_name, str)
+        and bool(confirm_name)
+    ):
+        method, params = "cancel-upload", {
+            "id": _canonical_id(target),
+            "revision": revision,
+            "confirm_name": confirm_name,
+        }
     elif (
         action == "describe"
         and isinstance(target, list)
         and 0 < len(target) <= 64
         and all(_is_local_uri(uri) for uri in target)
+        and revision is None
+        and confirm_name is None
     ):
         params = {"uris": target}
         frame = {

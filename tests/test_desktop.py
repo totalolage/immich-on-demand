@@ -43,6 +43,24 @@ class DesktopTest(unittest.TestCase):
                     await run_action("restore", ASSET_ID.upper()),
                     {"scheduled": True},
                 )
+                self.assertEqual(
+                    await run_action("uploads"),
+                    {"scheduled": True},
+                )
+                self.assertEqual(
+                    await run_action("uploads", ASSET_ID.upper()),
+                    {"scheduled": True},
+                )
+                self.assertEqual(
+                    await run_action("retry-upload", ASSET_ID.upper()),
+                    {"scheduled": True},
+                )
+                self.assertEqual(
+                    await run_action(
+                        "cancel-upload", ASSET_ID.upper(), 7, "Test image.jpg"
+                    ),
+                    {"scheduled": True},
+                )
 
             self.assertEqual(
                 request.await_args_list,
@@ -79,6 +97,34 @@ class DesktopTest(unittest.TestCase):
                         "restore",
                         {"asset": ASSET_ID},
                     ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "uploads",
+                        {"after": None, "limit": 32},
+                    ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "uploads",
+                        {"after": ASSET_ID, "limit": 32},
+                    ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "retry-upload",
+                        {"id": ASSET_ID},
+                    ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "cancel-upload",
+                        {
+                            "id": ASSET_ID,
+                            "revision": 7,
+                            "confirm_name": "Test image.jpg",
+                        },
+                    ),
                 ],
             )
 
@@ -99,10 +145,33 @@ class DesktopTest(unittest.TestCase):
                 ("restore", None),
                 ("restore", "not-a-uuid"),
                 ("restore", "file:///Photos/photo.jpg"),
+                ("uploads", "not-a-uuid"),
+                ("retry-upload", None),
+                ("retry-upload", "not-a-uuid"),
                 ("unknown", None),
             ):
                 with self.subTest(action=action, uri=uri), self.assertRaises(ValueError):
                     await run_action(action, uri)
+
+        trio.run(scenario)
+
+    def test_cancel_upload_requires_an_exact_nonempty_confirmation_name(self) -> None:
+        async def scenario() -> None:
+            for upload_id, revision, confirmation in (
+                (ASSET_ID, None, "Test image.jpg"),
+                (ASSET_ID, -1, "Test image.jpg"),
+                (ASSET_ID, 0, None),
+                (ASSET_ID, 0, ""),
+                ("not-a-uuid", 0, "Test image.jpg"),
+            ):
+                with self.subTest(
+                    upload_id=upload_id,
+                    revision=revision,
+                    confirmation=confirmation,
+                ), self.assertRaises(ValueError):
+                    await run_action(
+                        "cancel-upload", upload_id, revision, confirmation
+                    )
 
         trio.run(scenario)
 

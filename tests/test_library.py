@@ -10,7 +10,7 @@ from trio.testing import wait_all_tasks_blocked
 
 from immich_on_demand.app import refresh_catalog
 from immich_on_demand.catalog import Catalog
-from immich_on_demand.immich import ServerSession, UploadResult
+from immich_on_demand.immich import ServerSession
 from immich_on_demand.library import Library, LibraryError
 from immich_on_demand.model import Asset
 from immich_on_demand.settings import Settings
@@ -49,35 +49,12 @@ def settings(root: Path, *, remote_delete: bool = False) -> Settings:
     return Settings("https://photos.example.test", root / "mount", remote_delete=remote_delete)
 
 
-class ReadClient:
-    def __init__(self, uploaded: Asset, error: Exception | None = None) -> None:
-        self.uploaded = uploaded
-        self.error = error
-        self.on_asset = lambda: None
-
-    async def asset(self, asset_id: str) -> Asset:
-        self.on_asset()
-        if self.error is not None:
-            raise self.error
-        return self.uploaded
-
-
 class MutationClient:
-    def __init__(self, error: Exception | None = None, *, created: bool = True) -> None:
+    def __init__(self, error: Exception | None = None) -> None:
         self.error = error
-        self.created = created
-        self.uploads = 0
         self.trashes: list[str] = []
         self.restores: list[str] = []
-        self.on_upload = lambda: None
         self.on_restore = lambda: None
-
-    async def upload(self, path: Path, media_types: frozenset[str]) -> UploadResult:
-        self.uploads += 1
-        self.on_upload()
-        if self.error is not None:
-            raise self.error
-        return UploadResult(ASSET_ID, self.created)
 
     async def trash(self, asset_id: str) -> None:
         if self.error is not None:
@@ -110,7 +87,6 @@ def library(
     catalog: Catalog,
     root: Path,
     *,
-    read: ReadClient | None = None,
     mutation: MutationClient | None = None,
     mutation_session: ServerSession | None = None,
     remote_delete: bool = False,
@@ -118,7 +94,6 @@ def library(
 ) -> Library:
     return Library(
         catalog,
-        read or ReadClient(asset()),  # type: ignore[arg-type]
         Cache(),  # type: ignore[arg-type]
         settings(root, remote_delete=remote_delete),
         mutation_client=mutation,  # type: ignore[arg-type]
@@ -130,14 +105,12 @@ def library(
 class LibraryTest(unittest.TestCase):
     def test_enabling_mutations_promotes_every_remote_route(self) -> None:
         async def scenario(root: Path) -> None:
-            staged = root / "staged.jpg"
-            staged.write_bytes(b"hello")
             mutation = MutationClient()
             with Catalog(root / "catalog.db") as catalog:
+                entry = catalog.add_uploaded(asset(), "photo.jpg")
                 mounted = library(
                     catalog,
                     root,
-                    read=ReadClient(asset()),
                     remote_delete=True,
                 )
                 self.assertFalse(mounted.mutation_enabled)
@@ -145,10 +118,9 @@ class LibraryTest(unittest.TestCase):
                 mounted.enable_mutations(mutation, session())  # type: ignore[arg-type]
 
                 self.assertTrue(mounted.mutation_enabled)
-                uploaded = await mounted.upload_new(staged, "staged.jpg")
-                await mounted.remote_trash(uploaded)
-                await mounted.remote_restore(uploaded.asset.id)
-                self.assertEqual(mutation.uploads, 1)
+                self.assertEqual(mounted.upload_access(), (mutation, session()))
+                await mounted.remote_trash(entry)
+                await mounted.remote_restore(entry.asset.id)
                 self.assertEqual(mutation.trashes, [ASSET_ID])
                 self.assertEqual(mutation.restores, [ASSET_ID])
 
@@ -192,88 +164,6 @@ class LibraryTest(unittest.TestCase):
                 for entry in entries:
                     self.assertIsNone(mounted.lookup(entry.name))
                     self.assertIsNone(mounted.lookup(entry.inode))
-
-    def test_upload_commits_only_after_upload_and_authoritative_fetch(self) -> None:
-        async def scenario(root: Path) -> None:
-            staged = root / "staged"
-            staged.write_bytes(b"hello")
-            with Catalog(root / "catalog.db") as catalog:
-                mutation = MutationClient()
-                read = ReadClient(asset())
-                mutation.on_upload = lambda: self.assertEqual(catalog.list_visible(), [])
-                read.on_asset = lambda: self.assertEqual(catalog.list_visible(), [])
-                mounted = library(
-                    catalog, root, read=read, mutation=mutation, mutation_session=session()
-                )
-
-                entry = await mounted.upload_new(staged, "new.jpg")
-
-                self.assertEqual(entry.name, "new.jpg")
-                self.assertEqual(catalog.by_name("new.jpg"), entry)
-                self.assertEqual(staged.read_bytes(), b"hello")
-
-        with tempfile.TemporaryDirectory() as directory:
-            trio.run(scenario, Path(directory))
-
-    def test_upload_failures_leave_recovery_bytes_and_catalog_untouched(self) -> None:
-        async def scenario(root: Path) -> None:
-            staged = root / "staged"
-            staged.write_bytes(b"recover me")
-            for read, mutation in (
-                (ReadClient(asset()), MutationClient(OSError("upload failed"))),
-                (ReadClient(asset(), OSError("fetch failed")), MutationClient()),
-            ):
-                with Catalog(root / f"catalog-{mutation.error is None}.db") as catalog:
-                    mounted = library(
-                        catalog, root, read=read, mutation=mutation, mutation_session=session()
-                    )
-                    with self.assertRaises(OSError):
-                        await mounted.upload_new(staged, "new.jpg")
-                    self.assertEqual(catalog.list_visible(), [])
-                    self.assertEqual(staged.read_bytes(), b"recover me")
-
-        with tempfile.TemporaryDirectory() as directory:
-            trio.run(scenario, Path(directory))
-
-    def test_upload_refuses_existing_name_or_missing_mutation_access(self) -> None:
-        async def scenario(root: Path) -> None:
-            staged = root / "staged"
-            staged.write_bytes(b"hello")
-            with Catalog(root / "catalog.db") as catalog:
-                catalog.add_uploaded(asset(OTHER_ID), "new.jpg")
-                mutation = MutationClient()
-                with self.assertRaises(FileExistsError):
-                    await library(
-                        catalog, root, mutation=mutation, mutation_session=session()
-                    ).upload_new(staged, "new.jpg")
-                self.assertEqual(mutation.uploads, 0)
-                with self.assertRaises(LibraryError):
-                    await library(catalog, root).upload_new(staged, "free.jpg")
-
-        with tempfile.TemporaryDirectory() as directory:
-            trio.run(scenario, Path(directory))
-
-    def test_duplicate_upload_keeps_recovery_file_out_of_the_catalog(self) -> None:
-        async def scenario(root: Path) -> None:
-            staged = root / "duplicate.jpg"
-            staged.write_bytes(b"same bytes")
-            with Catalog(root / "catalog.db") as catalog:
-                mutation = MutationClient(created=False)
-                read = ReadClient(asset())
-                with self.assertRaisesRegex(FileExistsError, "identical content"):
-                    await library(
-                        catalog,
-                        root,
-                        read=read,
-                        mutation=mutation,
-                        mutation_session=session(),
-                    ).upload_new(staged, "duplicate.jpg")
-
-                self.assertEqual(catalog.list_visible(), [])
-                self.assertEqual(staged.read_bytes(), b"same bytes")
-
-        with tempfile.TemporaryDirectory() as directory:
-            trio.run(scenario, Path(directory))
 
     def test_remote_trash_requires_every_guard_and_commits_after_success(self) -> None:
         async def scenario(root: Path) -> None:
@@ -416,51 +306,6 @@ class LibraryTest(unittest.TestCase):
                 current = catalog.by_id(entry.asset.id)
                 self.assertTrue(current and current.asset.is_trashed)
                 self.assertEqual(mutation.restores, [entry.asset.id])
-
-        with tempfile.TemporaryDirectory() as directory:
-            trio.run(scenario, Path(directory))
-
-    def test_refresh_cannot_erase_a_concurrent_upload(self) -> None:
-        async def scenario(root: Path) -> None:
-            refresh_paused = trio.Event()
-            finish_refresh = trio.Event()
-            upload_done = trio.Event()
-
-            class RefreshClient:
-                async def asset_pages(self, owner_id: str):
-                    if owner_id != OWNER_ID:
-                        raise AssertionError(owner_id)
-                    yield []
-                    refresh_paused.set()
-                    await finish_refresh.wait()
-
-            staged = root / "new.jpg"
-            staged.write_bytes(b"hello")
-            with Catalog(root / "catalog.db") as catalog:
-                lock = trio.Lock()
-                mutation = MutationClient()
-                mounted = library(
-                    catalog,
-                    root,
-                    mutation=mutation,
-                    mutation_session=session(),
-                    catalog_lock=lock,
-                )
-
-                async def upload() -> None:
-                    await mounted.upload_new(staged, "new.jpg")
-                    upload_done.set()
-
-                async with trio.open_nursery() as nursery:
-                    nursery.start_soon(refresh_catalog, catalog, RefreshClient(), session(), lock)
-                    await refresh_paused.wait()
-                    nursery.start_soon(upload)
-                    await wait_all_tasks_blocked()
-                    self.assertEqual(mutation.uploads, 0)
-                    finish_refresh.set()
-                    await upload_done.wait()
-
-                self.assertEqual(catalog.by_name("new.jpg").asset.id, ASSET_ID)  # type: ignore[union-attr]
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

@@ -2,7 +2,7 @@
 
 ## Destination
 
-Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, and the first desktop controls are implemented but await target acceptance. Later releases may add queued uploads, Views, broader media support, Asset replacement, multiple Profiles, and more platforms.
+Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, queued uploads, and the first desktop controls are implemented but await target acceptance. Later releases may add Views, broader media support, Asset replacement, multiple Profiles, and more platforms.
 
 ## Rules
 
@@ -29,7 +29,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 ### 1.2: work through outages
 
 - [Start from trusted cached state while Immich is offline](issues/07-start-offline.md) is implemented. Target acceptance remains.
-- [Queue and retry uploads](issues/08-queue-and-retry-uploads.md)
+- [Queue and retry uploads](issues/08-queue-and-retry-uploads.md) is implemented. Crash and target-system acceptance remain.
 
 ### 1.3: add rich library Views
 

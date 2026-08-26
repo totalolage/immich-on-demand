@@ -15,7 +15,17 @@ import trio
 MAX_MESSAGE_BYTES = 64 * 1024
 DEFAULT_TIMEOUT_SECONDS = 5.0
 METHODS = frozenset(
-    {"status", "refresh", "evict", "describe", "pin", "restore"}
+    {
+        "status",
+        "refresh",
+        "evict",
+        "describe",
+        "pin",
+        "restore",
+        "uploads",
+        "retry-upload",
+        "cancel-upload",
+    }
 )
 _SECRET_FIELDS = frozenset(
     {"apikey", "authorization", "credential", "credentials", "password", "secret", "token"}

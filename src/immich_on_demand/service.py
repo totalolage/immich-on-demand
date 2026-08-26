@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
+import base64
+from functools import partial
 import hashlib
+import hmac
 import logging
 import os
 from pathlib import Path
 import stat
+import time
 from typing import Any
 from urllib.parse import unquote_to_bytes, urlsplit
 from uuid import UUID
@@ -20,8 +25,10 @@ from .control import serve_control
 from .filesystem import ImmichFilesystem
 from .immich import (
     ImmichClient,
+    ImmichError,
     ImmichPageLimitError,
     ImmichResponseError,
+    ImmichRetryableError,
     ImmichUnavailableError,
     MUTATION_PERMISSIONS,
     READ_PERMISSIONS,
@@ -29,14 +36,21 @@ from .immich import (
     UPLOAD_PERMISSIONS,
 )
 from .library import Library
+from .model import Asset
 from .previewer import populate_previews
-from .settings import Settings, cache_path, load_api_key, runtime_path, state_path
+from .settings import Settings, cache_path, data_path, load_api_key, runtime_path, state_path
 from .thumbnails import prepare_thumbnail_cache
+from .uploads import UploadErrorCode, UploadQueue, UploadQueueError, UploadState, UploadStatus
 
 
 LOGGER = logging.getLogger(__name__)
 FULL_REFRESH_SECONDS = 24 * 60 * 60
 OFFLINE_RETRY_DELAYS = (5, 10, 20, 40, 60)
+UPLOAD_RETRY_DELAYS = (5, 10, 20, 40, 60)
+
+
+class _PreviewSuppressionError(OSError):
+    pass
 
 
 class _RestoreJob:
@@ -46,6 +60,12 @@ class _RestoreJob:
         self.asset_id = asset_id
         self.done = trio.Event()
         self.failed = False
+
+
+async def _queue_call(
+    function: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    return await trio.to_thread.run_sync(partial(function, *args, **kwargs))
 
 
 def _check_mountpoint(path: Path) -> None:
@@ -252,6 +272,170 @@ async def _pin_worker(
                 inflight.discard(asset_id)
 
 
+def _upload_retry_at(attempt_count: int) -> int:
+    delay = UPLOAD_RETRY_DELAYS[
+        min(max(attempt_count, 1) - 1, len(UPLOAD_RETRY_DELAYS) - 1)
+    ]
+    return time.time_ns() + delay * 1_000_000_000
+
+
+def _upload_matches(job: UploadStatus, asset: Asset, marker: str) -> bool:
+    try:
+        checksum = base64.b64decode(asset.checksum, validate=True).hex()
+    except (ValueError, TypeError):
+        return False
+    return (
+        marker == job.id
+        and asset.visible
+        and asset.owner_id == job.owner_id
+        and asset.library_id is None
+        and asset.size == job.size
+        and job.sha1 is not None
+        and hmac.compare_digest(checksum, job.sha1)
+    )
+
+
+async def _process_upload(
+    queue: UploadQueue,
+    catalog: Catalog,
+    catalog_lock: trio.Lock,
+    library: Library,
+    read_client: ImmichClient,
+    settings: Settings,
+    job: UploadStatus,
+    on_uploaded: Callable[[CatalogAsset], Awaitable[None]],
+) -> None:
+    if job.server_origin != settings.server_origin:
+        await _queue_call(queue.block, job.id, UploadErrorCode.PROFILE_MISMATCH)
+        return
+    if not library.mutation_enabled:
+        return
+    mutation, session = library.upload_access()
+    if session.owner_id != job.owner_id:
+        await _queue_call(queue.block, job.id, UploadErrorCode.PROFILE_MISMATCH)
+        return
+
+    current = job
+    try:
+        current, descriptor = await _queue_call(queue.open_attempt, current.id)
+        try:
+            result = (
+                await mutation.upload(
+                    descriptor,
+                    current.requested_name,
+                    session.media_types,
+                    current.id,
+                )
+                if current.candidate_asset_id is None
+                else None
+            )
+        finally:
+            os.close(descriptor)
+        if result is not None:
+            current = await _queue_call(
+                queue.record_candidate, current.id, result.asset_id
+            )
+
+        assert current.candidate_asset_id is not None
+        asset = await read_client.asset(current.candidate_asset_id)
+        marker = await read_client.asset_metadata(current.candidate_asset_id)
+        if not _upload_matches(current, asset, marker):
+            await _queue_call(
+                queue.block, current.id, UploadErrorCode.CANDIDATE_MISMATCH
+            )
+            return
+
+        async with catalog_lock:
+            entry = catalog.add_uploaded(asset, current.requested_name)
+            await on_uploaded(entry)
+        await _queue_call(queue.commit, current.id)
+    except (ImmichUnavailableError, ImmichRetryableError):
+        await _queue_call(
+            queue.retry,
+            current.id,
+            at_ns=_upload_retry_at(current.attempt_count),
+            error=UploadErrorCode.UPLOAD_UNAVAILABLE,
+        )
+    except ImmichResponseError:
+        if current.candidate_asset_id is None:
+            await _queue_call(
+                queue.retry,
+                current.id,
+                at_ns=_upload_retry_at(current.attempt_count),
+                error=UploadErrorCode.AMBIGUOUS_RESPONSE,
+            )
+        else:
+            await _queue_call(
+                queue.block, current.id, UploadErrorCode.CANDIDATE_MISMATCH
+            )
+    except ImmichError:
+        await _queue_call(queue.block, current.id, UploadErrorCode.UPLOAD_REJECTED)
+    except UploadQueueError as error:
+        LOGGER.warning("upload queue rejected a job: %s", type(error).__name__)
+    except _PreviewSuppressionError:
+        await _queue_call(queue.block, current.id, UploadErrorCode.LOCAL_STATE_FAILED)
+        raise
+    except Exception as error:
+        await _queue_call(queue.block, current.id, UploadErrorCode.LOCAL_STATE_FAILED)
+        LOGGER.warning("upload job was blocked: %s", type(error).__name__)
+    else:
+        try:
+            await _queue_call(queue.remove, current.id)
+        except Exception as error:
+            LOGGER.warning(
+                "could not remove committed upload job: %s", type(error).__name__
+            )
+
+
+def _next_upload_delay(queue: UploadQueue) -> float | None:
+    now = time.time_ns()
+    due = [
+        job.next_attempt_ns
+        for job in queue.list()
+        if job.state in {UploadState.PENDING, UploadState.ATTEMPTING}
+        and job.next_attempt_ns is not None
+        and job.next_attempt_ns > now
+    ]
+    return max(0.0, (min(due) - now) / 1_000_000_000) if due else None
+
+
+async def _upload_worker(
+    queue: UploadQueue,
+    catalog: Catalog,
+    catalog_lock: trio.Lock,
+    library: Library,
+    read_client: ImmichClient,
+    settings: Settings,
+    notifications: trio.MemoryReceiveChannel[bool],
+    online: list[bool],
+    on_uploaded: Callable[[CatalogAsset], Awaitable[None]],
+) -> None:
+    while True:
+        ready = online[0] and library.mutation_enabled
+        job = await _queue_call(queue.next_due) if ready else None
+        if job is not None:
+            await _process_upload(
+                queue,
+                catalog,
+                catalog_lock,
+                library,
+                read_client,
+                settings,
+                job,
+                on_uploaded,
+            )
+            continue
+        delay = await _queue_call(_next_upload_delay, queue) if ready else None
+        try:
+            if delay is None:
+                await notifications.receive()
+            else:
+                with trio.move_on_after(delay):
+                    await notifications.receive()
+        except trio.EndOfChannel:
+            return
+
+
 async def _restore_worker(
     library: Library,
     notifications: trio.MemoryReceiveChannel[bool],
@@ -336,6 +520,7 @@ async def _offline_worker(
     online: list[bool],
     pin_requests: trio.MemorySendChannel[bool],
     pin_pending: dict[str, CatalogAsset],
+    upload_requests: trio.MemorySendChannel[bool],
     *,
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> None:
@@ -387,6 +572,10 @@ async def _offline_worker(
             assert mutation_session is not None
             library.enable_mutations(mutation_client, mutation_session)
         online[0] = True
+        try:
+            upload_requests.send_nowait(True)
+        except trio.WouldBlock:
+            pass
         full_requested[0] = False
         persisted_pins = catalog.pinned_ids()
         for entry in library.list():
@@ -457,7 +646,13 @@ async def run_service(settings: Settings) -> None:
     mutation_clients: list[ImmichClient] = []
     try:
         state_root = state_path()
-        with Catalog(state_root / "catalog.db") as catalog:
+        with (
+            Catalog(state_root / "catalog.db") as catalog,
+            UploadQueue(
+                data_path() / "uploads",
+                minimum_free_bytes=settings.minimum_free_bytes,
+            ) as upload_queue,
+        ):
             catalog_lock = trio.Lock()
             stored_profile = catalog.trusted_profile()
             if (
@@ -523,7 +718,6 @@ async def run_service(settings: Settings) -> None:
             )
             library = Library(
                 catalog,
-                read_client,
                 content_cache,
                 settings,
                 mutation_client=mutation_client,
@@ -534,6 +728,7 @@ async def run_service(settings: Settings) -> None:
             requests, refreshes = trio.open_memory_channel[bool](1)
             pin_requests, pins = trio.open_memory_channel[bool](1)
             restore_requests, restores = trio.open_memory_channel[bool](1)
+            upload_requests, uploads = trio.open_memory_channel[bool](1)
             pin_pending: dict[str, CatalogAsset] = {}
             pin_inflight: set[str] = set()
             restore_pending: list[_RestoreJob] = []
@@ -549,6 +744,8 @@ async def run_service(settings: Settings) -> None:
                         pin_pending[entry.asset.id] = entry
             if pin_pending:
                 pin_requests.send_nowait(True)
+            if online[0] and await _queue_call(upload_queue.next_due) is not None:
+                upload_requests.send_nowait(True)
             full_requested = [False]
             mount_ready = trio.Event()
             fatal_errors: list[str] = []
@@ -566,16 +763,45 @@ async def run_service(settings: Settings) -> None:
                         )
                 except Exception:
                     fatal_errors.append("preview suppression failed; mount terminated")
-                    raise
+                    raise _PreviewSuppressionError(
+                        "preview suppression failed"
+                    ) from None
+                try:
+                    await trio.to_thread.run_sync(
+                        pyfuse3.invalidate_entry,
+                        pyfuse3.ROOT_INODE,
+                        entry.name.encode("utf-8"),
+                        0,
+                    )
+                except (OSError, RuntimeError) as error:
+                    LOGGER.warning(
+                        "could not invalidate uploaded name: %s", type(error).__name__
+                    )
                 try:
                     requests.send_nowait(False)
                 except trio.WouldBlock:
                     pass
 
+            def on_pending() -> None:
+                try:
+                    upload_requests.send_nowait(True)
+                except trio.WouldBlock:
+                    pass
+
+            async def current_uploads() -> tuple[UploadStatus, ...]:
+                return tuple(
+                    job
+                    for job in await _queue_call(upload_queue.list)
+                    if job.server_origin == settings.server_origin
+                    and job.owner_id == trusted_profile.owner_id
+                )
+
             filesystem = ImmichFilesystem(
                 library,
-                cache_root / "uploads",
-                on_uploaded=on_uploaded,
+                upload_queue,
+                settings.server_origin,
+                trusted_profile.owner_id,
+                on_pending=on_pending,
             )
 
             async def status(params: dict[str, Any]) -> dict[str, Any]:
@@ -584,7 +810,104 @@ async def run_service(settings: Settings) -> None:
                 result = asdict(catalog.stats())
                 result["online"] = online[0]
                 result["mutation_enabled"] = library.mutation_enabled
+                result["pending_uploads"] = len(await current_uploads())
+                result["upload_quarantined"] = await trio.to_thread.run_sync(
+                    lambda: upload_queue.quarantined_count
+                )
                 return result
+
+            async def list_uploads(params: dict[str, Any]) -> dict[str, object]:
+                if set(params) != {"after", "limit"}:
+                    raise ValueError("uploads requires a cursor and limit")
+                after = params["after"]
+                limit = params["limit"]
+                if type(limit) is not int or not 1 <= limit <= 32:
+                    raise ValueError("uploads limit must be between 1 and 32")
+                if after is not None:
+                    if not isinstance(after, str) or str(UUID(after)) != after:
+                        raise ValueError("uploads cursor must be a canonical UUID")
+                jobs = list(await current_uploads())
+                start = 0
+                if after is not None:
+                    matches = [index for index, job in enumerate(jobs) if job.id == after]
+                    if len(matches) != 1:
+                        raise ValueError("uploads cursor is unknown")
+                    start = matches[0] + 1
+                page = jobs[start : start + limit]
+                more = start + len(page) < len(jobs)
+                return {
+                    "items": [
+                        {
+                            "id": job.id,
+                            "name": job.requested_name,
+                            "state": job.state.value,
+                            "size": job.size,
+                            "error": job.error.value if job.error is not None else None,
+                            "revision": job.revision,
+                        }
+                        for job in page
+                    ],
+                    "next": page[-1].id if more and page else None,
+                }
+
+            async def retry_upload(params: dict[str, Any]) -> dict[str, object]:
+                if set(params) != {"id"} or not isinstance(params["id"], str):
+                    raise ValueError("retry-upload requires one canonical job UUID")
+                if not library.mutation_enabled:
+                    raise PermissionError("mutations are disabled")
+                job_id = str(UUID(params["id"]))
+                if job_id != params["id"]:
+                    raise ValueError("retry-upload requires one canonical job UUID")
+                job = await _queue_call(upload_queue.status, job_id)
+                if job is None:
+                    raise ValueError("unknown upload job")
+                if (
+                    job.server_origin != settings.server_origin
+                    or job.owner_id != trusted_profile.owner_id
+                ):
+                    raise PermissionError("upload job belongs to another Profile")
+                await _queue_call(
+                    upload_queue.retry,
+                    job_id,
+                    at_ns=0,
+                    revision=job.revision,
+                )
+                try:
+                    upload_requests.send_nowait(True)
+                except trio.WouldBlock:
+                    pass
+                return {"id": job_id, "scheduled": True}
+
+            async def cancel_upload(params: dict[str, Any]) -> dict[str, object]:
+                if set(params) != {"id", "revision", "confirm_name"}:
+                    raise ValueError("cancel-upload requires exact confirmation")
+                job_id = params["id"]
+                revision = params["revision"]
+                name = params["confirm_name"]
+                if (
+                    not isinstance(job_id, str)
+                    or str(UUID(job_id)) != job_id
+                    or type(revision) is not int
+                    or revision < 0
+                    or not isinstance(name, str)
+                    or not name
+                ):
+                    raise ValueError("cancel-upload requires exact confirmation")
+                job = await _queue_call(upload_queue.status, job_id)
+                if job is None:
+                    raise ValueError("unknown upload job")
+                if (
+                    job.server_origin != settings.server_origin
+                    or job.owner_id != trusted_profile.owner_id
+                ):
+                    raise PermissionError("upload job belongs to another Profile")
+                await _queue_call(
+                    upload_queue.cancel,
+                    job_id,
+                    requested_name=name,
+                    revision=revision,
+                )
+                return {"id": job_id, "cancelled": True}
 
             async def refresh(params: dict[str, Any]) -> dict[str, bool]:
                 if params:
@@ -768,6 +1091,8 @@ async def run_service(settings: Settings) -> None:
                 pins,
                 restore_requests,
                 restores,
+                upload_requests,
+                uploads,
                 trio.open_nursery() as nursery,
             ):
                 if online[0]:
@@ -812,6 +1137,7 @@ async def run_service(settings: Settings) -> None:
                         online,
                         pin_requests,
                         pin_pending,
+                        upload_requests,
                     )
                 _check_mountpoint(settings.mount_path)
                 pyfuse3.init(
@@ -831,6 +1157,9 @@ async def run_service(settings: Settings) -> None:
                             "describe": describe,
                             "pin": pin,
                             "restore": restore,
+                            "uploads": list_uploads,
+                            "retry-upload": retry_upload,
+                            "cancel-upload": cancel_upload,
                         },
                     )
                     nursery.start_soon(
@@ -848,6 +1177,18 @@ async def run_service(settings: Settings) -> None:
                         restore_pending,
                         restore_jobs,
                         requests,
+                    )
+                    nursery.start_soon(
+                        _upload_worker,
+                        upload_queue,
+                        catalog,
+                        catalog_lock,
+                        library,
+                        read_client,
+                        settings,
+                        uploads,
+                        online,
+                        on_uploaded,
                     )
                     nursery.start_soon(
                         _periodic_refresh,

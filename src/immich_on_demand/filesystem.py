@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import errno
 import logging
 import os
 from pathlib import Path
 import stat
-import tempfile
 import time
 
 import pyfuse3
@@ -16,6 +15,7 @@ import trio
 from .catalog import CatalogAsset
 from .library import Library, LibraryError
 from .model import safe_filename
+from .uploads import UploadErrorCode, UploadQueue, WritableUpload
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,14 +26,19 @@ _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 class _StagedFile:
     inode: int
     name: str
-    directory: Path
-    path: Path
-    descriptor: int
+    draft: WritableUpload
     open_handles: int = 1
-    uploaded: CatalogAsset | None = None
     closed: bool = False
     failure_errno: int | None = None
     lock: trio.Lock = field(default_factory=trio.Lock)
+
+    @property
+    def descriptor(self) -> int:
+        return self.draft.descriptor
+
+    @property
+    def path(self) -> Path:
+        return self.draft.payload_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +49,7 @@ class _StagedHandle:
     append: bool
 
 
-UploadCallback = Callable[[CatalogAsset], Awaitable[None]]
+PendingCallback = Callable[[], None]
 
 
 class ImmichFilesystem(pyfuse3.Operations):
@@ -53,19 +58,18 @@ class ImmichFilesystem(pyfuse3.Operations):
     def __init__(
         self,
         library: Library,
-        staging_root: Path,
+        upload_queue: UploadQueue,
+        server_origin: str,
+        owner_id: str,
         *,
-        on_uploaded: UploadCallback | None = None,
+        on_pending: PendingCallback | None = None,
     ) -> None:
         super().__init__()
         self.library = library
-        self.staging_root = staging_root
-        self._on_uploaded = on_uploaded
-        staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = os.lstat(staging_root)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            raise PermissionError("upload recovery root must be a directory owned by this user")
-        os.chmod(staging_root, 0o700)
+        self.upload_queue = upload_queue
+        self.server_origin = server_origin
+        self.owner_id = owner_id
+        self._on_pending = on_pending
         self._started_ns = time.time_ns()
         self._next_handle = 1
         self._next_staged_inode = 1 << 63
@@ -122,18 +126,7 @@ class ImmichFilesystem(pyfuse3.Operations):
         staged = self._staged_inodes.get(inode)
         if staged is not None:
             if staged.closed:
-                if staged.uploaded is None:
-                    raise pyfuse3.FUSEError(errno.ENOENT)
-                entry = staged.uploaded
-                assert entry.asset.size is not None
-                return self._stat(
-                    staged.inode,
-                    stat.S_IFREG | 0o400,
-                    entry.asset.size,
-                    entry.asset.modified_ns,
-                    entry.asset.created_ns,
-                    1,
-                )
+                raise pyfuse3.FUSEError(errno.ENOENT)
             value = os.fstat(staged.descriptor)
             return self._stat(
                 inode,
@@ -234,25 +227,27 @@ class ImmichFilesystem(pyfuse3.Operations):
         readable, writable = self._access(flags)
         async with staged.lock:
             if staged.closed:
-                uploaded = staged.uploaded
+                raise pyfuse3.FUSEError(errno.ENOENT)
             else:
                 if flags & os.O_TRUNC:
                     if not writable:
                         raise pyfuse3.FUSEError(errno.EACCES)
                     try:
-                        os.ftruncate(staged.descriptor, 0)
+                        await trio.to_thread.run_sync(
+                            self.upload_queue.truncate, staged.draft, 0
+                        )
                     except OSError as error:
                         staged.failure_errno = error.errno or errno.EIO
                         raise pyfuse3.FUSEError(staged.failure_errno) from error
+                    except Exception as error:
+                        staged.failure_errno = errno.EIO
+                        raise pyfuse3.FUSEError(errno.EIO) from error
                 handle = self._handle()
                 staged.open_handles += 1
                 self._staged_handles[handle] = _StagedHandle(
                     staged, readable, writable, bool(flags & os.O_APPEND)
                 )
                 return pyfuse3.FileInfo(fh=handle, direct_io=True)
-        if uploaded is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-        return self._open_remote(uploaded, flags)
 
     async def read(self, fh: int, off: int, size: int) -> bytes:
         staged_handle = self._staged_handles.get(fh)
@@ -285,7 +280,7 @@ class ImmichFilesystem(pyfuse3.Operations):
         if staged_handle is None:
             raise pyfuse3.FUSEError(errno.EBADF)
         staged = staged_handle.staged
-        failed = False
+        pending = False
         async with staged.lock:
             if self._staged_handles.pop(fh, None) is None:
                 raise pyfuse3.FUSEError(errno.EBADF)
@@ -294,11 +289,21 @@ class ImmichFilesystem(pyfuse3.Operations):
                 return
             if staged.failure_errno is None:
                 try:
-                    await self._upload(staged)
-                except pyfuse3.FUSEError:
-                    failed = True
-            else:
-                failed = True
+                    await trio.to_thread.run_sync(self.upload_queue.seal, staged.draft)
+                    pending = True
+                except Exception as error:
+                    staged.failure_errno = (
+                        error.errno if isinstance(error, OSError) and error.errno else errno.EIO
+                    )
+            if not pending:
+                try:
+                    await trio.to_thread.run_sync(
+                        self.upload_queue.block_writing,
+                        staged.draft,
+                        UploadErrorCode.LOCAL_WRITE_FAILED,
+                    )
+                except Exception as error:
+                    LOGGER.error("could not record failed local upload %s: %s", staged.name, error)
             try:
                 os.close(staged.descriptor)
             except OSError as error:
@@ -316,7 +321,13 @@ class ImmichFilesystem(pyfuse3.Operations):
             if error.errno != errno.ENOENT:
                 LOGGER.warning("could not invalidate promoted name %s: %s", staged.name, error)
         self._staged_inodes.pop(staged.inode, None)
-        if failed:
+        if pending:
+            if self._on_pending is not None:
+                try:
+                    self._on_pending()
+                except Exception as error:
+                    LOGGER.error("could not wake upload worker for %s: %s", staged.name, error)
+        else:
             LOGGER.error("upload failed; recovery retained at %s", staged.path)
 
     async def create(
@@ -333,19 +344,33 @@ class ImmichFilesystem(pyfuse3.Operations):
         if not self.library.mutation_enabled:
             raise pyfuse3.FUSEError(errno.EROFS)
         decoded = self._name(name)
-        if decoded in self._staged_names or self.library.lookup(decoded) is not None:
-            raise pyfuse3.FUSEError(errno.EEXIST)
-        directory = Path(tempfile.mkdtemp(prefix=".upload-", dir=self.staging_root))
-        os.chmod(directory, 0o700)
-        path = directory / decoded
         try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-        except BaseException:
-            directory.rmdir()
-            raise
+            queued_name = any(
+                job.requested_name == decoded
+                for job in await trio.to_thread.run_sync(self.upload_queue.list)
+            )
+        except Exception as error:
+            raise pyfuse3.FUSEError(errno.EIO) from error
+        if (
+            decoded in self._staged_names
+            or queued_name
+            or self.library.lookup(decoded) is not None
+        ):
+            raise pyfuse3.FUSEError(errno.EEXIST)
+        try:
+            draft = await trio.to_thread.run_sync(
+                self.upload_queue.begin,
+                decoded,
+                self.server_origin,
+                self.owner_id,
+            )
+        except OSError as error:
+            raise pyfuse3.FUSEError(error.errno or errno.EIO) from error
+        except Exception as error:
+            raise pyfuse3.FUSEError(errno.EIO) from error
         inode = self._next_staged_inode
         self._next_staged_inode += 1
-        staged = _StagedFile(inode, decoded, directory, path, descriptor)
+        staged = _StagedFile(inode, decoded, draft)
         handle = self._handle()
         readable, writable = self._access(flags)
         self._staged_handles[handle] = _StagedHandle(
@@ -363,10 +388,18 @@ class ImmichFilesystem(pyfuse3.Operations):
         async with staged.lock:
             try:
                 offset = os.fstat(staged.descriptor).st_size if staged_handle.append else off
-                written = os.pwrite(staged.descriptor, buf, offset)
+                written = await trio.to_thread.run_sync(
+                    self.upload_queue.write, staged.draft, offset, buf
+                )
             except OSError as error:
                 staged.failure_errno = error.errno or errno.EIO
                 raise pyfuse3.FUSEError(staged.failure_errno) from error
+            except ValueError as error:
+                staged.failure_errno = errno.EINVAL
+                raise pyfuse3.FUSEError(errno.EINVAL) from error
+            except Exception as error:
+                staged.failure_errno = errno.EIO
+                raise pyfuse3.FUSEError(errno.EIO) from error
             if written != len(buf):
                 staged.failure_errno = errno.EIO
                 raise pyfuse3.FUSEError(errno.EIO)
@@ -383,10 +416,13 @@ class ImmichFilesystem(pyfuse3.Operations):
             if staged.failure_errno is not None:
                 raise pyfuse3.FUSEError(staged.failure_errno)
             try:
-                os.fsync(staged.descriptor)
+                await trio.to_thread.run_sync(self.upload_queue.sync, staged.draft)
             except OSError as error:
                 staged.failure_errno = error.errno or errno.EIO
                 raise pyfuse3.FUSEError(staged.failure_errno) from error
+            except Exception as error:
+                staged.failure_errno = errno.EIO
+                raise pyfuse3.FUSEError(errno.EIO) from error
 
     async def fsync(self, fh: int, datasync: bool) -> None:
         if fh in self._reads:
@@ -399,17 +435,19 @@ class ImmichFilesystem(pyfuse3.Operations):
             if staged.failure_errno is not None:
                 raise pyfuse3.FUSEError(staged.failure_errno)
             try:
-                if datasync and hasattr(os, "fdatasync"):
-                    os.fdatasync(staged.descriptor)
-                else:
-                    os.fsync(staged.descriptor)
+                await trio.to_thread.run_sync(
+                    self.upload_queue.sync, staged.draft, datasync
+                )
             except OSError as error:
                 staged.failure_errno = error.errno or errno.EIO
                 raise pyfuse3.FUSEError(staged.failure_errno) from error
+            except Exception as error:
+                staged.failure_errno = errno.EIO
+                raise pyfuse3.FUSEError(errno.EIO) from error
 
     async def statfs(self, ctx: pyfuse3.RequestContext) -> pyfuse3.StatvfsData:
         try:
-            source = os.statvfs(self.staging_root)
+            source = os.statvfs(self.upload_queue.root)
         except OSError as error:
             raise pyfuse3.FUSEError(error.errno or errno.EIO) from error
         result = pyfuse3.StatvfsData()
@@ -423,31 +461,6 @@ class ImmichFilesystem(pyfuse3.Operations):
         result.f_favail = source.f_favail
         result.f_namemax = min(source.f_namemax, 255)
         return result
-
-    async def _upload(self, staged: _StagedFile) -> None:
-        try:
-            os.fsync(staged.descriptor)
-            uploaded = await self.library.upload_new(staged.path, staged.name)
-        except (ValueError, FileExistsError) as error:
-            code = errno.EEXIST if isinstance(error, FileExistsError) else errno.EINVAL
-            staged.failure_errno = code
-            raise pyfuse3.FUSEError(code) from error
-        except Exception as error:
-            staged.failure_errno = errno.EIO
-            raise pyfuse3.FUSEError(errno.EIO) from error
-        staged.uploaded = uploaded
-        with trio.CancelScope(shield=True):
-            if self._on_uploaded is not None:
-                try:
-                    await self._on_uploaded(uploaded)
-                except Exception as error:
-                    LOGGER.error("post-upload callback failed for %s: %s", staged.name, error)
-                    pyfuse3.terminate()
-            try:
-                staged.path.unlink()
-                staged.directory.rmdir()
-            except OSError:
-                LOGGER.warning("uploaded %s but could not remove its recovery file", staged.name)
 
     async def unlink(
         self, parent_inode: int, name: bytes, ctx: pyfuse3.RequestContext
@@ -498,7 +511,9 @@ class ImmichFilesystem(pyfuse3.Operations):
         async with staged.lock:
             try:
                 if fields.update_size:
-                    os.ftruncate(staged.descriptor, attr.st_size)
+                    await trio.to_thread.run_sync(
+                        self.upload_queue.truncate, staged.draft, attr.st_size
+                    )
                 if fields.update_atime or fields.update_mtime:
                     current = os.fstat(staged.descriptor)
                     os.utime(
@@ -513,6 +528,9 @@ class ImmichFilesystem(pyfuse3.Operations):
             except OSError as error:
                 staged.failure_errno = error.errno or errno.EIO
                 raise pyfuse3.FUSEError(staged.failure_errno) from error
+            except Exception as error:
+                staged.failure_errno = errno.EIO
+                raise pyfuse3.FUSEError(errno.EIO) from error
             return self._attributes(staged.inode)
 
     async def rename(self, *args: object) -> None:

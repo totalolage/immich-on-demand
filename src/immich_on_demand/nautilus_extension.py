@@ -161,6 +161,9 @@ class NautilusExtension(
         return [
             self._menu_item("refresh", "Refresh Immich", self._activate_refresh),
             self._menu_item(
+                "uploads", "Manage Pending Uploads", self._activate_settings
+            ),
+            self._menu_item(
                 "settings", "Immich On-Demand Settings", self._activate_settings
             ),
         ]

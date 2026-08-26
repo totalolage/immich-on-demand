@@ -71,6 +71,9 @@ class DesktopPackagingTests(unittest.TestCase):
             )
             wheel = next(Path(directory).glob("*.whl"))
             with ZipFile(wheel) as archive:
+                self.assertIn(
+                    "immich_on_demand/uploads.py", archive.namelist()
+                )
                 entry_points_name = next(
                     name
                     for name in archive.namelist()

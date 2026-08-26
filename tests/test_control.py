@@ -32,6 +32,36 @@ async def _raw_request(path: Path, data: bytes) -> tuple[dict[str, object], byte
 
 
 class ControlTests(unittest.TestCase):
+    def test_upload_methods_reach_registered_handlers(self) -> None:
+        async def handler(params: dict[str, object]) -> object:
+            return params
+
+        async def scenario(path: Path) -> None:
+            async with trio.open_nursery() as nursery:
+                await nursery.start(
+                    serve_control,
+                    path,
+                    {
+                        "uploads": handler,
+                        "retry-upload": handler,
+                        "cancel-upload": handler,
+                    },
+                )
+                for request_id, method in enumerate(
+                    ("uploads", "retry-upload", "cancel-upload"), start=1
+                ):
+                    with self.subTest(method=method):
+                        self.assertEqual(
+                            await send_request(
+                                path, request_id, method, {"request": method}
+                            ),
+                            {"request": method},
+                        )
+                nursery.cancel_scope.cancel()
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory) / "runtime" / "control.sock")
+
     def test_reports_an_absent_or_refused_service_without_leaking_its_path(self) -> None:
         async def scenario(root: Path) -> None:
             absent = root / "absent-secret" / "control.sock"
