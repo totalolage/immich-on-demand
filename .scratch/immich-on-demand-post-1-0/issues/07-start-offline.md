@@ -14,7 +14,7 @@ Persist the validated server origin, user identity, Immich version, exact read s
 - With Immich unreachable, a previously validated Profile mounts its catalog and reads complete cached originals.
 - Uncached reads and every remote mutation fail without changing local or remote state.
 - Reconnection revalidates identity and scopes and completes a stable full refresh before downloads or mutations resume.
-- A new Profile, changed server, changed user, changed read key, or changed key scope cannot use stale trust data.
+- A new local Profile or locally changed server or read key cannot use stale trust data. After the server responds, any changed user, version, or exact key scope refuses promotion before remote access resumes.
 
 ## Answer
 

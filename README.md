@@ -33,7 +33,7 @@ The service defers a newly sealed ordinary upload for one second so an editor ca
 
 By default, unlink is disabled. If you enable remote deletion, unlink moves an owned asset to Immich trash. The client refuses deletion when the server has disabled trash, and it never requests permanent deletion. Cache eviction is a separate local operation and never changes Immich.
 
-Previews are supported for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Development 1.4 installs a Preview for every alias but groups work by asset, so all aliases use at most one server Preview fetch. Its missing-preview queue follows the Nautilus sort saved for `All` and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Other Preview formats remain future work.
+Released 1.0 supports Previews for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Development 1.4 installs a Preview for every alias but groups work by asset, so all aliases use at most one server Preview fetch. Its missing-preview queue follows the Nautilus sort saved for `All` and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Development 1.4's broader image Preview behavior is described below.
 
 ## Build and install the Arch package
 
@@ -46,11 +46,13 @@ cd immich-on-demand/packaging
 makepkg -si
 ```
 
-`packaging/PKGBUILD` builds the tagged release named by `pkgver`, currently version 1.0.0 rather than the development source tree. The package installs the Python application and the `immich-on-demand.service` systemd user unit.
+`packaging/PKGBUILD` builds the tagged release named by `pkgver`, currently version 1.0.0 rather than the development source tree. The package installs the Python application and the `immich-on-demand.service` systemd user unit. Configure that package with the exact [v1.0.0 instructions](https://github.com/totalolage/immich-on-demand/blob/v1.0.0/README.md); its hostname-only Secret Service identity and mutation scopes differ from the development tree below.
 
 ## Store API keys in Secret Service
 
-For the current 1.4 development tree, create a read-only API key in Immich with exactly these permissions:
+The commands in this section are only for the current 1.4 development tree. Released 1.0 uses the tagged instructions linked above; do not give its mutation key the development-only `asset.copy` permission.
+
+Create a read-only API key in Immich with exactly these permissions:
 
 - `user.read`
 - `asset.read`
@@ -119,7 +121,7 @@ The service creates a missing mount directory. An existing mount directory must 
 
 The released 1.0 service requires Immich to be online at startup. If Immich becomes unavailable later, the running mount keeps its catalog and continues to serve cached originals. Reads of uncached originals fail until Immich returns.
 
-The development tree can start from trusted cached state after one successful online run. If Immich is unreachable, it mounts a safe, nonempty catalog in degraded mode. Cached originals remain readable, but uncached reads, Preview downloads, automatic Eviction, and every remote mutation stay disabled. The service retries validation and a stable full refresh in the background before it resumes network access. TLS, authentication, schema, identity, version, scope, and local trust failures still prevent the mount.
+The development tree can start from trusted cached state after one successful online run. If Immich is unreachable, it mounts a safe, nonempty catalog in degraded mode. Cached originals remain readable, but uncached reads, Preview downloads, automatic Eviction, and every remote mutation stay disabled. The service retries validation and a stable full refresh in the background before it resumes network access. Observable TLS, authentication, schema, identity, version, scope, and local trust failures prevent the mount or terminate degraded mode. A server-side identity or scope change cannot be detected while the origin is unreachable; reconnection detects it before remote access resumes.
 
 Development 1.4 uses Immich's bounded generated Preview for every image MIME type, including RAW and HEIF originals. Live Photo stills retain their explicit motion-video relationship across refreshes and Views, but the mount exposes and previews only the still. Composite playback, paired export/upload, and Asset replacement of Live Photos are not implemented.
 

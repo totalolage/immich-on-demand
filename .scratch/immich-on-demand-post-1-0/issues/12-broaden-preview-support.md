@@ -7,7 +7,7 @@ Blocked by: 09
 
 ## Scope
 
-Add formats only after representative files prove that Immich returns useful bounded Previews. Model Live Photos as related image and video assets without exposing hidden components as unrelated files.
+Use Immich's bounded generated Preview path for image formats without Hydration, but claim RAW or HEIF support only after representative files prove those Previews useful. Model Live Photos as related image and video assets without exposing hidden components as unrelated files.
 
 ## Acceptance
 

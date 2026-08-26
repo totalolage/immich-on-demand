@@ -12,7 +12,7 @@ Replace an existing `All` entry through the temp-file rename-over pattern. Immic
 ## Acceptance
 
 - The documented transaction has a recoverable outcome for failures before upload, after upload, and before retiring the previous asset.
-- Concurrent remote changes never cause silent data loss.
+- Source or album changes observed before retirement block and leave the old asset live. A change racing after the final read remains recoverable through Immich trash; the operation is not serializable.
 - Tests mutate only recorded Test assets and prove the old original is never overwritten in place.
 - Common save patterns from image editors produce one understandable result.
 
@@ -26,7 +26,7 @@ Only the All View accepts rename-over. Direct writes and truncation of an existi
 
 The worker waits one second before admitting a newly sealed ordinary upload. This delay covers the close-then-rename save sequence. A rename that arrives after admission returns `EBUSY`; add an explicit publish syscall only if Reference-system applications need a longer window.
 
-Concurrent source-record or album changes block retirement and leave the old asset live. Immich has no conditional or atomic copy-and-trash operation, so the transaction uses reversible trash and keeps both UUIDs in durable recovery state until local publication completes. Live acceptance may touch only newly recorded Test assets, never the Protected library.
+Source-record or album changes observed before retirement block and leave the old asset live. Immich has no conditional or atomic copy-and-trash operation, so a later remote change can race the final read. The transaction limits that window with fresh reads, uses reversible trash, and keeps both UUIDs in durable recovery state until local publication completes. Live acceptance may touch only newly recorded Test assets, never the Protected library.
 
 ## Remaining acceptance
 

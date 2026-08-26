@@ -50,5 +50,5 @@ Extend the released Flat library without weakening its safety rules. Incremental
 ## Deferred until evidence exists
 
 - Do not add a plugin framework, network control service, or second daemon.
-- Do not implement partial Hydration until Immich documents or reliably exposes byte ranges with a whole-file fallback.
+- Do not implement partial Hydration until every reopening criterion in issue 13 passes, including measured benefit, stable public-origin behavior, a strong byte validator or chunk hashes, and crash-safe whole-file fallback.
 - Do not infer the user's visible Nautilus viewport. Saved folder sort is the available supported priority signal.
