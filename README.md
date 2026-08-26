@@ -38,13 +38,13 @@ Create a read-only API key in Immich with exactly these permissions:
 - `asset.view`
 - `asset.download`
 
-Store the key under the server hostname. The following command reads the value without echoing it or placing it in shell history:
+Store the key under the canonical server origin. The following command reads the value without echoing it or placing it in shell history:
 
 ```bash
 read -rsp 'Read-only Immich API key: ' IMMICH_KEY && printf '\n'
 printf '%s' "$IMMICH_KEY" | secret-tool store \
   --label='Immich On-Demand read-only API key' \
-  application immich-on-demand server photos.example.com purpose read-only
+  application immich-on-demand server https://photos.example.com purpose read-only
 unset IMMICH_KEY
 ```
 
@@ -66,11 +66,11 @@ Store it with the `mutation` purpose:
 read -rsp 'Mutation Immich API key: ' IMMICH_KEY && printf '\n'
 printf '%s' "$IMMICH_KEY" | secret-tool store \
   --label='Immich On-Demand mutation API key' \
-  application immich-on-demand server photos.example.com purpose mutation
+  application immich-on-demand server https://photos.example.com purpose mutation
 unset IMMICH_KEY
 ```
 
-Replace `photos.example.com` with the hostname from the configured server URL. Do not include the scheme, port, or path.
+Replace `https://photos.example.com` with the configured HTTPS origin. Include a nondefault port, but do not include a path. On first use, a development build moves a version 1.0 hostname-only item for a default HTTPS origin to this canonical identity.
 
 ## Configure and run the service
 
@@ -91,7 +91,9 @@ The first `auth-check` validates Immich 3.0.3 and the exact read-only permission
 
 The service creates a missing mount directory. An existing mount directory must be empty, owned by the current user, and not a symbolic link.
 
-Startup deliberately requires Immich to be online. Before mounting, the service validates the configured keys, refreshes the catalog, and prepares Preview suppression. If Immich becomes unavailable later, the running mount keeps its catalog and continues to serve cached originals. Reads of uncached originals fail until Immich returns.
+The released 1.0 service requires Immich to be online at startup. If Immich becomes unavailable later, the running mount keeps its catalog and continues to serve cached originals. Reads of uncached originals fail until Immich returns.
+
+The development tree can start from trusted cached state after one successful online run. If Immich is unreachable, it mounts a safe, nonempty catalog in degraded mode. Cached originals remain readable, but uncached reads, Preview downloads, automatic Eviction, and every remote mutation stay disabled. The service retries validation and a stable full refresh in the background before it resumes network access. TLS, authentication, schema, identity, version, scope, and local trust failures still prevent the mount.
 
 In the development tree, routine background refreshes request only assets updated within an overlapping time window. These refreshes never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete sweeps before removing rows.
 
@@ -134,6 +136,8 @@ immich-on-demand unpin --asset 12345678-1234-4234-8234-123456789abc
 `pin` records the Pin before it downloads the original. A Pin protects a complete original from automatic and manual Eviction. If a download fails, the Pin remains and the next service start retries it. Run `pin` again to retry without restarting. The minimum free-space limit still applies.
 
 `pin-status` reports `pinned`, `cached`, `busy`, and `scheduled`. `unpin` removes the protection but keeps any cached bytes until normal Eviction removes them.
+
+`status` also reports `online`. While it is false, `mutation_enabled` is false and Pins without complete cached bytes wait for reconnection.
 
 Development builds also provide an explicit Restore command:
 
@@ -179,6 +183,8 @@ Immich On-Demand follows the XDG base-directory variables. Without overrides, it
 - Previews: `~/.cache/thumbnails/`
 - Control socket: `$XDG_RUNTIME_DIR/immich-on-demand/control.sock`
 
+Configured XDG base directories must be absolute paths. The service rejects a relative value before it opens local state.
+
 Original downloads use a private temporary file. The cache publishes the file only after its byte count and available checksum pass validation. An interrupted or invalid download never replaces a complete cache entry.
 
 The last close makes one upload attempt. A successful upload removes its staged copy. A failed upload or duplicate-content rejection is written to the service log and keeps the file below `uploads/` with mode `0600` in a directory with mode `0700`. FUSE release has no error return, so the application that closed the file cannot detect this failure. The service does not retry it. Copy the recovery file to a safe location, then copy it into the mount again when you are ready to retry. Delete the recovery copy only after the new asset appears in Immich.
@@ -201,7 +207,7 @@ Version 1.0 is available on GitHub. The package has not been published to the AU
 
 Albums, people, dates, and other views are also deferred. A future version may expose paths such as `{Albums,People,All,by Date}/asset.ext` and hardlink repeated views of the same asset.
 
-The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, and desktop controls. It also tracks AUR publication, offline behavior, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
+The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, trusted offline startup, and desktop controls. It also tracks AUR publication, queued uploads, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
 
 ## License
 

@@ -128,6 +128,33 @@ def library(
 
 
 class LibraryTest(unittest.TestCase):
+    def test_enabling_mutations_promotes_every_remote_route(self) -> None:
+        async def scenario(root: Path) -> None:
+            staged = root / "staged.jpg"
+            staged.write_bytes(b"hello")
+            mutation = MutationClient()
+            with Catalog(root / "catalog.db") as catalog:
+                mounted = library(
+                    catalog,
+                    root,
+                    read=ReadClient(asset()),
+                    remote_delete=True,
+                )
+                self.assertFalse(mounted.mutation_enabled)
+
+                mounted.enable_mutations(mutation, session())  # type: ignore[arg-type]
+
+                self.assertTrue(mounted.mutation_enabled)
+                uploaded = await mounted.upload_new(staged, "staged.jpg")
+                await mounted.remote_trash(uploaded)
+                await mounted.remote_restore(uploaded.asset.id)
+                self.assertEqual(mutation.uploads, 1)
+                self.assertEqual(mutation.trashes, [ASSET_ID])
+                self.assertEqual(mutation.restores, [ASSET_ID])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_lists_looks_up_and_reads_immutable_assets(self) -> None:
         async def scenario(root: Path) -> None:
             with Catalog(root / "catalog.db") as catalog:

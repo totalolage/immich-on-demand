@@ -46,6 +46,11 @@ class Library:
     def mutation_enabled(self) -> bool:
         return self._mutation_client is not None and self._mutation_session is not None
 
+    def enable_mutations(
+        self, mutation_client: ImmichClient, mutation_session: ServerSession
+    ) -> None:
+        self._mutation_client, self._mutation_session = mutation_client, mutation_session
+
     def lookup(self, identity: str | int) -> CatalogAsset | None:
         entry = (
             self._catalog.by_inode(identity)

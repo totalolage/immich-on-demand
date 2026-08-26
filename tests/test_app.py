@@ -12,7 +12,7 @@ from immich_on_demand.app import (
 from immich_on_demand.catalog import Catalog
 from immich_on_demand.immich import ImmichError, ServerSession
 from immich_on_demand.model import Asset
-from test_catalog import ASSET_ID, OTHER_ID, OWNER_ID, asset
+from test_catalog import ASSET_ID, OTHER_ID, OWNER_ID, asset, trusted_profile
 
 
 class FakeClient:
@@ -41,6 +41,50 @@ class IncrementalClient:
 
 
 class AppTest(unittest.TestCase):
+    def test_complete_refresh_commits_the_supplied_trusted_profile(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                with Catalog(Path(directory) / "catalog.db") as catalog:
+                    profile = trusted_profile()
+                    client = FakeClient([[[asset()]], [[asset()]]])
+                    session = ServerSession(OWNER_ID, "3.0.3", frozenset(), True)
+
+                    await refresh_catalog(
+                        catalog,
+                        client,  # type: ignore[arg-type]
+                        session,
+                        trio.Lock(),
+                        trusted_profile=profile,
+                    )
+
+                    self.assertEqual(catalog.trusted_profile(), profile)
+
+        trio.run(scenario)
+
+    def test_complete_refresh_rejects_trust_for_a_different_session(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                with Catalog(Path(directory) / "catalog.db") as catalog:
+                    profile = trusted_profile(
+                        owner_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                    )
+                    client = FakeClient([])
+                    session = ServerSession(OWNER_ID, "3.0.3", frozenset(), True)
+
+                    with self.assertRaisesRegex(ValueError, "session"):
+                        await refresh_catalog(
+                            catalog,
+                            client,  # type: ignore[arg-type]
+                            session,
+                            trio.Lock(),
+                            trusted_profile=profile,
+                        )
+
+                    self.assertEqual(client.calls, 0)
+                    self.assertIsNone(catalog.trusted_profile())
+
+        trio.run(scenario)
+
     def test_incremental_refresh_uses_overlap_and_upserts_later_duplicates(self) -> None:
         third_id = "32345678-1234-4234-8234-123456789abc"
 
@@ -170,6 +214,7 @@ class AppTest(unittest.TestCase):
                         page_count=1,
                     )
                     session = ServerSession(OWNER_ID, "3.0.3", frozenset(), True)
+                    profile = trusted_profile()
                     client = FakeClient(
                         [
                             [[asset(OTHER_ID, "other.jpg")]],
@@ -184,11 +229,13 @@ class AppTest(unittest.TestCase):
                             client,  # type: ignore[arg-type]
                             session,
                             trio.Lock(),
+                            trusted_profile=profile,
                         )
 
                     self.assertEqual(
                         [entry.asset.id for entry in catalog.list_visible()], [ASSET_ID]
                     )
+                    self.assertIsNone(catalog.trusted_profile())
 
         trio.run(scenario)
 

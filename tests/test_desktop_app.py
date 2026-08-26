@@ -414,7 +414,11 @@ class DesktopApplicationTests(unittest.TestCase):
         ):
             application = module.DesktopApplication()
             cases = (
-                ("status-ok", "Service is running."),
+                ("status-online", "Service is online."),
+                (
+                    "status-offline",
+                    "Service is offline; cached files remain available.",
+                ),
                 ("refresh-ok", "Refresh requested."),
                 ("evict-ok", "Eviction requested."),
                 ("pin-cached", "Pinned and cached."),
@@ -441,6 +445,55 @@ class DesktopApplicationTests(unittest.TestCase):
         )
         self.assertEqual(application._message.get_text(), "Invalid desktop action.")
         application.do_shutdown()
+
+    def test_status_action_requires_exact_online_and_counter_types(self) -> None:
+        module, _idle = _load_desktop_app()
+        base = {
+            "total": 7,
+            "visible": 6,
+            "missing_size": 1,
+            "trashed": 0,
+            "hidden": 0,
+            "offline": 0,
+            "mutation_enabled": False,
+        }
+
+        for online, expected in ((True, "status-online"), (False, "status-offline")):
+            relayed: list[str] = []
+
+            async def action(_name: str, _target=None, *, value=online):
+                return {**base, "online": value}
+
+            with (
+                mock.patch.object(module, "run_action", side_effect=action),
+                mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+            ):
+                result = module.trio.run(module._run_action_command, "status", None)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(relayed, [expected])
+
+        malformed = (
+            base,
+            {**base, "online": 1},
+            {**base, "online": True, "mutation_enabled": 0},
+            {**base, "online": True, "total": True},
+            {**base, "online": True, "extra": 0},
+        )
+        for response in malformed:
+            relayed = []
+
+            async def action(_name: str, _target=None, *, value=response):
+                return value
+
+            with (
+                mock.patch.object(module, "run_action", side_effect=action),
+                mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+            ):
+                result = module.trio.run(module._run_action_command, "status", None)
+
+            self.assertEqual(result, 1)
+            self.assertEqual(relayed, ["status-error"])
 
     def test_worker_bounds_pending_operations(self) -> None:
         module, idle = _load_desktop_app()

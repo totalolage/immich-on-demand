@@ -78,6 +78,97 @@ class Client:
 
 
 class ContentCacheTest(unittest.TestCase):
+    def test_disabled_downloads_reuse_a_complete_cache_after_restart(self) -> None:
+        content = b"trusted original"
+
+        async def scenario(root: Path) -> None:
+            await ContentCache(root, Client([content])).hydrate(  # type: ignore[arg-type]
+                asset(content)
+            )
+            client = Client([])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                downloads_enabled=False,
+            )
+
+            self.assertEqual(await cache.read(asset(content), 0, len(content)), content)
+            self.assertEqual(client.calls, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_disabled_downloads_leave_missing_and_corrupt_cache_untouched(self) -> None:
+        content = b"trusted original"
+
+        async def scenario(root: Path, corrupt: bool) -> None:
+            item = asset(content)
+            if corrupt:
+                original = root / item.id
+                original.write_bytes(b"x" * len(content))
+                os.utime(original, ns=(1, item.modified_ns))
+            unrelated = root / OTHER_ID
+            unrelated.write_bytes(b"keep")
+            before = {OTHER_ID: b"keep"}
+            if corrupt:
+                before[item.id] = b"x" * len(content)
+            for path in root.iterdir():
+                os.utime(path, ns=(1, path.stat().st_mtime_ns))
+            before_atimes = {
+                path.name: path.stat().st_atime_ns for path in root.iterdir()
+            }
+            client = Client([content])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                max_bytes=0,
+                downloads_enabled=False,
+            )
+
+            with self.assertRaisesRegex(
+                CacheError, "^original is unavailable while downloads are disabled$"
+            ):
+                await cache.hydrate(item)
+
+            self.assertEqual(client.calls, 0)
+            self.assertEqual(
+                {path.name: path.stat().st_atime_ns for path in root.iterdir()},
+                before_atimes,
+            )
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in root.iterdir()},
+                before,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for corrupt in (False, True):
+                with self.subTest(corrupt=corrupt):
+                    case = root / str(corrupt)
+                    case.mkdir()
+                    trio.run(scenario, case, corrupt)
+
+    def test_enabling_downloads_promotes_a_cache_miss_to_one_hydration(self) -> None:
+        content = b"trusted original"
+
+        async def scenario(root: Path) -> None:
+            client = Client([content])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                downloads_enabled=False,
+            )
+            with self.assertRaises(CacheError):
+                await cache.hydrate(asset(content))
+
+            cache.enable_downloads()
+
+            self.assertEqual((await cache.hydrate(asset(content))).read_bytes(), content)
+            self.assertEqual(client.calls, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_describe_reports_local_state_without_hashing_or_touching(self) -> None:
         content = b"cached"
         item = asset(content)

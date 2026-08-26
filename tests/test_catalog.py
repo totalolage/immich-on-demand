@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hmac
 import os
 from pathlib import Path
 import sqlite3
@@ -7,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from immich_on_demand.catalog import Catalog
+from immich_on_demand.catalog import Catalog, TrustedProfile
 from immich_on_demand.model import Asset
 
 
@@ -15,6 +16,19 @@ ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 LITERAL_ID = "17345678-1234-4234-8234-123456789abc"
 OTHER_ID = "22345678-1234-4234-8234-123456789abc"
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
+READ_SCOPES = frozenset({"asset.download", "asset.read", "asset.view", "user.read"})
+
+
+def trusted_profile(**changes: object) -> TrustedProfile:
+    values: dict[str, object] = {
+        "server_origin": "https://photos.example.test",
+        "owner_id": OWNER_ID,
+        "server_version": "3.0.3",
+        "read_permissions": READ_SCOPES,
+        "read_key_sha256": "a" * 64,
+    }
+    values.update(changes)
+    return TrustedProfile(**values)  # type: ignore[arg-type]
 
 
 def asset(asset_id: str = ASSET_ID, name: str = "photo.jpg") -> Asset:
@@ -36,6 +50,324 @@ def asset(asset_id: str = ASSET_ID, name: str = "photo.jpg") -> Asset:
 
 
 class CatalogTest(unittest.TestCase):
+    def test_requires_an_exact_complete_offline_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            profile = trusted_profile()
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=profile,
+                )
+
+                with patch(
+                    "immich_on_demand.catalog.hmac.compare_digest",
+                    wraps=hmac.compare_digest,
+                ) as compare_digest:
+                    self.assertIsNone(catalog.require_offline_profile(profile))
+
+                compare_digest.assert_called_once_with("a" * 64, "a" * 64)
+
+    def test_offline_profile_rejects_every_authority_mismatch_with_one_message(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            profile = trusted_profile()
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=profile,
+                )
+
+                mismatches = (
+                    trusted_profile(server_origin="https://other.example.test"),
+                    trusted_profile(
+                        owner_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                    ),
+                    trusted_profile(read_key_sha256="b" * 64),
+                )
+                for expected in mismatches:
+                    with self.subTest(expected=expected), self.assertRaisesRegex(
+                        ValueError,
+                        r"^catalog is not trusted for offline use$",
+                    ):
+                        catalog.require_offline_profile(expected)
+
+    def test_offline_profile_requires_a_completed_nonempty_full_refresh(self) -> None:
+        profile = trusted_profile()
+        for condition in ("missing_profile", "empty", "incomplete"):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "catalog.db"
+                with Catalog(database) as catalog:
+                    catalog.begin_refresh()
+                    catalog.stage([] if condition == "empty" else [asset()])
+                    catalog.finish_refresh(
+                        high_water_ms=1,
+                        page_count=1,
+                        trusted_profile=(
+                            None if condition == "missing_profile" else profile
+                        ),
+                    )
+                if condition == "incomplete":
+                    connection = sqlite3.connect(database)
+                    try:
+                        connection.execute(
+                            "UPDATE metadata SET value = 0 "
+                            "WHERE key = 'full_refresh_pages'"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+
+                with Catalog(database) as catalog, self.assertRaisesRegex(
+                    ValueError,
+                    r"^catalog is not trusted for offline use$",
+                ):
+                    catalog.require_offline_profile(profile)
+
+    def test_offline_profile_requires_sqlite_quick_check_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            profile = trusted_profile()
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=profile,
+                )
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE damaged(value INTEGER CHECK(value = 1));
+                    PRAGMA ignore_check_constraints = ON;
+                    INSERT INTO damaged VALUES (2);
+                    PRAGMA ignore_check_constraints = OFF;
+                    """
+                )
+                connection.commit()
+                self.assertNotEqual(
+                    connection.execute("PRAGMA quick_check").fetchall(), [("ok",)]
+                )
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog, self.assertRaisesRegex(
+                ValueError,
+                r"^catalog is not trusted for offline use$",
+            ):
+                catalog.require_offline_profile(profile)
+
+    def test_trusted_profile_schema_migrates_an_existing_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            with Catalog(database) as catalog:
+                catalog.add_uploaded(asset(), "photo.jpg")
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("DROP TABLE trusted_profile")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog:
+                self.assertIsNone(catalog.trusted_profile())
+                self.assertEqual(
+                    [entry.asset.id for entry in catalog.list_visible()], [ASSET_ID]
+                )
+
+    def test_full_refresh_persists_a_normalized_trusted_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            profile = trusted_profile(
+                server_origin="HTTPS://PHOTOS.EXAMPLE.TEST:443/",
+            )
+            self.assertEqual(profile.server_origin, "https://photos.example.test")
+            self.assertEqual(profile.format_version, 1)
+
+            with Catalog(database) as catalog:
+                self.assertIsNone(catalog.trusted_profile())
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=profile,
+                )
+                self.assertEqual(catalog.trusted_profile(), profile)
+
+            with Catalog(database) as catalog:
+                self.assertEqual(catalog.trusted_profile(), profile)
+                catalog.begin_refresh()
+                catalog.stage([asset(OTHER_ID, "other.jpg")])
+                catalog.finish_refresh(high_water_ms=2, page_count=1)
+                self.assertEqual(catalog.trusted_profile(), profile)
+
+    def test_trusted_profile_rejects_invalid_authority_fields(self) -> None:
+        invalid = (
+            {"format_version": 2},
+            {"server_origin": "http://photos.example.test"},
+            {"server_origin": "https://user@photos.example.test"},
+            {"server_origin": "https://photos.example.test/path"},
+            {"server_origin": "https://bad host"},
+            {"owner_id": "not-a-uuid"},
+            {"server_version": "3.0.4"},
+            {"read_permissions": set(READ_SCOPES)},
+            {"read_permissions": frozenset()},
+            {"read_permissions": READ_SCOPES - {"asset.download"}},
+            {"read_permissions": READ_SCOPES | {"asset.delete"}},
+            {"read_permissions": frozenset({"asset.read\n"})},
+            {"read_key_sha256": "A" * 64},
+            {"read_key_sha256": "a" * 63},
+        )
+        for changes in invalid:
+            with self.subTest(changes=changes), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                trusted_profile(**changes)
+
+    def test_rejects_malformed_persisted_trusted_profile(self) -> None:
+        corruptions = (
+            ("format_version", 2),
+            ("server_origin", "http://photos.example.test"),
+            ("owner_id", "not-a-uuid"),
+            ("server_version", "3.0.4"),
+            ("read_permissions", '["user.read","user.read"]'),
+            (
+                "read_permissions",
+                sqlite3.Binary(
+                    b'["asset.download","asset.read","asset.view","user.read"]'
+                ),
+            ),
+            ("read_permissions", "not-json"),
+            ("read_key_sha256", "A" * 64),
+        )
+        for column, value in corruptions:
+            with self.subTest(column=column), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "catalog.db"
+                with Catalog(database) as catalog:
+                    catalog.begin_refresh()
+                    catalog.stage([asset()])
+                    catalog.finish_refresh(
+                        high_water_ms=1,
+                        page_count=1,
+                        trusted_profile=trusted_profile(),
+                    )
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute(
+                        f"UPDATE trusted_profile SET {column} = ?", (value,)
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                with Catalog(database) as catalog:
+                    with self.assertRaisesRegex(ValueError, "invalid trusted profile"):
+                        catalog.trusted_profile()
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"^catalog is not trusted for offline use$",
+                    ):
+                        catalog.require_offline_profile(trusted_profile())
+
+    def test_full_refresh_rejects_a_profile_that_does_not_own_staged_assets(self) -> None:
+        other_owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+
+                with self.assertRaisesRegex(ValueError, "does not own"):
+                    catalog.finish_refresh(
+                        high_water_ms=1,
+                        page_count=1,
+                        trusted_profile=trusted_profile(owner_id=other_owner),
+                    )
+
+                self.assertIsNone(catalog.trusted_profile())
+                self.assertEqual(catalog.list_visible(), [])
+
+    def test_offline_profile_requires_every_asset_to_have_the_expected_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=trusted_profile(),
+                )
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "UPDATE assets SET owner_id = ?",
+                    ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog, self.assertRaisesRegex(
+                ValueError,
+                r"^catalog is not trusted for offline use$",
+            ):
+                catalog.require_offline_profile(trusted_profile())
+
+    def test_profile_and_asset_refresh_roll_back_together_on_sql_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            original_profile = trusted_profile()
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=original_profile,
+                )
+
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER reject_trusted_profile
+                    BEFORE INSERT ON trusted_profile
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced trust failure');
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset(OTHER_ID, "other.jpg")])
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "forced trust"):
+                    catalog.finish_refresh(
+                        high_water_ms=2,
+                        page_count=1,
+                        trusted_profile=trusted_profile(read_key_sha256="c" * 64),
+                    )
+
+                self.assertEqual(catalog.trusted_profile(), original_profile)
+                self.assertEqual(
+                    [entry.asset.id for entry in catalog.list_visible()], [ASSET_ID]
+                )
+                self.assertEqual(catalog.refresh_state(), (1, 1))
+
     def test_pin_schema_migrates_in_place_and_uses_existing_private_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -126,7 +458,7 @@ class CatalogTest(unittest.TestCase):
     def test_rejects_an_unsafe_database_before_opening_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
-            state.mkdir()
+            state.mkdir(mode=0o700)
             target = Path(directory) / "target"
             target.write_bytes(b"do not touch")
             database = state / "catalog.db"
@@ -187,12 +519,99 @@ class CatalogTest(unittest.TestCase):
                 with Catalog(database):
                     pass
 
+    @unittest.skipUnless(hasattr(os, "O_CLOEXEC"), "platform lacks O_CLOEXEC")
+    def test_database_descriptor_is_close_on_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            real_open = os.open
+            opened_flags: list[int] = []
+
+            def checked_open(path: Path, flags: int, mode: int = 0o777) -> int:
+                opened_flags.append(flags)
+                return real_open(path, flags, mode)
+
+            with patch(
+                "immich_on_demand.catalog.os.open", side_effect=checked_open
+            ):
+                with Catalog(database):
+                    pass
+
+            self.assertTrue(opened_flags)
+            self.assertTrue(all(flags & os.O_CLOEXEC for flags in opened_flags))
+
+    def test_rejects_nonprivate_catalog_state_before_sqlite_opens(self) -> None:
+        for case in ("directory", "database"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory) / "state"
+                state.mkdir(mode=0o700 if case == "database" else 0o755)
+                state.chmod(0o700 if case == "database" else 0o755)
+                database = state / "catalog.db"
+                if case == "database":
+                    database.write_bytes(b"")
+                    database.chmod(0o644)
+
+                with patch(
+                    "immich_on_demand.catalog.sqlite3.connect",
+                    side_effect=AssertionError("opened unsafe SQLite state"),
+                ) as connect:
+                    with self.assertRaisesRegex(PermissionError, case):
+                        Catalog(database)
+
+                connect.assert_not_called()
+
+    def test_rejects_hardlinked_database_before_sqlite_opens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            target = Path(directory) / "target"
+            target.write_bytes(b"")
+            target.chmod(0o600)
+            database = state / "catalog.db"
+            os.link(target, database)
+
+            with patch(
+                "immich_on_demand.catalog.sqlite3.connect",
+                side_effect=AssertionError("opened hardlinked database"),
+            ) as connect:
+                with self.assertRaisesRegex(PermissionError, "database"):
+                    Catalog(database)
+
+            connect.assert_not_called()
+
+    def test_rejects_nonprivate_or_hardlinked_sqlite_auxiliary_files(self) -> None:
+        for condition in ("mode", "hardlink"):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory) / "state"
+                state.mkdir(mode=0o700)
+                database = state / "catalog.db"
+                database.write_bytes(b"")
+                database.chmod(0o600)
+                auxiliary = Path(f"{database}-wal")
+                if condition == "mode":
+                    auxiliary.write_bytes(b"")
+                    auxiliary.chmod(0o644)
+                else:
+                    target = Path(directory) / "target"
+                    target.write_bytes(b"")
+                    target.chmod(0o600)
+                    os.link(target, auxiliary)
+
+                with patch(
+                    "immich_on_demand.catalog.sqlite3.connect",
+                    side_effect=AssertionError("opened unsafe SQLite state"),
+                ) as connect:
+                    with self.assertRaisesRegex(PermissionError, "auxiliary files"):
+                        Catalog(database)
+
+                connect.assert_not_called()
+
     def test_rejects_unsafe_sqlite_auxiliary_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
-            state.mkdir()
+            state.mkdir(mode=0o700)
             database = state / "catalog.db"
             database.write_bytes(b"")
+            database.chmod(0o600)
             target = Path(directory) / "target"
             target.write_bytes(b"do not touch")
             Path(f"{database}-wal").symlink_to(target)
@@ -210,7 +629,6 @@ class CatalogTest(unittest.TestCase):
     def test_creates_a_private_catalog_and_state_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
-            state.mkdir(mode=0o755)
             database = state / "catalog.db"
 
             with Catalog(database):

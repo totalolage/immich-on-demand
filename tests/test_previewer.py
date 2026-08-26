@@ -105,6 +105,69 @@ class PreviewerTest(unittest.TestCase):
 
         trio.run(scenario)
 
+    def test_disabled_downloads_suppress_without_mount_sort_or_network(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entries = [entry(1), entry(2), entry(3, "application/pdf")]
+                cached_source = root / "mount" / entries[0].name
+                missing_source = root / "mount" / entries[1].name
+                install_thumbnail(
+                    preview_bytes(),
+                    cached_source,
+                    4,
+                    124,
+                    cache_home=root / "cache",
+                )
+                stale = install_thumbnail(
+                    preview_bytes(),
+                    missing_source,
+                    3,
+                    125,
+                    cache_home=root / "cache",
+                    size="xx-large",
+                )
+                mount_ready = trio.Event()
+                task_status = Mock()
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        raise AssertionError("disabled preview fetched")
+
+                with (
+                    patch(
+                        "immich_on_demand.previewer._read_nautilus_sort",
+                        side_effect=AssertionError("disabled preview read Nautilus sort"),
+                    ),
+                    patch(
+                        "immich_on_demand.previewer.install_thumbnail",
+                        side_effect=AssertionError("disabled preview installed a success"),
+                    ),
+                ):
+                    stats = await populate_previews(
+                        entries,
+                        Client(),  # type: ignore[arg-type]
+                        root / "mount",
+                        cache_home=root / "cache",
+                        mount_ready=mount_ready,
+                        task_status=task_status,
+                        downloads_enabled=False,
+                    )
+
+                task_status.started.assert_called_once_with()
+                self.assertFalse(mount_ready.is_set())
+                self.assertEqual(stats, PreviewStats(3, 1, 1, 1))
+                self.assertTrue(thumbnail_cache_path(cached_source, root / "cache").exists())
+                self.assertFalse(stale.exists())
+                for item in entries:
+                    self.assertTrue(
+                        failed_thumbnail_path(
+                            root / "mount" / item.name, root / "cache"
+                        ).exists()
+                    )
+
+        trio.run(scenario)
+
     def test_installs_every_failure_record_before_first_network_call(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:

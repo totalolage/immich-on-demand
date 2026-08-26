@@ -3,12 +3,18 @@ from contextlib import aclosing
 import json
 import logging
 from pathlib import Path
+import ssl
 import tempfile
 
 import httpx
 import trio
 
-from immich_on_demand.immich import ImmichClient, ImmichError, ImmichPageLimitError
+from immich_on_demand.immich import (
+    ImmichClient,
+    ImmichError,
+    ImmichPageLimitError,
+    ImmichUnavailableError,
+)
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
@@ -35,6 +41,57 @@ def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
 
 
 class ImmichClientTest(unittest.TestCase):
+    def test_classifies_only_no_response_network_failures_as_unavailable(self) -> None:
+        async def scenario(error: Exception) -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise error
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichUnavailableError, "^Immich is unavailable$"
+                ):
+                    await client.validate()
+
+        for error in (
+            httpx.ConnectError("connection refused"),
+            httpx.ConnectTimeout("connect timed out"),
+            httpx.ReadError("connection lost"),
+            httpx.ReadTimeout("read timed out"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                trio.run(scenario, error)
+
+    def test_tls_and_protocol_failures_are_not_offline_availability(self) -> None:
+        async def scenario(error: Exception, message: str) -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise error
+
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(ImmichError, message) as raised:
+                    await client.validate()
+                self.assertNotIsInstance(raised.exception, ImmichUnavailableError)
+
+        tls = httpx.ConnectError("certificate verify failed")
+        bridge = trio.BrokenResourceError()
+        bridge.__context__ = ssl.SSLCertVerificationError(
+            "certificate verify failed"
+        )
+        tls.__cause__ = bridge
+        trio.run(scenario, tls, "^Immich TLS validation failed$")
+        trio.run(
+            scenario,
+            httpx.RemoteProtocolError("invalid HTTP"),
+            "^Immich transport validation failed$",
+        )
+
     def test_asset_pages_sends_an_inclusive_millisecond_update_bound(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)

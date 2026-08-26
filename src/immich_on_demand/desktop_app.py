@@ -25,7 +25,8 @@ _PROGRAM_NAME = "immich-on-demand-desktop"
 _PIN_POLL_SECONDS = 0.5
 _ACTION_WAIT_SECONDS = 300
 _RESULT_MESSAGES = {
-    "status-ok": "Service is running.",
+    "status-online": "Service is online.",
+    "status-offline": "Service is offline; cached files remain available.",
     "status-error": "Could not query service.",
     "refresh-ok": "Refresh requested.",
     "refresh-error": "Could not request refresh.",
@@ -102,18 +103,21 @@ async def _run_action_command(action: str, uri: str | None) -> int:
             "trashed",
             "hidden",
             "offline",
+            "online",
             "mutation_enabled",
         }
+        booleans = {"online", "mutation_enabled"}
         valid = (
             isinstance(result, dict)
             and set(result) == expected
-            and type(result["mutation_enabled"]) is bool
-            and all(
-                type(result[name]) is int
-                for name in expected - {"mutation_enabled"}
-            )
+            and all(type(result[name]) is bool for name in booleans)
+            and all(type(result[name]) is int for name in expected - booleans)
         )
-        _relay_result("status-ok" if valid else "status-error")
+        _relay_result(
+            f"status-{'online' if result['online'] else 'offline'}"
+            if valid
+            else "status-error"
+        )
         return 0 if valid else 1
     if action == "refresh":
         valid = result == {"scheduled": True}

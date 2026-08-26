@@ -11,9 +11,16 @@ from urllib.parse import urlsplit
 APP_ID = "immich-on-demand"
 
 
-def _xdg(name: str, fallback: str) -> Path:
+def _xdg(name: str, fallback: str | None = None) -> Path:
     value = os.environ.get(name)
-    return Path(value).expanduser() if value else Path.home() / fallback
+    if value:
+        path = Path(value)
+        if not path.is_absolute():
+            raise RuntimeError(f"{name} must be an absolute path")
+        return path
+    if fallback is None:
+        raise RuntimeError(f"{name} is not set")
+    return Path.home() / fallback
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,15 +34,26 @@ class Settings:
     remote_delete: bool = False
 
     def __post_init__(self) -> None:
-        parsed = urlsplit(self.server_url)
+        try:
+            parsed = urlsplit(self.server_url)
+            hostname = parsed.hostname
+            _ = parsed.port
+        except ValueError:
+            raise ValueError(
+                "server_url must be an HTTPS origin without credentials, query, or fragment"
+            ) from None
         if (
             parsed.scheme != "https"
-            or not parsed.hostname
+            or not hostname
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment
+            or any(
+                ord(character) <= 32 or ord(character) == 127
+                for character in parsed.netloc
+            )
         ):
             raise ValueError("server_url must be an HTTPS origin without credentials, query, or fragment")
         if not self.mount_path.is_absolute():
@@ -55,6 +73,18 @@ class Settings:
         assert hostname is not None
         return hostname
 
+    @property
+    def server_origin(self) -> str:
+        parsed = urlsplit(self.server_url)
+        hostname = parsed.hostname
+        assert hostname is not None
+        host = hostname.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        port = parsed.port
+        suffix = "" if port in {None, 443} else f":{port}"
+        return f"https://{host}{suffix}"
+
 
 def config_path() -> Path:
     return _xdg("XDG_CONFIG_HOME", ".config") / APP_ID / "config.json"
@@ -69,10 +99,7 @@ def cache_path() -> Path:
 
 
 def runtime_path() -> Path:
-    value = os.environ.get("XDG_RUNTIME_DIR")
-    if not value:
-        raise RuntimeError("XDG_RUNTIME_DIR is not set")
-    return Path(value) / APP_ID
+    return _xdg("XDG_RUNTIME_DIR") / APP_ID
 
 
 def _api_key_attributes(settings: Settings, purpose: str) -> dict[str, str]:
@@ -80,7 +107,7 @@ def _api_key_attributes(settings: Settings, purpose: str) -> dict[str, str]:
         raise ValueError("API key purpose must be read-only or mutation")
     return {
         "application": APP_ID,
-        "server": settings.server_name,
+        "server": settings.server_origin,
         "purpose": purpose,
     }
 
@@ -122,9 +149,17 @@ def save(settings: Settings, path: Path | None = None) -> Path:
 
 def load_api_key(settings: Settings, purpose: str = "read-only") -> str:
     attributes = _api_key_attributes(settings, purpose)
+    legacy_items: list[object] = []
+    migrated = False
     try:
         collection = _secret_collection()
         items = list(collection.search_items(attributes))
+        if len(items) <= 1 and urlsplit(settings.server_url).port in {None, 443}:
+            legacy_attributes = {**attributes, "server": settings.server_name}
+            legacy_items = list(collection.search_items(legacy_attributes))
+            if not items:
+                items = legacy_items
+                migrated = True
     except Exception as error:
         raise RuntimeError("could not read API key from Secret Service") from error
     if len(items) != 1:
@@ -146,6 +181,25 @@ def load_api_key(settings: Settings, purpose: str = "read-only") -> str:
         raise RuntimeError("could not read API key from Secret Service") from error
     if not secret:
         raise RuntimeError("Secret Service returned an empty API key")
+    try:
+        if migrated:
+            migrated_item = collection.create_item(
+                f"Immich On-Demand {purpose} API key",
+                attributes,
+                secret.encode("utf-8"),
+                replace=False,
+            )
+            canonical_items = list(collection.search_items(attributes))
+            if (
+                len(canonical_items) != 1
+                or canonical_items[0].item_path != migrated_item.item_path
+            ):
+                migrated_item.delete()
+                raise RuntimeError("canonical API key changed during migration")
+        for legacy_item in legacy_items:
+            legacy_item.delete()
+    except Exception as error:
+        raise RuntimeError("could not migrate API key in Secret Service") from error
     return secret
 
 
@@ -154,11 +208,18 @@ def store_api_key(settings: Settings, purpose: str, secret: str) -> None:
         raise ValueError("API key must not be empty")
     attributes = _api_key_attributes(settings, purpose)
     try:
-        _secret_collection().create_item(
+        collection = _secret_collection()
+        legacy_items = []
+        if urlsplit(settings.server_url).port in {None, 443}:
+            legacy_attributes = {**attributes, "server": settings.server_name}
+            legacy_items = list(collection.search_items(legacy_attributes))
+        collection.create_item(
             f"Immich On-Demand {purpose} API key",
             attributes,
             secret.encode("utf-8"),
             replace=True,
         )
+        for legacy_item in legacy_items:
+            legacy_item.delete()
     except Exception as error:
         raise RuntimeError("could not store API key in Secret Service") from error

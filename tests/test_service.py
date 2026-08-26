@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import hashlib
 from pathlib import Path
 import stat
 import tempfile
@@ -9,11 +10,12 @@ from unittest.mock import patch
 
 import trio
 
-from immich_on_demand.catalog import CatalogAsset, CatalogStats
+from immich_on_demand.catalog import CatalogAsset, CatalogStats, TrustedProfile
 from immich_on_demand.control import ControlError, send_request, serve_control
 from immich_on_demand.immich import (
     ImmichPageLimitError,
     ImmichResponseError,
+    ImmichUnavailableError,
     MUTATION_PERMISSIONS,
     ServerSession,
     UPLOAD_PERMISSIONS,
@@ -33,6 +35,16 @@ from immich_on_demand.settings import Settings
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 PINNED_ID = "aaaaaaaa-1234-4234-8234-123456789abc"
+
+
+def trusted_profile(read_key: str = "read") -> TrustedProfile:
+    return TrustedProfile(
+        "https://photos.example.test",
+        OWNER_ID,
+        "3.0.3",
+        frozenset({"user.read", "asset.read", "asset.view", "asset.download"}),
+        hashlib.sha256(read_key.encode()).hexdigest(),
+    )
 
 
 def upload_entry() -> CatalogAsset:
@@ -72,6 +84,8 @@ class ServiceFakes:
         pin_persist_error: bool = False,
         restore_error: Exception | None = None,
         block_restore: bool = False,
+        read_validation_error: Exception | None = None,
+        trusted_profile: TrustedProfile | None = None,
     ) -> None:
         self.root = root
         self.mutation = mutation
@@ -83,6 +97,8 @@ class ServiceFakes:
         self.pin_persist_error = pin_persist_error
         self.restore_error = restore_error
         self.block_restore = block_restore
+        self.read_validation_error = read_validation_error
+        self.trusted_profile_value = trusted_profile
         self.events: list[str] = []
         self.clients: list[ServiceFakes.Client] = []
         self.handlers: dict[str, object] = {}
@@ -103,6 +119,7 @@ class ServiceFakes:
         self.restore_gate = trio.Event()
         self.persisted_pins = {PINNED_ID}
         self.pin_hydrated = trio.Event()
+        self.promoted = trio.Event()
         outer = self
 
         class Client:
@@ -114,6 +131,8 @@ class ServiceFakes:
             async def validate(self, permissions: object = None) -> ServerSession:
                 self.validations.append(permissions)
                 outer.events.append(f"validate:{self.key}")
+                if self.key == "read" and outer.read_validation_error is not None:
+                    raise outer.read_validation_error
                 owner_id = mutation_owner if self.key == "mutation" else OWNER_ID
                 return ServerSession(owner_id, "3.0.3", frozenset({".jpg"}), True)
 
@@ -136,6 +155,13 @@ class ServiceFakes:
             def pinned_ids(self) -> frozenset[str]:
                 return frozenset(outer.persisted_pins)
 
+            def trusted_profile(self) -> TrustedProfile | None:
+                return outer.trusted_profile_value
+
+            def require_offline_profile(self, profile: TrustedProfile) -> None:
+                if profile != outer.trusted_profile_value:
+                    raise ValueError("catalog is not trusted for offline startup")
+
             def pin(self, asset_id: str) -> None:
                 if outer.pin_persist_error:
                     raise OSError("private catalog path")
@@ -156,10 +182,12 @@ class ServiceFakes:
                 max_bytes: int,
                 minimum_free_bytes: int,
                 pinned_ids: frozenset[str],
+                downloads_enabled: bool = True,
             ) -> None:
                 self.limit_calls: list[dict[str, int]] = []
                 self.asset_evictions: list[str] = []
                 self.pinned_ids = set(pinned_ids)
+                self.downloads_enabled = downloads_enabled
                 outer.cache = self
                 outer.events.append(f"cache:{path.relative_to(root)}")
                 outer.events.append(f"cache-policy:{max_bytes}:{minimum_free_bytes}")
@@ -188,6 +216,10 @@ class ServiceFakes:
             def unpin(self, asset_id: str) -> None:
                 self.pinned_ids.discard(asset_id)
 
+            def enable_downloads(self) -> None:
+                self.downloads_enabled = True
+                outer.events.append("downloads-enabled")
+
             async def hydrate(self, asset: Asset) -> Path:
                 outer.pin_hydrated.set()
                 return root / "cache" / "originals" / asset.id
@@ -211,10 +243,19 @@ class ServiceFakes:
             def list(self) -> list[object]:
                 return [upload_entry()]
 
+            def enable_mutations(
+                self, mutation_client: object, mutation_session: object
+            ) -> None:
+                self.mutation_enabled = True
+                outer.events.append("mutations-enabled")
+                outer.promoted.set()
+
             def lookup(self, identity: str | int) -> CatalogAsset | None:
                 return upload_entry() if identity == "new.jpg" else None
 
             async def remote_restore(self, asset_id: str) -> None:
+                if not self.mutation_enabled:
+                    raise PermissionError("mutations are disabled")
                 outer.restore_attempts.append(asset_id)
                 outer.restore_started.set()
                 if outer.block_restore:
@@ -242,7 +283,13 @@ class ServiceFakes:
         raise RuntimeError("expected one mutation API key in Secret Service, found 0")
 
     async def refresh(
-        self, catalog: object, client: object, session: object, catalog_lock: object
+        self,
+        catalog: object,
+        client: object,
+        session: object,
+        catalog_lock: object,
+        *,
+        trusted_profile: TrustedProfile | None = None,
     ) -> CatalogStats:
         self.catalog_locks.append(catalog_lock)
         self.events.append("refresh")
@@ -250,6 +297,8 @@ class ServiceFakes:
             self.second_refresh.set()
         if self.events.count("refresh") == self.refresh_error_call:
             raise OSError("Immich unavailable")
+        if trusted_profile is not None:
+            self.trusted_profile_value = trusted_profile
         return CatalogStats(7, 6, 1, 0, 0, 0)
 
     async def incremental_refresh(
@@ -276,14 +325,19 @@ class ServiceFakes:
         client: object,
         mount: Path,
         *,
-        mount_ready: trio.Event,
+        downloads_enabled: bool = True,
+        mount_ready: trio.Event | None = None,
         task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
     ) -> object:
         self.events.append("suppress")
         if self.events.count("suppress") == self.preview_error_call:
             raise OSError("thumbnail cache unavailable")
         task_status.started()
-        await mount_ready.wait()
+        if not downloads_enabled:
+            self.events.append("offline-suppress")
+            return None
+        if mount_ready is not None:
+            await mount_ready.wait()
         self.events.append("sort")
         self.events.append("fetch")
         if self.block_preview and self.events.count("fetch") == 1:
@@ -353,6 +407,139 @@ class ServiceFakes:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_matching_trust_mounts_offline_without_remote_or_eviction_work(self) -> None:
+        async def scenario(root: Path) -> ServiceFakes:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                read_validation_error=ImmichUnavailableError("unreachable"),
+                trusted_profile=trusted_profile(),
+            )
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+            with fakes.patches():
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    status = fakes.handlers["status"]
+                    self.assertEqual(
+                        await status({}),  # type: ignore[operator]
+                        {
+                            "total": 7,
+                            "visible": 6,
+                            "missing_size": 1,
+                            "trashed": 0,
+                            "hidden": 0,
+                            "offline": 0,
+                            "online": False,
+                            "mutation_enabled": False,
+                        },
+                    )
+                    self.assertNotIn("refresh", fakes.events)
+                    self.assertNotIn("fetch", fakes.events)
+                    self.assertFalse(any(event.startswith("evict:") for event in fakes.events))
+                    self.assertIn("offline-suppress", fakes.events)
+                    assert fakes.cache is not None
+                    self.assertFalse(fakes.cache.downloads_enabled)
+                    restore = fakes.handlers["restore"]
+                    with self.assertRaisesRegex(PermissionError, "mutations are disabled"):
+                        await restore({"asset": ASSET_ID})  # type: ignore[operator]
+                    await trio.lowlevel.checkpoint()
+                    fakes.stop_main.set()
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory:
+            fakes = trio.run(scenario, Path(directory))
+
+        self.assertEqual(
+            [event for event in fakes.events if event.startswith("validate:")],
+            ["validate:read"],
+        )
+        self.assertNotIn("validate:mutation", fakes.events)
+
+    def test_offline_refresh_promotes_only_after_validation_and_full_refresh(self) -> None:
+        async def scenario(root: Path) -> ServiceFakes:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                read_validation_error=ImmichUnavailableError("unreachable"),
+                trusted_profile=trusted_profile(),
+            )
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+            with fakes.patches():
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    fakes.read_validation_error = None
+                    refresh = fakes.handlers["refresh"]
+                    self.assertEqual(
+                        await refresh({}),  # type: ignore[operator]
+                        {"scheduled": True},
+                    )
+                    with trio.fail_after(0.2):
+                        await fakes.promoted.wait()
+                    status = fakes.handlers["status"]
+                    self.assertTrue((await status({}))["online"])  # type: ignore[operator]
+                    assert fakes.cache is not None
+                    self.assertTrue(fakes.cache.downloads_enabled)
+                    fakes.stop_main.set()
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory:
+            fakes = trio.run(scenario, Path(directory))
+
+        validation = len(fakes.events) - 1 - fakes.events[::-1].index("validate:read")
+        refresh = fakes.events.index("refresh")
+        downloads = fakes.events.index("downloads-enabled")
+        mutations = fakes.events.index("mutations-enabled")
+        self.assertLess(validation, refresh)
+        self.assertLess(refresh, downloads)
+        self.assertLess(downloads, mutations)
+        self.assertIn("close:mutation", fakes.events)
+
+    def test_offline_fallback_rejects_missing_trust_and_authoritative_errors(self) -> None:
+        async def scenario(
+            root: Path,
+            error: Exception,
+            with_trust: bool,
+            expected: type[Exception],
+        ) -> ServiceFakes:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                read_validation_error=error,
+                trusted_profile=trusted_profile() if with_trust else None,
+            )
+            settings = Settings("https://photos.example.test", root / "mount")
+            with fakes.patches(), self.assertRaises(expected):
+                await run_service(settings)
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = trio.run(
+                scenario,
+                Path(directory) / "missing",
+                ImmichUnavailableError("unreachable"),
+                False,
+                RuntimeError,
+            )
+            authoritative = trio.run(
+                scenario,
+                Path(directory) / "authoritative",
+                ImmichResponseError("invalid response"),
+                True,
+                ImmichResponseError,
+            )
+
+        self.assertNotIn("fuse-init", missing.events + authoritative.events)
+
     def test_restore_worker_does_not_retain_failed_jobs(self) -> None:
         async def scenario() -> None:
             class Library:
@@ -671,10 +858,38 @@ class ServiceTest(unittest.TestCase):
                         FULL_REFRESH_SECONDS,
                         True,
                         full_requested,
+                        [True],
                     )
             self.assertEqual(sleeps, [FULL_REFRESH_SECONDS, FULL_REFRESH_SECONDS])
             self.assertTrue(full_requested[0])
             self.assertTrue(refreshes.receive_nowait())
+
+        trio.run(scenario)
+
+    def test_periodic_refresh_is_silent_while_offline(self) -> None:
+        async def scenario() -> None:
+            calls = 0
+
+            async def stop_after_two_sleeps(seconds: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("stop")
+
+            requests, refreshes = trio.open_memory_channel[bool](1)
+            full_requested = [False]
+            with patch("immich_on_demand.service.trio.sleep", stop_after_two_sleeps):
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    await _periodic_refresh(
+                        requests,
+                        1,
+                        True,
+                        full_requested,
+                        [False],
+                    )
+            self.assertFalse(full_requested[0])
+            with self.assertRaises(trio.WouldBlock):
+                refreshes.receive_nowait()
 
         trio.run(scenario)
 
@@ -776,6 +991,7 @@ class ServiceTest(unittest.TestCase):
                             "trashed": 0,
                             "hidden": 0,
                             "offline": 0,
+                            "online": True,
                             "mutation_enabled": True,
                         },
                     )

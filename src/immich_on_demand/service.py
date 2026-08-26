@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ import pyfuse3
 import trio
 
 from .app import FullRefreshRequired, refresh_catalog, refresh_catalog_incremental
-from .catalog import Catalog, CatalogAsset
+from .catalog import Catalog, CatalogAsset, TrustedProfile
 from .content_cache import ContentCache
 from .control import serve_control
 from .filesystem import ImmichFilesystem
@@ -21,7 +22,9 @@ from .immich import (
     ImmichClient,
     ImmichPageLimitError,
     ImmichResponseError,
+    ImmichUnavailableError,
     MUTATION_PERMISSIONS,
+    READ_PERMISSIONS,
     ServerSession,
     UPLOAD_PERMISSIONS,
 )
@@ -33,6 +36,7 @@ from .thumbnails import prepare_thumbnail_cache
 
 LOGGER = logging.getLogger(__name__)
 FULL_REFRESH_SECONDS = 24 * 60 * 60
+OFFLINE_RETRY_DELAYS = (5, 10, 20, 40, 60)
 
 
 class _RestoreJob:
@@ -84,36 +88,32 @@ def _evict_to_limits(content_cache: ContentCache, settings: Settings) -> list[st
     )
 
 
-async def _refresh_worker(
+async def _refresh_loop(
     catalog: Catalog,
     library: Library,
     read_client: ImmichClient,
     read_session: ServerSession,
+    trusted_profile: TrustedProfile,
     catalog_lock: trio.Lock,
     content_cache: ContentCache,
     settings: Settings,
     mount_ready: trio.Event,
-    initial_entries: list[CatalogAsset],
     requests: trio.MemoryReceiveChannel[bool],
     full_requested: list[bool],
     fatal_errors: list[str],
-    *,
-    task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> None:
-    await populate_previews(
-        initial_entries,
-        read_client,
-        settings.mount_path,
-        mount_ready=mount_ready,
-        task_status=task_status,
-    )
-
     async for force_full in requests:
         force_full = force_full or full_requested[0]
         full_requested[0] = False
         try:
             if force_full:
-                await refresh_catalog(catalog, read_client, read_session, catalog_lock)
+                await refresh_catalog(
+                    catalog,
+                    read_client,
+                    read_session,
+                    catalog_lock,
+                    trusted_profile=trusted_profile,
+                )
             else:
                 await refresh_catalog_incremental(
                     catalog,
@@ -124,7 +124,13 @@ async def _refresh_worker(
                 )
         except (FullRefreshRequired, ImmichPageLimitError, ImmichResponseError):
             try:
-                await refresh_catalog(catalog, read_client, read_session, catalog_lock)
+                await refresh_catalog(
+                    catalog,
+                    read_client,
+                    read_session,
+                    catalog_lock,
+                    trusted_profile=trusted_profile,
+                )
             except Exception as error:
                 LOGGER.warning("background full refresh failed: %s", error)
                 continue
@@ -151,20 +157,78 @@ async def _refresh_worker(
             return
 
 
+async def _refresh_worker(
+    catalog: Catalog,
+    library: Library,
+    read_client: ImmichClient,
+    read_session: ServerSession,
+    trusted_profile: TrustedProfile,
+    catalog_lock: trio.Lock,
+    content_cache: ContentCache,
+    settings: Settings,
+    mount_ready: trio.Event,
+    initial_entries: list[CatalogAsset],
+    requests: trio.MemoryReceiveChannel[bool],
+    full_requested: list[bool],
+    fatal_errors: list[str],
+    *,
+    task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
+) -> None:
+    await populate_previews(
+        initial_entries,
+        read_client,
+        settings.mount_path,
+        mount_ready=mount_ready,
+        task_status=task_status,
+    )
+    await _refresh_loop(
+        catalog,
+        library,
+        read_client,
+        read_session,
+        trusted_profile,
+        catalog_lock,
+        content_cache,
+        settings,
+        mount_ready,
+        requests,
+        full_requested,
+        fatal_errors,
+    )
+
+
 async def _periodic_refresh(
     requests: trio.MemorySendChannel[bool],
     interval: int,
     force_full: bool,
     full_requested: list[bool],
+    online: list[bool],
 ) -> None:
     while True:
         await trio.sleep(interval)
+        if not online[0]:
+            continue
         if force_full:
             full_requested[0] = True
         try:
             requests.send_nowait(force_full)
         except trio.WouldBlock:
             pass
+
+
+async def _offline_retries(
+    requests: trio.MemorySendChannel[bool], online: list[bool]
+) -> None:
+    index = 0
+    while not online[0]:
+        await trio.sleep(OFFLINE_RETRY_DELAYS[index])
+        if online[0]:
+            return
+        try:
+            requests.send_nowait(True)
+        except trio.WouldBlock:
+            pass
+        index = min(index + 1, len(OFFLINE_RETRY_DELAYS) - 1)
 
 
 async def _pin_worker(
@@ -217,6 +281,158 @@ def _missing_mutation_key(error: RuntimeError) -> bool:
     return "expected one mutation API key" in str(error) and str(error).endswith("found 0")
 
 
+def _trusted_profile(
+    settings: Settings, read_session: ServerSession, read_key: str
+) -> TrustedProfile:
+    return TrustedProfile(
+        server_origin=settings.server_origin,
+        owner_id=read_session.owner_id,
+        server_version=read_session.version,
+        read_permissions=READ_PERMISSIONS,
+        read_key_sha256=hashlib.sha256(read_key.encode("utf-8")).hexdigest(),
+    )
+
+
+async def _validate_access(
+    settings: Settings, read_client: ImmichClient
+) -> tuple[ServerSession, ImmichClient | None, ServerSession | None]:
+    read_session = await read_client.validate()
+    try:
+        mutation_key = load_api_key(settings, purpose="mutation")
+    except RuntimeError as error:
+        if not _missing_mutation_key(error):
+            raise
+        return read_session, None, None
+
+    mutation_client = ImmichClient(settings.server_url, mutation_key)
+    try:
+        permissions = MUTATION_PERMISSIONS if settings.remote_delete else UPLOAD_PERMISSIONS
+        mutation_session = await mutation_client.validate(permissions)
+        if mutation_session.owner_id != read_session.owner_id:
+            raise RuntimeError(
+                "read-only and mutation keys belong to different Immich users"
+            )
+        return read_session, mutation_client, mutation_session
+    except BaseException:
+        await mutation_client.close()
+        raise
+
+
+async def _offline_worker(
+    catalog: Catalog,
+    library: Library,
+    read_client: ImmichClient,
+    read_key: str,
+    trusted_profile: TrustedProfile,
+    catalog_lock: trio.Lock,
+    content_cache: ContentCache,
+    settings: Settings,
+    mount_ready: trio.Event,
+    initial_entries: list[CatalogAsset],
+    requests: trio.MemoryReceiveChannel[bool],
+    full_requested: list[bool],
+    fatal_errors: list[str],
+    mutation_clients: list[ImmichClient],
+    online: list[bool],
+    pin_requests: trio.MemorySendChannel[bool],
+    pin_pending: dict[str, CatalogAsset],
+    *,
+    task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
+) -> None:
+    await populate_previews(
+        initial_entries,
+        read_client,
+        settings.mount_path,
+        downloads_enabled=False,
+        task_status=task_status,
+    )
+    async for _ in requests:
+        mutation_client: ImmichClient | None = None
+        try:
+            read_session, mutation_client, mutation_session = await _validate_access(
+                settings, read_client
+            )
+            if mutation_client is not None:
+                mutation_clients.append(mutation_client)
+            candidate = _trusted_profile(settings, read_session, read_key)
+            if (
+                candidate.server_origin != trusted_profile.server_origin
+                or candidate.owner_id != trusted_profile.owner_id
+            ):
+                raise RuntimeError("validated server identity changed while offline")
+            await refresh_catalog(
+                catalog,
+                read_client,
+                read_session,
+                catalog_lock,
+                trusted_profile=candidate,
+            )
+        except ImmichUnavailableError as error:
+            LOGGER.warning("offline revalidation remains unavailable: %s", type(error).__name__)
+            if mutation_client is not None:
+                mutation_clients.remove(mutation_client)
+                await mutation_client.close()
+            continue
+        except Exception as error:
+            LOGGER.error("offline revalidation failed: %s", type(error).__name__)
+            if mutation_client is not None:
+                mutation_clients.remove(mutation_client)
+                await mutation_client.close()
+            fatal_errors.append("offline revalidation failed; mount terminated")
+            pyfuse3.terminate()
+            return
+
+        content_cache.enable_downloads()
+        if mutation_client is not None:
+            assert mutation_session is not None
+            library.enable_mutations(mutation_client, mutation_session)
+        online[0] = True
+        full_requested[0] = False
+        persisted_pins = catalog.pinned_ids()
+        for entry in library.list():
+            if (
+                entry.asset.id in persisted_pins
+                and not content_cache.describe(entry.asset)["cached"]
+            ):
+                pin_pending[entry.asset.id] = entry
+        if pin_pending:
+            try:
+                pin_requests.send_nowait(True)
+            except trio.WouldBlock:
+                pass
+        try:
+            _evict_to_limits(content_cache, settings)
+        except Exception as error:
+            LOGGER.warning("reconnected cache eviction failed: %s", error)
+        try:
+            await populate_previews(
+                library.list(),
+                read_client,
+                settings.mount_path,
+                mount_ready=mount_ready,
+            )
+        except Exception as error:
+            LOGGER.error("preview suppression failed; terminating mount: %s", error)
+            fatal_errors.append("preview suppression failed; mount terminated")
+            pyfuse3.terminate()
+            return
+        await _refresh_loop(
+            catalog,
+            library,
+            read_client,
+            read_session,
+            candidate,
+            catalog_lock,
+            content_cache,
+            settings,
+            mount_ready,
+            requests,
+            full_requested,
+            fatal_errors,
+        )
+        return
+
+
 def _library_name_from_uri(uri: object, mount_path: Path) -> str:
     if not isinstance(uri, str):
         raise ValueError("evict URI must identify a mounted file")
@@ -236,34 +452,74 @@ async def run_service(settings: Settings) -> None:
     _prepare_mountpoint(settings.mount_path)
     cache_root = cache_path()
     _prepare_cache_root(cache_root)
-    read_client = ImmichClient(settings.server_url, load_api_key(settings, purpose="read-only"))
-    mutation_client: ImmichClient | None = None
+    read_key = load_api_key(settings, purpose="read-only")
+    read_client = ImmichClient(settings.server_url, read_key)
+    mutation_clients: list[ImmichClient] = []
     try:
-        read_session = await read_client.validate()
-        try:
-            mutation_key = load_api_key(settings, purpose="mutation")
-        except RuntimeError as error:
-            if not _missing_mutation_key(error):
-                raise
-            mutation_key = None
-
-        mutation_session: ServerSession | None = None
-        if mutation_key is not None:
-            mutation_client = ImmichClient(settings.server_url, mutation_key)
-            permissions = MUTATION_PERMISSIONS if settings.remote_delete else UPLOAD_PERMISSIONS
-            mutation_session = await mutation_client.validate(permissions)
-            if mutation_session.owner_id != read_session.owner_id:
-                raise RuntimeError("read-only and mutation keys belong to different Immich users")
-
         state_root = state_path()
         with Catalog(state_root / "catalog.db") as catalog:
             catalog_lock = trio.Lock()
+            stored_profile = catalog.trusted_profile()
+            if (
+                stored_profile is not None
+                and stored_profile.server_origin != settings.server_origin
+            ):
+                raise RuntimeError("configured server does not match trusted catalog state")
+
+            mutation_client: ImmichClient | None = None
+            mutation_session: ServerSession | None = None
+            try:
+                read_session, mutation_client, mutation_session = await _validate_access(
+                    settings, read_client
+                )
+                if mutation_client is not None:
+                    mutation_clients.append(mutation_client)
+                trusted_profile = _trusted_profile(settings, read_session, read_key)
+                if (
+                    stored_profile is not None
+                    and stored_profile.owner_id != trusted_profile.owner_id
+                ):
+                    raise RuntimeError(
+                        "validated user does not match trusted catalog state"
+                    )
+                await refresh_catalog(
+                    catalog,
+                    read_client,
+                    read_session,
+                    catalog_lock,
+                    trusted_profile=trusted_profile,
+                )
+                online = [True]
+            except ImmichUnavailableError:
+                if mutation_client is not None:
+                    mutation_clients.remove(mutation_client)
+                    await mutation_client.close()
+                if stored_profile is None:
+                    raise RuntimeError(
+                        "trusted offline catalog state is unavailable"
+                    ) from None
+                trusted_profile = TrustedProfile(
+                    server_origin=settings.server_origin,
+                    owner_id=stored_profile.owner_id,
+                    server_version="3.0.3",
+                    read_permissions=READ_PERMISSIONS,
+                    read_key_sha256=hashlib.sha256(
+                        read_key.encode("utf-8")
+                    ).hexdigest(),
+                )
+                catalog.require_offline_profile(trusted_profile)
+                read_session = None
+                mutation_client = None
+                mutation_session = None
+                online = [False]
+
             content_cache = ContentCache(
                 cache_root / "originals",
                 read_client,
                 max_bytes=settings.cache_max_bytes,
                 minimum_free_bytes=settings.minimum_free_bytes,
                 pinned_ids=catalog.pinned_ids(),
+                downloads_enabled=online[0],
             )
             library = Library(
                 catalog,
@@ -274,7 +530,6 @@ async def run_service(settings: Settings) -> None:
                 mutation_session=mutation_session,
                 catalog_lock=catalog_lock,
             )
-            await refresh_catalog(catalog, read_client, read_session, catalog_lock)
 
             requests, refreshes = trio.open_memory_channel[bool](1)
             pin_requests, pins = trio.open_memory_channel[bool](1)
@@ -285,12 +540,13 @@ async def run_service(settings: Settings) -> None:
             # ponytail: one terminal success per asset; replace it when the row is trashed again.
             restore_jobs: dict[str, _RestoreJob] = {}
             persisted_pins = catalog.pinned_ids()
-            for entry in library.list():
-                if (
-                    entry.asset.id in persisted_pins
-                    and not content_cache.describe(entry.asset)["cached"]
-                ):
-                    pin_pending[entry.asset.id] = entry
+            if online[0]:
+                for entry in library.list():
+                    if (
+                        entry.asset.id in persisted_pins
+                        and not content_cache.describe(entry.asset)["cached"]
+                    ):
+                        pin_pending[entry.asset.id] = entry
             if pin_pending:
                 pin_requests.send_nowait(True)
             full_requested = [False]
@@ -326,6 +582,7 @@ async def run_service(settings: Settings) -> None:
                 if params:
                     raise ValueError("status takes no parameters")
                 result = asdict(catalog.stats())
+                result["online"] = online[0]
                 result["mutation_enabled"] = library.mutation_enabled
                 return result
 
@@ -479,6 +736,8 @@ async def run_service(settings: Settings) -> None:
                 asset_id = str(UUID(params["asset"]))
                 if asset_id != params["asset"]:
                     raise ValueError("restore requires one canonical asset UUID")
+                if not library.mutation_enabled:
+                    raise PermissionError("mutations are disabled")
                 job = restore_jobs.get(asset_id)
                 if job is not None and job.done.is_set():
                     current = catalog.by_id(asset_id)
@@ -511,25 +770,49 @@ async def run_service(settings: Settings) -> None:
                 restores,
                 trio.open_nursery() as nursery,
             ):
-                await nursery.start(
-                    _refresh_worker,
-                    catalog,
-                    library,
-                    read_client,
-                    read_session,
-                    catalog_lock,
-                    content_cache,
-                    settings,
-                    mount_ready,
-                    library.list(),
-                    refreshes,
-                    full_requested,
-                    fatal_errors,
-                )
-                try:
-                    _evict_to_limits(content_cache, settings)
-                except Exception as error:
-                    LOGGER.warning("initial cache eviction failed: %s", error)
+                if online[0]:
+                    assert read_session is not None
+                    await nursery.start(
+                        _refresh_worker,
+                        catalog,
+                        library,
+                        read_client,
+                        read_session,
+                        trusted_profile,
+                        catalog_lock,
+                        content_cache,
+                        settings,
+                        mount_ready,
+                        library.list(),
+                        refreshes,
+                        full_requested,
+                        fatal_errors,
+                    )
+                    try:
+                        _evict_to_limits(content_cache, settings)
+                    except Exception as error:
+                        LOGGER.warning("initial cache eviction failed: %s", error)
+                else:
+                    await nursery.start(
+                        _offline_worker,
+                        catalog,
+                        library,
+                        read_client,
+                        read_key,
+                        trusted_profile,
+                        catalog_lock,
+                        content_cache,
+                        settings,
+                        mount_ready,
+                        library.list(),
+                        refreshes,
+                        full_requested,
+                        fatal_errors,
+                        mutation_clients,
+                        online,
+                        pin_requests,
+                        pin_pending,
+                    )
                 _check_mountpoint(settings.mount_path)
                 pyfuse3.init(
                     filesystem,
@@ -572,6 +855,7 @@ async def run_service(settings: Settings) -> None:
                         settings.refresh_seconds,
                         False,
                         full_requested,
+                        online,
                     )
                     nursery.start_soon(
                         _periodic_refresh,
@@ -579,7 +863,10 @@ async def run_service(settings: Settings) -> None:
                         FULL_REFRESH_SECONDS,
                         True,
                         full_requested,
+                        online,
                     )
+                    if not online[0]:
+                        nursery.start_soon(_offline_retries, requests, online)
                     await pyfuse3.main()
                 finally:
                     try:
@@ -590,7 +877,7 @@ async def run_service(settings: Settings) -> None:
                 raise RuntimeError(fatal_errors[0])
     finally:
         try:
-            if mutation_client is not None:
+            for mutation_client in mutation_clients:
                 await mutation_client.close()
         finally:
             await read_client.close()

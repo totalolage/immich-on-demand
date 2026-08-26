@@ -4,7 +4,7 @@ from contextlib import aclosing
 
 import trio
 
-from .catalog import Catalog, CatalogStats
+from .catalog import Catalog, CatalogStats, TrustedProfile
 from .immich import ImmichClient, ImmichError, ServerSession
 from .model import timestamp_nanoseconds
 
@@ -25,7 +25,14 @@ async def refresh_catalog(
     client: ImmichClient,
     session: ServerSession,
     catalog_lock: trio.Lock,
+    *,
+    trusted_profile: TrustedProfile | None = None,
 ) -> CatalogStats:
+    if trusted_profile is not None and (
+        trusted_profile.owner_id != session.owner_id
+        or trusted_profile.server_version != session.version
+    ):
+        raise ValueError("trusted profile does not match the validated server session")
     async with catalog_lock:
         previous_ids: set[str] | None = None
         for _ in range(MAX_REFRESH_SWEEPS):
@@ -49,6 +56,7 @@ async def refresh_catalog(
                 return catalog.finish_refresh(
                     high_water_ms=high_water_ms,
                     page_count=page_count,
+                    trusted_profile=trusted_profile,
                 )
             else:
                 previous_ids = asset_ids

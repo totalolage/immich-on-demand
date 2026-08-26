@@ -90,10 +90,11 @@ async def populate_previews(
     *,
     cache_home: Path | None = None,
     concurrency: int = 4,
+    downloads_enabled: bool = True,
     mount_ready: trio.Event | None = None,
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> PreviewStats:
-    """Suppress desktop fallbacks, then populate supported previews concurrently."""
+    """Suppress desktop fallbacks, then optionally populate supported previews."""
     if concurrency < 1:
         raise ValueError("preview concurrency must be positive")
     entries = tuple(entries)
@@ -121,9 +122,16 @@ async def populate_previews(
             jobs.append((entry, source_path, mtime, original_size))
 
     task_status.started()
+    job_count = len(jobs)
+    if not downloads_enabled:
+        return PreviewStats(
+            len(entries),
+            current_count,
+            job_count,
+            len(entries) - current_count - job_count,
+        )
     if mount_ready is not None:
         await mount_ready.wait()
-    job_count = len(jobs)
     pending = deque(jobs)
     installed: set[str] = set()
 

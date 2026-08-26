@@ -38,6 +38,13 @@ class CacheCapacityError(CacheError):
     pass
 
 
+class _DownloadsDisabledError(CacheError):
+    pass
+
+
+_DOWNLOADS_DISABLED = "original is unavailable while downloads are disabled"
+
+
 @dataclass(slots=True)
 class _Hydration:
     done: trio.Event
@@ -58,9 +65,12 @@ class ContentCache:
         max_bytes: int | None = None,
         minimum_free_bytes: int = 0,
         pinned_ids: Iterable[str] = (),
+        downloads_enabled: bool = True,
     ) -> None:
         if (max_bytes is not None and max_bytes < 0) or minimum_free_bytes < 0:
             raise ValueError("cache limits must be non-negative")
+        if type(downloads_enabled) is not bool:
+            raise ValueError("downloads_enabled must be a boolean")
         pins = set(pinned_ids)
         for asset_id in pins:
             UUID(asset_id)
@@ -81,6 +91,10 @@ class ContentCache:
         self._validated: dict[str, _Validation] = {}
         self._pending_discards: set[str] = set()
         self._pinned = pins
+        self._downloads_enabled = downloads_enabled
+
+    def enable_downloads(self) -> None:
+        self._downloads_enabled = True
 
     def describe(self, asset: Asset) -> dict[str, bool]:
         UUID(asset.id)
@@ -125,6 +139,10 @@ class ContentCache:
         if hydration is not None:
             await hydration.done.wait()
             if hydration.error is not None:
+                if isinstance(hydration.error, _DownloadsDisabledError):
+                    raise _DownloadsDisabledError(
+                        _DOWNLOADS_DISABLED
+                    ) from hydration.error
                 if isinstance(hydration.error, CacheBusyError):
                     path = await self._cached_path(asset)
                     if path is not None:
@@ -140,8 +158,12 @@ class ContentCache:
         hydration = _Hydration(trio.Event())
         self._hydrations[asset.id] = hydration
         try:
-            path = await self._cached_path(asset)
+            path = await self._cached_path(
+                asset, discard_invalid=self._downloads_enabled
+            )
             if path is None:
+                if not self._downloads_enabled:
+                    raise _DownloadsDisabledError(_DOWNLOADS_DISABLED)
                 self._reserve(asset)
                 # ponytail: whole-file caching is the 1.0 ceiling; add sparse ranges only
                 # when Immich documents original-download range semantics.
@@ -282,18 +304,22 @@ class ContentCache:
             temporary.unlink(missing_ok=True)
             raise
 
-    async def _cached_path(self, asset: Asset) -> Path | None:
+    async def _cached_path(
+        self, asset: Asset, *, discard_invalid: bool = True
+    ) -> Path | None:
         UUID(asset.id)
         path = self.root / asset.id
         info = self._complete_info(path)
         if info is None:
             return None
         if asset.size is None or info.st_size != asset.size:
-            self._discard(asset.id, path)
+            if discard_invalid:
+                self._discard(asset.id, path)
             return None
         if asset.library_id is not None:
             if info.st_mtime_ns != self._cache_mtime_ns(asset):
-                self._discard(asset.id, path)
+                if discard_invalid:
+                    self._discard(asset.id, path)
                 return None
             return path
 
@@ -309,7 +335,8 @@ class ContentCache:
                 self._validated.pop(asset.id, None)
                 return None
             if not unchanged or not self._checksum_matches(asset.checksum, actual):
-                self._discard(asset.id, path)
+                if discard_invalid:
+                    self._discard(asset.id, path)
                 return None
         return path
 
@@ -324,7 +351,12 @@ class ContentCache:
     @staticmethod
     def _file_sha1(path: Path) -> bytes:
         digest = hashlib.sha1(usedforsecurity=False)
-        with path.open("rb") as stream:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOATIME", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        with os.fdopen(os.open(path, flags), "rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
         return digest.digest()

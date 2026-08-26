@@ -8,6 +8,7 @@ import base64
 import hashlib
 import logging
 from pathlib import Path
+import ssl
 from urllib.parse import urljoin, urlsplit
 from uuid import UUID
 
@@ -33,6 +34,28 @@ class ImmichPageLimitError(ImmichError):
 
 class ImmichResponseError(ImmichError):
     pass
+
+
+class ImmichUnavailableError(ImmichError):
+    pass
+
+
+def _contains_tls_error(error: BaseException) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return True
+        pending.extend(
+            related
+            for related in (current.__cause__, current.__context__)
+            if related is not None
+        )
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,8 +101,16 @@ class ImmichClient:
 
     async def _request(self, method: str, path: str, **kwargs: object) -> httpx.Response:
         url = urljoin(self._api_root, path.lstrip("/"))
-        response = await self._http.request(method, url, **kwargs)
-        self._raise_for_status(response, method, path)
+        display_path = urlsplit(path).path.lstrip("/") if urlsplit(path).scheme else path
+        try:
+            response = await self._http.request(method, url, **kwargs)
+        except (httpx.TimeoutException, httpx.NetworkError) as error:
+            if _contains_tls_error(error):
+                raise ImmichError("Immich TLS validation failed") from error
+            raise ImmichUnavailableError("Immich is unavailable") from error
+        except httpx.TransportError as error:
+            raise ImmichError("Immich transport validation failed") from error
+        self._raise_for_status(response, method, display_path)
         return response
 
     @staticmethod
@@ -109,8 +140,9 @@ class ImmichClient:
         *,
         exact_permissions: bool = True,
     ) -> ServerSession:
-        discovery = await self._http.get(urljoin(self._origin, ".well-known/immich"))
-        self._raise_for_status(discovery, "GET", ".well-known/immich")
+        discovery = await self._request(
+            "GET", urljoin(self._origin, ".well-known/immich")
+        )
         discovery_value = discovery.json()
         api = discovery_value.get("api") if isinstance(discovery_value, dict) else None
         endpoint = api.get("endpoint") if isinstance(api, dict) else None
