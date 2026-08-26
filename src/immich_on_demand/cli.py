@@ -3,6 +3,7 @@ import json
 import logging
 from pathlib import Path
 import secrets
+import subprocess
 import sys
 from uuid import UUID
 
@@ -12,7 +13,13 @@ import trio
 from . import __version__
 from .auth import validate_api_key
 from .control import send_request
-from .profiles import Profile, ProfileError, manage_profile, select_profile
+from .profiles import (
+    Profile,
+    ProfileError,
+    manage_profile,
+    retire_profile,
+    select_profile,
+)
 from .service import run_service
 from .settings import (
     Settings,
@@ -64,6 +71,11 @@ def parser() -> argparse.ArgumentParser:
     configure.add_argument("--minimum-free-gib", type=_positive_int, default=5)
     configure.add_argument("--enable-remote-delete", action="store_true")
 
+    retire = commands.add_parser(
+        "retire-profile", help="retire a Profile without deleting its data"
+    )
+    retire.add_argument("--confirm-profile", required=True)
+
     auth_check = commands.add_parser("auth-check", help="validate an API key")
     auth_check.add_argument("--mutation", action="store_true")
     commands.add_parser("mount", help="run the foreground filesystem service")
@@ -96,6 +108,20 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         profile = select_profile(arguments.profile)
+        if arguments.command == "retire-profile":
+            if arguments.confirm_profile != profile.id:
+                raise ProfileError("Profile confirmation does not match")
+            units = [f"immich-on-demand@{profile.id}.service"]
+            if profile.id == "default":
+                units.append("immich-on-demand.service")
+            completed = subprocess.run(
+                ["systemctl", "--user", "disable", "--now", *units],
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError("could not stop Profile service")
+            retire_profile(profile)
+            return 0
         if arguments.command == "configure":
             settings = Settings(
                 arguments.server,

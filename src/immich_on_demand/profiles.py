@@ -338,29 +338,29 @@ def _valid_entry(metadata: os.stat_result, kind: str) -> bool:
     )
 
 
-def _open_migration_directory(path: Path) -> int:
+def _open_private_directory(path: Path) -> int:
     try:
         descriptor = os.open(
             path,
             os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
     except OSError as error:
-        raise ProfileError(f"unsafe legacy migration directory: {path}") from error
+        raise ProfileError(f"unsafe Profile directory: {path}") from error
     if not _valid_entry(os.fstat(descriptor), "directory"):
         os.close(descriptor)
-        raise ProfileError(f"unsafe legacy migration directory: {path}")
+        raise ProfileError(f"unsafe Profile directory: {path}")
     return descriptor
 
 
 def _strict_entry_at(
-    directory: int, path: Path, kind: str
+    directory: int, path: Path, kind: str, operation: str = "legacy migration"
 ) -> os.stat_result | None:
     try:
         metadata = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return None
     if not _valid_entry(metadata, kind):
-        raise ProfileError(f"unsafe legacy migration entry: {path}")
+        raise ProfileError(f"unsafe {operation} entry: {path}")
     return metadata
 
 
@@ -376,6 +376,22 @@ def _same_entry(first: os.stat_result, second: os.stat_result) -> bool:
         "st_ctime_ns",
     )
     return all(getattr(first, name) == getattr(second, name) for name in names)
+
+
+def _require_directory_identity(path: Path, descriptor: int) -> None:
+    from .settings import _open_config_directory
+
+    try:
+        current_descriptor = _open_config_directory(path / "config.json")
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ProfileError(f"Profile directory changed: {path}") from error
+    try:
+        current = os.fstat(current_descriptor)
+        opened = os.fstat(descriptor)
+        if current.st_dev != opened.st_dev or current.st_ino != opened.st_ino:
+            raise ProfileError(f"Profile directory changed: {path}")
+    finally:
+        os.close(current_descriptor)
 
 
 def _migration_entries(profile: Profile) -> tuple[tuple[Path, Path, str], ...]:
@@ -424,9 +440,9 @@ def _rename_and_fsync(
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        raise ProfileError(f"legacy migration source changed: {source}") from None
+        raise ProfileError(f"Profile source changed: {source}") from None
     if not _valid_entry(current, kind) or not _same_entry(current, expected):
-        raise ProfileError(f"legacy migration source changed: {source}")
+        raise ProfileError(f"Profile source changed: {source}")
     result = _RENAMEAT2(
         source_directory,
         os.fsencode(source.name),
@@ -438,7 +454,7 @@ def _rename_and_fsync(
         number = ctypes.get_errno()
         if number == errno.EEXIST:
             raise ProfileError(
-                f"legacy migration destination appeared: {destination}"
+                f"Profile destination appeared: {destination}"
             )
         raise OSError(number, os.strerror(number), source)
     os.fsync(source_directory)
@@ -487,8 +503,8 @@ def _migrate_default_locked(profile: Profile) -> None:
     ] = []
     try:
         for source, destination, kind in entries:
-            source_directory = _open_migration_directory(source.parent)
-            destination_directory = _open_migration_directory(destination.parent)
+            source_directory = _open_private_directory(source.parent)
+            destination_directory = _open_private_directory(destination.parent)
             opened.extend((source_directory, destination_directory))
             source_exists = _strict_entry_at(source_directory, source, kind)
             destination_exists = _strict_entry_at(
@@ -588,6 +604,110 @@ def _mount_lock_path(directory: Path, mount: Path) -> Path:
     return directory / digest
 
 
+def _acquire_mount_locks(application: Path, mount: Path) -> list[int]:
+    directory = application / "mounts"
+    _ensure_private_directory(directory)
+    locks: list[int] = []
+    try:
+        paths = (*reversed(mount.parents), mount)
+        for index, path in enumerate(paths):
+            operation = fcntl.LOCK_EX if index == len(paths) - 1 else fcntl.LOCK_SH
+            locks.append(
+                _acquire_lock(
+                    _mount_lock_path(directory, path),
+                    operation,
+                    ProfileError,
+                    f"mount path is already claimed: {mount}",
+                )
+            )
+        return locks
+    except BaseException:
+        for descriptor in reversed(locks):
+            _release(descriptor)
+        raise
+
+
+def retire_profile(profile: Profile) -> None:
+    profile = _checked_profile(profile)
+    application, runtime = _prepare_runtime(profile)
+    global_lock = _acquire_lock(
+        application / "profiles.lock",
+        fcntl.LOCK_EX,
+        ProfileBusyError,
+        "Profile management is busy",
+    )
+    service_lock: int | None = None
+    mount_locks: list[int] = []
+    directory: int | None = None
+    try:
+        service_lock = _acquire_lock(
+            runtime / "service.lock",
+            fcntl.LOCK_EX,
+            ProfileError,
+            f"Profile {profile.id} is already claimed",
+        )
+        if os.path.lexists(_legacy_config(profile)):
+            raise ProfileError("legacy config must migrate to Profile default first")
+
+        active = profile.config / "config.json"
+        retired = profile.config / "config.retired.json"
+        from .settings import _open_config_directory, load
+
+        try:
+            directory = _open_config_directory(active)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ProfileError(f"unsafe Profile directory: {profile.config}") from error
+        if (
+            _strict_entry_at(directory, retired, "file", "Profile retirement")
+            is not None
+        ):
+            raise ProfileError(f"Profile {profile.id} is already retired")
+        expected = _strict_entry_at(directory, active, "file", "Profile retirement")
+        if expected is None:
+            raise ProfileError(f"Profile {profile.id} is not active")
+
+        try:
+            settings = load(active)
+        except Exception as error:
+            raise ProfileError(f"could not load Profile {profile.id} config") from error
+        _require_directory_identity(profile.config, directory)
+        loaded = _strict_entry_at(
+            directory, active, "file", "Profile retirement"
+        )
+        if loaded is None or not _same_entry(loaded, expected):
+            raise ProfileError(f"Profile source changed: {active}")
+        mount = _resolved_mount(settings)
+        mount_locks = _acquire_mount_locks(application, mount)
+        if _resolved_mount(settings) != mount:
+            raise ProfileError("Profile mount path changed while it was claimed")
+        if os.path.ismount(mount):
+            raise ProfileError(f"Profile {profile.id} mount is still mounted")
+        if (
+            _strict_entry_at(directory, retired, "file", "Profile retirement")
+            is not None
+        ):
+            raise ProfileError(f"Profile {profile.id} is already retired")
+        _require_directory_identity(profile.config, directory)
+        try:
+            _rename_and_fsync(
+                directory,
+                directory,
+                active,
+                retired,
+                "file",
+                expected,
+            )
+        except OSError as error:
+            raise ProfileError(f"could not retire Profile {profile.id}") from error
+    finally:
+        if directory is not None:
+            os.close(directory)
+        for descriptor in reversed(mount_locks):
+            _release(descriptor)
+        _release(service_lock)
+        _release(global_lock)
+
+
 @contextmanager
 def claim_service(profile: Profile) -> Iterator[Settings]:
     profile = _checked_profile(profile)
@@ -622,19 +742,7 @@ def claim_service(profile: Profile) -> Iterator[Settings]:
             raise ProfileError(f"could not load Profile {profile.id} config") from error
 
         mount = _resolved_mount(settings)
-        mount_lock_directory = application / "mounts"
-        _ensure_private_directory(mount_lock_directory)
-        paths = (*reversed(mount.parents), mount)
-        for index, path in enumerate(paths):
-            operation = fcntl.LOCK_EX if index == len(paths) - 1 else fcntl.LOCK_SH
-            mount_locks.append(
-                _acquire_lock(
-                    _mount_lock_path(mount_lock_directory, path),
-                    operation,
-                    ProfileError,
-                    f"mount path is already claimed: {mount}",
-                )
-            )
+        mount_locks = _acquire_mount_locks(application, mount)
         if _resolved_mount(settings) != mount:
             raise ProfileError("Profile mount path changed while it was claimed")
         for root in (profile.state, profile.data, profile.cache):

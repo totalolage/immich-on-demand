@@ -153,6 +153,14 @@ systemctl --user status immich-on-demand@home.service
 
 Each Profile uses a literal `immich-on-demand@ID.service` instance, private socket, catalog, cache, upload queue, credentials, and journal stream. Equal or nested mount paths are refused. For one 2.0 release, `immich-on-demand.service` remains only as a compatibility entry point for the legacy unprofiled installation; it selects `default`, copies matching legacy credentials without deleting them, and migrates the exact local files before mounting.
 
+Retire a Profile only with its exact confirmation:
+
+```bash
+immich-on-demand --profile home retire-profile --confirm-profile home
+```
+
+Retirement disables and stops only that Profile's systemd unit (plus the compatibility singleton for `default`), refuses a still-mounted Library, and renames only `config.json` to `config.retired.json`. It makes no Immich request and retains the catalog, cached originals, Pending uploads, configuration, and Secret Service items. The retired ID remains reserved; there is no destructive purge command.
+
 For foreground diagnostics, stop the user service and run:
 
 ```bash

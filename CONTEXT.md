@@ -81,7 +81,7 @@ Immich metadata that marks an asset for the user's Favorite View. A Favorite doe
 _Avoid_: Pin, starred local file
 
 **Profile**:
-One Immich server, one authenticated Immich user, one mount, and their local state. Version 1.0 supports one Profile.
+One Immich server, one authenticated Immich user, one mount, and their isolated local state. Version 1.0 supports one Profile; development 2.0 requires an explicit Profile ID and can retire it without deleting its retained state.
 _Avoid_: Account, instance
 
 **Protected library**:

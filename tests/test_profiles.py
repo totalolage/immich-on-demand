@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import immich_on_demand.profiles as profiles_module
 from immich_on_demand.profiles import (
     Profile,
     ProfileBusyError,
@@ -15,6 +16,7 @@ from immich_on_demand.profiles import (
     claim_service,
     manage_profile,
     profiles,
+    retire_profile,
     select_profile,
 )
 
@@ -285,6 +287,141 @@ class ProfileTest(unittest.TestCase):
                         with manage_profile(candidate, mount):
                             self.fail("overlapping mount reached management caller")
             self.assertFalse(candidate.config.exists())
+
+    def test_retire_profile_preserves_local_state_and_refuses_a_mounted_path(self) -> None:
+        with patch.dict(os.environ, self.environment, clear=True):
+            profile = select_profile("home")
+            mount = Path(self.temporary.name) / "mount"
+            mount.mkdir()
+            self._write_config(profile, mount)
+            config = profile.config / "config.json"
+            expected_config = config.read_bytes()
+            for root in (profile.state, profile.data, profile.cache):
+                root.mkdir(parents=True)
+                (root / "preserved").write_bytes(root.name.encode())
+
+            with patch("immich_on_demand.profiles.os.path.ismount", return_value=True):
+                with self.assertRaisesRegex(ProfileError, "still mounted"):
+                    retire_profile(profile)
+            self.assertTrue(config.exists())
+
+            with patch("immich_on_demand.profiles.os.path.ismount", return_value=False):
+                retire_profile(profile)
+
+            retired = profile.config / "config.retired.json"
+            self.assertFalse(config.exists())
+            self.assertEqual(retired.read_bytes(), expected_config)
+            self.assertEqual(stat.S_IMODE(retired.stat().st_mode), 0o600)
+            for root in (profile.state, profile.data, profile.cache):
+                self.assertEqual((root / "preserved").read_bytes(), root.name.encode())
+            self.assertEqual(profiles(), ())
+
+    def test_retire_profile_rejects_a_replaced_config_directory(self) -> None:
+        from immich_on_demand.settings import load
+
+        with patch.dict(os.environ, self.environment, clear=True):
+            profile = select_profile("home")
+            mount = Path(self.temporary.name) / "mount"
+            self._write_config(profile, mount)
+            original_directory = profile.config.with_name("opened-home")
+
+            def replace_directory(_path: Path):
+                profile.config.rename(original_directory)
+                self._write_config(profile, Path(self.temporary.name) / "other-mount")
+                return load(profile.config / "config.json")
+
+            with (
+                patch("immich_on_demand.settings.load", side_effect=replace_directory),
+                patch("immich_on_demand.profiles.os.path.ismount", return_value=False),
+                self.assertRaisesRegex(ProfileError, "directory changed"),
+            ):
+                retire_profile(profile)
+
+            self.assertTrue((original_directory / "config.json").exists())
+            self.assertTrue((profile.config / "config.json").exists())
+            self.assertFalse(
+                (original_directory / "config.retired.json").exists()
+            )
+
+    def test_retire_profile_honors_management_profile_and_mount_locks(self) -> None:
+        with patch.dict(os.environ, self.environment, clear=True):
+            target = select_profile("target")
+            other = select_profile("other")
+            mount = Path(self.temporary.name) / "mount"
+            self._write_config(target, mount)
+            self._write_config(other, mount)
+
+            process, connection = self._start_holder(_hold_management, other)
+            try:
+                with self.assertRaises(ProfileBusyError):
+                    retire_profile(target)
+            finally:
+                self._stop_holder(process, connection)
+
+            process, connection = self._start_holder(_hold_claim, target)
+            try:
+                with self.assertRaisesRegex(ProfileError, "already claimed"):
+                    retire_profile(target)
+            finally:
+                self._stop_holder(process, connection)
+
+            process, connection = self._start_holder(_hold_claim, other)
+            try:
+                with self.assertRaisesRegex(ProfileError, "mount path is already claimed"):
+                    retire_profile(target)
+            finally:
+                self._stop_holder(process, connection)
+
+            self.assertTrue((target.config / "config.json").exists())
+
+    def test_retire_profile_never_replaces_a_raced_destination(self) -> None:
+        with patch.dict(os.environ, self.environment, clear=True):
+            profile = select_profile("home")
+            self._write_config(profile, Path(self.temporary.name) / "mount")
+            active = profile.config / "config.json"
+            retired = profile.config / "config.retired.json"
+            expected = active.read_bytes()
+            rename = profiles_module._RENAMEAT2
+
+            def destination_appears(*arguments) -> int:
+                retired.write_bytes(b"foreign retired config")
+                retired.chmod(0o600)
+                return rename(*arguments)
+
+            with (
+                patch(
+                    "immich_on_demand.profiles._RENAMEAT2",
+                    side_effect=destination_appears,
+                ),
+                patch("immich_on_demand.profiles.os.path.ismount", return_value=False),
+                self.assertRaisesRegex(ProfileError, "destination appeared"),
+            ):
+                retire_profile(profile)
+
+            self.assertEqual(active.read_bytes(), expected)
+            self.assertEqual(retired.read_bytes(), b"foreign retired config")
+
+    def test_retire_profile_refuses_to_migrate_a_legacy_default(self) -> None:
+        with patch.dict(os.environ, self.environment, clear=True):
+            profile = select_profile("default")
+            legacy = profile.config.parent.parent / "config.json"
+            legacy.parent.mkdir(mode=0o700, parents=True)
+            legacy.write_text(
+                json.dumps(
+                    {
+                        "server_url": "https://photos.example.test",
+                        "mount_path": str(Path(self.temporary.name) / "mount"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            legacy.chmod(0o600)
+
+            with self.assertRaisesRegex(ProfileError, "legacy config must migrate"):
+                retire_profile(profile)
+
+            self.assertTrue(legacy.exists())
+            self.assertFalse(profile.config.exists())
 
     def test_claim_keeps_the_profile_lock_and_locks_before_config_load(self) -> None:
         with patch.dict(os.environ, self.environment, clear=True):

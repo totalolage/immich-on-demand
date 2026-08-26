@@ -2,7 +2,7 @@
 
 ## Destination
 
-Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, queued uploads, the first desktop controls, rich Views, Asset replacement, broader image Previews, and isolated multiple Profiles are implemented but await target acceptance. Later releases may add Profile retirement and more platforms.
+Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, queued uploads, the first desktop controls, rich Views, Asset replacement, broader image Previews, isolated multiple Profiles, and reversible Profile retirement are implemented but await target acceptance. Later releases may add more platforms.
 
 ## Rules
 
@@ -44,7 +44,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 
 ### 2.0: support more environments
 
-- [Support multiple Profiles](issues/14-support-multiple-profiles.md) has implemented isolation and routing in source. Reversible retirement and concurrent target acceptance remain.
+- [Support multiple Profiles](issues/14-support-multiple-profiles.md) has implemented isolation, routing, and reversible retirement in source. Concurrent target acceptance remains.
 - [Support more file managers and Linux distributions](issues/15-support-more-platforms.md) selected Ubuntu Desktop 26.04 with Nautilus 50 as the next acceptance target; support remains unclaimed until the runtime and package matrices pass.
 
 ## Deferred until evidence exists

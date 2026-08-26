@@ -1,7 +1,7 @@
 # Support multiple Profiles
 
 Type: feature
-Status: in progress
+Status: implemented
 Design: resolved
 Target: 2.0
 Target acceptance: pending
@@ -14,7 +14,7 @@ Use literal `immich-on-demand@ID.service` instances, one private control socket 
 
 Require migration of the unprofiled installation to `default` before creating another Profile. Preflight and move only the exact catalog files, cache, and Pending uploads inside their XDG filesystems; copy and compare exact legacy secrets with `replace=False`; and move strict config last as the completion marker. New-Profile config is instead published before requested key writes so an interrupted key write leaves an active editable Profile.
 
-The source implementation now covers selection, strict paths, locking, legacy migration, isolated credentials and local roots, CLI/service routing, the desktop selector, Nautilus routing, and systemd template instances. Reversible Profile retirement remains unimplemented, and the concurrent Reference-system matrix remains pending. The exact design and acceptance boundaries are in [the design](../../../docs/research/multiple-profile-boundaries.md).
+The source implementation now covers selection, strict paths, locking, legacy migration, isolated credentials and local roots, CLI/service routing, the desktop selector, Nautilus routing, systemd template instances, and reversible Profile retirement. The concurrent Reference-system matrix remains pending. The exact design and acceptance boundaries are in [the design](../../../docs/research/multiple-profile-boundaries.md).
 
 ## Scope
 
@@ -25,4 +25,4 @@ Namespace configuration, Secret Service items, catalog, cache, recovery bytes, c
 - Two Profiles run concurrently without sharing credentials, inodes, cache entries, control requests, or recovery files.
 - The service rejects duplicate mount paths and conflicting Profile identifiers.
 - A GUI and CLI select a Profile explicitly.
-- A future reversible retirement operation cannot alter another Profile's local or remote state.
+- Reversible retirement cannot alter another Profile's local or remote state.

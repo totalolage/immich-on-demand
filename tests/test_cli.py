@@ -114,6 +114,90 @@ class CliTest(unittest.TestCase):
                 78,
             )
 
+    def test_retire_profile_requires_confirmation_and_stops_only_its_units(self) -> None:
+        for profile_id, units in (
+            ("home", ["immich-on-demand@home.service"]),
+            (
+                "default",
+                [
+                    "immich-on-demand@default.service",
+                    "immich-on-demand.service",
+                ],
+            ),
+        ):
+            selected = profile(Path("/profile"), profile_id)
+            events: list[str] = []
+            with (
+                self.subTest(profile=profile_id),
+                patch("immich_on_demand.cli.select_profile", return_value=selected),
+                patch("immich_on_demand.cli.subprocess", create=True) as subprocess_module,
+                patch("immich_on_demand.cli.retire_profile", create=True) as retire,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                systemctl = subprocess_module.run
+                systemctl.return_value.returncode = 0
+                systemctl.side_effect = lambda *_args, **_kwargs: (
+                    events.append("systemctl") or systemctl.return_value
+                )
+                retire.side_effect = lambda _profile: events.append("retire")
+
+                self.assertEqual(
+                    main(
+                        [
+                            "--profile",
+                            profile_id,
+                            "retire-profile",
+                            "--confirm-profile",
+                            "wrong",
+                        ]
+                    ),
+                    78,
+                )
+                systemctl.assert_not_called()
+                retire.assert_not_called()
+
+                self.assertEqual(
+                    main(
+                        [
+                            "--profile",
+                            profile_id,
+                            "retire-profile",
+                            "--confirm-profile",
+                            profile_id,
+                        ]
+                    ),
+                    0,
+                )
+                systemctl.assert_called_once_with(
+                    ["systemctl", "--user", "disable", "--now", *units],
+                    check=False,
+                )
+                retire.assert_called_once_with(selected)
+                self.assertEqual(events, ["systemctl", "retire"])
+
+        selected = profile(Path("/profile"))
+        with (
+            patch("immich_on_demand.cli.select_profile", return_value=selected),
+            patch("immich_on_demand.cli.subprocess", create=True) as subprocess_module,
+            patch("immich_on_demand.cli.retire_profile", create=True) as retire,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            systemctl = subprocess_module.run
+            systemctl.return_value.returncode = 1
+            self.assertEqual(
+                main(
+                    [
+                        "--profile",
+                        "home",
+                        "retire-profile",
+                        "--confirm-profile",
+                        "home",
+                    ]
+                ),
+                1,
+            )
+            retire.assert_not_called()
+
     def test_configure_writes_only_non_secret_settings(self) -> None:
         import json
 

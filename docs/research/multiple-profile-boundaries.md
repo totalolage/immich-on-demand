@@ -1,6 +1,6 @@
 # Multiple Profile boundaries
 
-Status: core source implementation complete; reversible retirement and target acceptance pending
+Status: source implementation complete; target acceptance pending
 Date: 2026-08-26
 Examined baseline: Immich On-Demand development tree at version `1.4.0.dev0`
 
@@ -23,6 +23,7 @@ class Profile:
 
 def select_profile(profile_id: str) -> Profile: ...
 def profiles() -> tuple[Profile, ...]: ...
+def retire_profile(profile: Profile) -> None: ...
 
 
 @contextmanager
@@ -33,9 +34,9 @@ def manage_profile(profile: Profile, mount_path: Path | None = None) -> Iterator
 def claim_service(profile: Profile) -> Iterator[Settings]: ...
 ```
 
-`select_profile` validates the identifier once and derives every XDG path without loading config. It refuses a non-`default` ID while the legacy config exists; the locked lifecycle contexts repeat that check authoritatively. `profiles` discovers the same validated directory names for the GUI and Nautilus and reports an unmigrated singleton installation as the only selectable `default` Profile. `manage_profile` owns the global-management and Profile-lock order for creation, save, migration, and retirement. `claim_service` briefly takes those locks in the same order, completes or rejects legacy migration, retains the Profile lock, releases the global lock, then loads strict config and acquires the mount claim before returning its `Settings`.
+`select_profile` validates the identifier once and derives every XDG path without loading config. It refuses a non-`default` ID while the legacy config exists; the locked lifecycle operations repeat that check authoritatively. `profiles` discovers the same validated directory names for the GUI and Nautilus and reports an unmigrated singleton installation as the only selectable `default` Profile. `manage_profile` owns the global-management and Profile-lock order for creation, save, and migration. `retire_profile` owns that order plus the mount claim for retirement. `claim_service` briefly takes the first two locks in the same order, completes or rejects legacy migration, retains the Profile lock, releases the global lock, then loads strict config and acquires the mount claim before returning its `Settings`.
 
-`run_service` accepts a `Profile`, not `Settings`, and enters `claim_service` itself. A caller therefore cannot accidentally load config before the running-instance lock. Management callers keep the `manage_profile` context open across both config and Secret Service writes. These two concrete lifecycle contexts are the whole concurrency interface; lock paths and ordering are not exposed to callers.
+`run_service` accepts a `Profile`, not `Settings`, and enters `claim_service` itself. A caller therefore cannot accidentally load config before the running-instance lock. Management callers keep the `manage_profile` context open across both config and Secret Service writes. These three concrete lifecycle operations are the whole concurrency interface; lock paths and ordering are not exposed to callers.
 
 Callers continue to use `Settings`, `Catalog`, `ContentCache`, `UploadQueue`, and the existing control protocol; they receive paths from the claimed `Profile` instead of calling global path helpers. This is the seam: selection, layout, migration, and lock lifetime stay local to one module, while storage and remote behavior remain in their existing modules. Deleting it would spread identifier validation, six path rules, and lock ordering back across the CLI, service, desktop application, Nautilus extension, Secret Service adapter, and packaging.
 
@@ -134,7 +135,7 @@ One Nautilus extension process loads all active Profile IDs and their non-overla
 
 Use native non-blocking `flock` locks; do not add a lock server.
 
-1. `manage_profile` acquires `$XDG_RUNTIME_DIR/immich-on-demand/profiles.lock`, then the selected Profile's `service.lock`, and holds both for the whole creation, config-plus-key save, legacy migration, or retirement. While holding them, load every active config. Refuse an unreadable config because mount separation cannot then be proved.
+1. `manage_profile` acquires `$XDG_RUNTIME_DIR/immich-on-demand/profiles.lock`, then the selected Profile's `service.lock`, and holds both for the whole creation, config-plus-key save, or legacy migration. `retire_profile` takes the same pair and then the selected mount locks. While holding the management pair, load every active config needed by the operation. Refuse an unreadable config because mount separation cannot then be proved.
 2. Profile creation refuses an active or retired config, any state/data/cache artifact, or an exact Profile-tagged Secret Service item without an active config. It creates only the strict mode-`0700` config Profile directory; while still holding `manage_profile`, creation may reuse that directory when it is empty after an interrupted directory-creation step. Catalog, UploadQueue, and ContentCache create their own selected roots only after config exists. Creation never adopts a database, queue, cached original, retired config, key, symlink, wrong-mode path, or unknown entry.
 3. Compare absolute, symlink-resolved mount paths by path components. Reject equality and either ancestor/descendant relation. This makes every filesystem URI belong to zero or one active Profile.
 4. `run_service(profile)` enters `claim_service`, which briefly acquires the global lock and then `service.lock`. It completes `default` migration or rejects pending legacy migration while holding both, releases only the global lock, and then loads `config.json`. It therefore holds `service.lock` before config load, Secret Service, SQLite, upload recovery, FUSE, or HTTP. A second process with the same ID exits `78` immediately. Never unlink a lock file while a process may hold its inode.
@@ -198,7 +199,7 @@ Do not copy the catalog, cache, or Pending upload payloads. Atomic rename preser
 
 ## Removal safety
 
-The first 2.0 removal operation is deliberately reversible. The removal command requires both `--profile ID` and `--confirm-profile ID`, disables and stops only `immich-on-demand@ID.service`, acquires the Profile and mount locks, and refuses a still-mounted path. Removing `default` also disables and stops the one-release compatibility singleton. It makes no HTTP request.
+The first 2.0 removal operation is deliberately reversible. `immich-on-demand --profile ID retire-profile --confirm-profile ID` disables and stops only `immich-on-demand@ID.service`, acquires the Profile and mount locks, and refuses a still-mounted path. Retiring `default` also disables and stops the one-release compatibility singleton. It makes no HTTP request.
 
 Removal refuses an existing `config.retired.json`, then atomically renames only that Profile's `config.json` to it without replacement. The Profile disappears from active selection, while its catalog, originals, Pending uploads, config, and Secret Service items remain intact under the same ID. The retired directory reserves the ID and prevents an unrelated new Profile from adopting its state. A hard purge is not part of this slice: recursive deletion across four XDG roots and Secret Service is unnecessary to satisfy active removal and is the operation most likely to cross a scope boundary.
 
