@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+import subprocess
 import sys
 import threading
 
@@ -20,6 +21,25 @@ from gi.repository import Adw, Gio, GLib, Gtk
 
 _APPLICATION_ID = "net.kalny.ImmichOnDemand"
 _PROGRAM_NAME = "immich-on-demand-desktop"
+_PIN_POLL_SECONDS = 0.5
+_ACTION_WAIT_SECONDS = 300
+_RESULT_MESSAGES = {
+    "status-ok": "Service is running.",
+    "status-error": "Could not query service.",
+    "refresh-ok": "Refresh requested.",
+    "refresh-error": "Could not request refresh.",
+    "evict-ok": "Eviction requested.",
+    "evict-error": "Could not request eviction.",
+    "pin-error": "Could not request Pin.",
+    "pin-cached": "Pinned and cached.",
+    "pin-retry": "Pin saved; download needs retry.",
+    "pin-cancelled": "Pin was removed by another client.",
+    "pin-unknown": "Pin saved; could not confirm download.",
+    "pin-timeout": "Pin saved; download is still running.",
+    "unpin-ok": "Pin removed.",
+    "unpin-cached": "Pin removed; cached copy retained.",
+    "unpin-error": "Could not remove Pin.",
+}
 
 
 def _parse_action(arguments: list[str]) -> tuple[str | None, str | None]:
@@ -27,12 +47,132 @@ def _parse_action(arguments: list[str]) -> tuple[str | None, str | None]:
         return None, None
     if arguments in (["--action", "status"], ["--action", "refresh"]):
         return arguments[1], None
-    if (
-        len(arguments) == 4
-        and arguments[:3] == ["--action", "evict", "--uri"]
-    ):
-        return "evict", arguments[3]
+    if len(arguments) == 4 and arguments[0] == "--action" and arguments[2] == "--uri":
+        if arguments[1] in {"evict", "pin", "unpin"}:
+            return arguments[1], arguments[3]
     raise ValueError("invalid desktop action")
+
+
+def _relay_result(name: str) -> None:
+    if name not in _RESULT_MESSAGES:
+        raise ValueError("invalid desktop result")
+    try:
+        subprocess.Popen(
+            [_PROGRAM_NAME, "--result", name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _described_pin(response: object, uri: str) -> dict[str, object] | None:
+    if not isinstance(response, dict) or set(response) != {"items"}:
+        return None
+    items = response["items"]
+    expected = {"uri", "cached", "pinned", "busy", "recoverable"}
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    item = items[0]
+    if (
+        not isinstance(item, dict)
+        or set(item) != expected
+        or item.get("uri") != uri
+        or any(type(item.get(name)) is not bool for name in expected - {"uri"})
+    ):
+        return None
+    return item
+
+
+async def _run_action_command(action: str, uri: str | None) -> int:
+    try:
+        result = await run_action(action, uri)
+    except Exception:
+        _relay_result(f"{action}-error")
+        return 1
+
+    if action == "status":
+        expected = {
+            "total",
+            "visible",
+            "missing_size",
+            "trashed",
+            "hidden",
+            "offline",
+            "mutation_enabled",
+        }
+        valid = (
+            isinstance(result, dict)
+            and set(result) == expected
+            and type(result["mutation_enabled"]) is bool
+            and all(
+                type(result[name]) is int
+                for name in expected - {"mutation_enabled"}
+            )
+        )
+        _relay_result("status-ok" if valid else "status-error")
+        return 0 if valid else 1
+    if action == "refresh":
+        valid = result == {"scheduled": True}
+        _relay_result("refresh-ok" if valid else "refresh-error")
+        return 0 if valid else 1
+    if action == "evict":
+        valid = (
+            isinstance(result, dict)
+            and set(result) == {"evicted"}
+            and type(result["evicted"]) is bool
+        )
+        _relay_result("evict-ok" if valid else "evict-error")
+        return 0 if valid else 1
+
+    if (
+        action not in {"pin", "unpin"}
+        or not isinstance(result, dict)
+        or set(result) != {"pinned", "cached", "busy", "scheduled"}
+        or any(type(result.get(name)) is not bool for name in result)
+        or uri is None
+    ):
+        _relay_result(f"{action}-error")
+        return 1
+    if action == "unpin" and result["pinned"] is not False:
+        _relay_result("unpin-error")
+        return 1
+    if action == "unpin":
+        _relay_result("unpin-cached" if result["cached"] else "unpin-ok")
+        return 0
+    if action == "pin" and result["pinned"] is not True:
+        _relay_result("pin-error")
+        return 1
+    if action == "pin" and result["cached"] is True and result["busy"] is False:
+        _relay_result("pin-cached")
+        return 0
+    with trio.move_on_after(_ACTION_WAIT_SECONDS) as wait:
+        while True:
+            response = None
+            try:
+                response = await run_action("describe", [uri])
+                state = _described_pin(response, uri)
+            except Exception:
+                state = None
+            if state is None:
+                _relay_result("pin-unknown")
+                return 1
+            if state["busy"] is True:
+                await trio.sleep(_PIN_POLL_SECONDS)
+                continue
+            if state["pinned"] is False:
+                _relay_result("pin-cancelled")
+                return 0
+            if state["cached"] is True:
+                _relay_result("pin-cached")
+                return 0
+            _relay_result("pin-retry")
+            return 1
+    assert wait.cancelled_caught
+    _relay_result("pin-timeout")
+    return 124
 
 
 class _Worker:
@@ -97,15 +237,21 @@ class DesktopApplication(Adw.Application):
         self._window.present()
 
     def do_command_line(self, command_line) -> int:
-        try:
-            action, uri = _parse_action(list(command_line.get_arguments())[1:])
-        except ValueError:
+        arguments = list(command_line.get_arguments())[1:]
+        result = (
+            arguments[1]
+            if len(arguments) == 2
+            and arguments[0] == "--result"
+            and arguments[1] in _RESULT_MESSAGES
+            else None
+        )
+        if arguments and result is None:
             self.activate()
             self._message.set_text("Invalid desktop action.")
             return 2
         self.activate()
-        if action is not None:
-            self._start_action(action, uri)
+        if result is not None:
+            self._message.set_text(_RESULT_MESSAGES[result])
         return 0
 
     def do_shutdown(self) -> None:
@@ -221,35 +367,13 @@ class DesktopApplication(Adw.Application):
         )
         return False
 
-    def _start_action(self, action: str, uri: str | None) -> None:
-        def invoke():
-            return trio.run(run_action, action, uri)
-
-        callback = lambda success, result: self._finish_action(
-            action, success, result
-        )
-        if not self._worker.submit(invoke, callback):
-            self._message.set_text("Desktop worker is busy.")
-            return
-        self._message.set_text("Contacting service.")
-
-    def _finish_action(self, action: str, success: bool, _result) -> bool:
-        if success:
-            message = {
-                "status": "Service is running.",
-                "refresh": "Refresh requested.",
-                "evict": "Eviction requested.",
-            }[action]
-        else:
-            message = {
-                "status": "Could not query service.",
-                "refresh": "Could not request refresh.",
-                "evict": "Could not request eviction.",
-            }[action]
-        self._message.set_text(message)
-        return False
-
-
 def main(argv: list[str] | None = None) -> int:
-    arguments = sys.argv if argv is None else [_PROGRAM_NAME, *argv]
-    return DesktopApplication().run(arguments)
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "--action":
+        try:
+            action, uri = _parse_action(arguments)
+        except ValueError:
+            return 2
+        assert action is not None
+        return trio.run(_run_action_command, action, uri)
+    return DesktopApplication().run([_PROGRAM_NAME, *arguments])

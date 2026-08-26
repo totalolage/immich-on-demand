@@ -93,7 +93,9 @@ The service creates a missing mount directory. An existing mount directory must 
 
 Startup deliberately requires Immich to be online. Before mounting, the service validates the configured keys, refreshes the catalog, and prepares Preview suppression. If Immich becomes unavailable later, the running mount keeps its catalog and continues to serve cached originals. Reads of uncached originals fail until Immich returns.
 
-Routine background refreshes request only assets updated within an overlapping time window and never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete sweeps before removing rows.
+In the development tree, routine background refreshes request only assets updated within an overlapping time window. These refreshes never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete sweeps before removing rows.
+
+The incremental refresh implementation has automated coverage and a read-only Immich 3.0.3 server check. The updated service has not completed its package and lifecycle checks on the target Arch system.
 
 To enable remote deletion, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.delete`. The service fails closed if either key has unexpected permissions.
 
@@ -121,11 +123,37 @@ immich-on-demand evict --asset 12345678-1234-4234-8234-123456789abc
 
 `evict` removes complete cached originals that are not open or downloading. With no `--asset`, it evicts every eligible original. The file remains in the mount and downloads again on its next read.
 
+Development builds also provide Pin commands:
+
+```bash
+immich-on-demand pin --asset 12345678-1234-4234-8234-123456789abc
+immich-on-demand pin-status --asset 12345678-1234-4234-8234-123456789abc
+immich-on-demand unpin --asset 12345678-1234-4234-8234-123456789abc
+```
+
+`pin` records the Pin before it downloads the original. A Pin protects a complete original from automatic and manual Eviction. If a download fails, the Pin remains and the next service start retries it. Run `pin` again to retry without restarting. The minimum free-space limit still applies.
+
+`pin-status` reports `pinned`, `cached`, `busy`, and `scheduled`. `unpin` removes the protection but keeps any cached bytes until normal Eviction removes them.
+
 After a configuration change, restart the service:
 
 ```bash
 systemctl --user restart immich-on-demand.service
 ```
+
+## Desktop integration in development
+
+The development tree contains a GTK 4 and libadwaita settings application plus a Nautilus 50 extension. The settings application edits the single configured server, mount, cache policy, refresh interval, and remote-delete policy. Nonblank API key fields replace the matching Secret Service item. Saving settings does not restart the service.
+
+Inside the configured mount, Nautilus adds folder actions for Refresh and Settings. A one-file selection can Pin, Unpin, retry a failed pinned download, or Evict its local copy. Emblems report cached, pinned, and busy state. The extension returns no actions or emblems outside the configured mount.
+
+The released version 1.0 Arch recipe does not install this desktop entry, the Nautilus loader, or the emblem icons. The following target-system checks remain open:
+
+- Build, install, upgrade, restart, and uninstall a package that contains the desktop files.
+- Load the extension in Nautilus 50 and verify mount scoping, menus, emblem changes, and failure behavior.
+- Save settings and replacement keys through the GUI, then restart the user service and verify the new configuration.
+- Pin one recorded Test asset, verify restart and Eviction behavior, inspect it with `pin-status`, then Unpin it. Do not use a Protected-library asset.
+- Run routine incremental refresh and complete-reconciliation checks through the installed target service.
 
 ## Local data and upload recovery
 
@@ -156,11 +184,11 @@ scripts/check
 
 ## Future work
 
-Version 1.0 is available on GitHub. The AUR recipe is ready, but publication is blocked while the AUR is not accepting account signups.
+Version 1.0 is available on GitHub. The package has not been published to the AUR.
 
 Albums, people, dates, and other views are also deferred. A future version may expose paths such as `{Albums,People,All,by Date}/asset.ext` and hardlink repeated views of the same asset.
 
-The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) tracks AUR publication, Pinning, desktop controls, offline behavior, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
+The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, and desktop controls. It also tracks AUR publication, Restore, offline behavior, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
 
 ## License
 

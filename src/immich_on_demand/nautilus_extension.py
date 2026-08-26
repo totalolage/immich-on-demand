@@ -78,18 +78,58 @@ class NautilusExtension(
         self._cache: OrderedDict[
             str, tuple[float, dict[str, bool]]
         ] = OrderedDict()
+        self._busy_refreshes: set[str] = set()
 
     def _in_mount(self, candidate) -> bool:
         return self._mount is not None and (
             candidate.equal(self._mount) or candidate.has_prefix(self._mount)
         )
 
-    @staticmethod
-    def _launch(*arguments: str) -> None:
-        Gio.Subprocess.new(
-            [_DESKTOP_CLIENT, *arguments],
-            Gio.SubprocessFlags.NONE,
-        )
+    def _launch(self, *arguments: str, invalidate=None) -> None:
+        try:
+            process = Gio.Subprocess.new(
+                [_DESKTOP_CLIENT, *arguments],
+                Gio.SubprocessFlags.NONE,
+            )
+        except Exception:
+            return
+        if invalidate is not None:
+            uri, file = invalidate
+            try:
+                process.wait_async(None, self._action_finished, (uri, file))
+            except Exception:
+                self._invalidate(uri, file)
+
+    def _action_finished(self, process, result, invalidate) -> None:
+        uri, file = invalidate
+        try:
+            process.wait_finish(result)
+        except Exception:
+            pass
+        self._invalidate(uri, file)
+
+    def _invalidate(self, uri: str, file) -> None:
+        self._cache.pop(uri, None)
+        try:
+            file.invalidate_extension_info()
+        except Exception:
+            pass
+
+    def _schedule_refresh(self, uri: str, file) -> None:
+        if uri in self._busy_refreshes:
+            return
+        self._busy_refreshes.add(uri)
+        try:
+            GLib.timeout_add(
+                int(_CACHE_SECONDS * 1000), self._refresh_state, uri, file
+            )
+        except Exception:
+            self._busy_refreshes.discard(uri)
+
+    def _refresh_state(self, uri: str, file) -> bool:
+        self._busy_refreshes.discard(uri)
+        self._invalidate(uri, file)
+        return False
 
     def _activate_refresh(self, _item) -> None:
         self._launch("--action", "refresh")
@@ -97,8 +137,17 @@ class NautilusExtension(
     def _activate_settings(self, _item) -> None:
         self._launch()
 
-    def _activate_evict(self, _item, uri: str) -> None:
-        self._launch("--action", "evict", "--uri", uri)
+    def _activate_evict(self, _item, uri: str, file) -> None:
+        self._launch(
+            "--action", "evict", "--uri", uri, invalidate=(uri, file)
+        )
+
+    def _activate_pin(self, _item, action: str, uri: str, file) -> None:
+        self._launch(
+            "--action", action, "--uri", uri, invalidate=(uri, file)
+        )
+        if action == "pin":
+            self._schedule_refresh(uri, file)
 
     @staticmethod
     def _menu_item(name: str, label: str, callback):
@@ -122,12 +171,41 @@ class NautilusExtension(
         file = files[0]
         if file.is_directory() or not self._in_mount(file.get_location()):
             return []
-        item = Nautilus.MenuItem(
+        uri = file.get_uri()
+        state = self._cached_state(uri)
+        pinned = state is not None and state["pinned"]
+        action = "unpin" if pinned else "pin"
+        pin = Nautilus.MenuItem(
+            name="ImmichOnDemand::pin",
+            label="Unpin" if action == "unpin" else "Pin for Offline Use",
+        )
+        pin.connect("activate", self._activate_pin, action, uri, file)
+        if pinned and state is not None and not state["cached"] and not state["busy"]:
+            retry = Nautilus.MenuItem(
+                name="ImmichOnDemand::retry-pin",
+                label="Retry Pinned Download",
+            )
+            retry.connect("activate", self._activate_pin, "pin", uri, file)
+            return [retry, pin]
+        if pinned:
+            return [pin]
+        evict = Nautilus.MenuItem(
             name="ImmichOnDemand::evict",
             label="Evict Local Copy",
         )
-        item.connect("activate", self._activate_evict, file.get_uri())
-        return [item]
+        evict.connect("activate", self._activate_evict, uri, file)
+        return [pin, evict]
+
+    def _cached_state(self, uri: str) -> dict[str, bool] | None:
+        cached = self._cache.get(uri)
+        if cached is None:
+            return None
+        expires, state = cached
+        if expires <= time.monotonic():
+            del self._cache[uri]
+            return None
+        self._cache.move_to_end(uri)
+        return state
 
     def update_file_info_full(self, provider, handle, closure, file):
         if not self._in_mount(file.get_location()):
@@ -135,17 +213,13 @@ class NautilusExtension(
         uri = file.get_uri()
         if not isinstance(uri, str):
             return Nautilus.OperationResult.COMPLETE
-        cached = self._cache.get(uri)
-        if cached is not None:
-            expires, state = cached
-            if expires > time.monotonic():
-                self._cache.move_to_end(uri)
-                try:
-                    self._apply_state(file, state)
-                except Exception:
-                    pass
-                return Nautilus.OperationResult.COMPLETE
-            del self._cache[uri]
+        state = self._cached_state(uri)
+        if state is not None:
+            try:
+                self._apply_state(file, state)
+            except Exception:
+                pass
+            return Nautilus.OperationResult.COMPLETE
         self._pending.append(_Update(provider, handle, closure, file, uri))
         if self._idle_source is None and not self._worker_active:
             self._idle_source = GLib.idle_add(self._start_batch)
@@ -269,6 +343,8 @@ class NautilusExtension(
                 state = states.get(update.uri)
                 if state is not None and not update.completed:
                     self._apply_state(update.file, state)
+                    if state["busy"]:
+                        self._schedule_refresh(update.uri, update.file)
             except Exception:
                 pass
             finally:

@@ -18,12 +18,18 @@ from immich_on_demand.immich import (
     UPLOAD_PERMISSIONS,
 )
 from immich_on_demand.model import Asset
-from immich_on_demand.service import FULL_REFRESH_SECONDS, _periodic_refresh, run_service
+from immich_on_demand.service import (
+    FULL_REFRESH_SECONDS,
+    _periodic_refresh,
+    _pin_worker,
+    run_service,
+)
 from immich_on_demand.settings import Settings
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+PINNED_ID = "aaaaaaaa-1234-4234-8234-123456789abc"
 
 
 def upload_entry() -> CatalogAsset:
@@ -60,6 +66,7 @@ class ServiceFakes:
         refresh_error_call: int | None = None,
         incremental_page_limit: bool = False,
         incremental_response_error: bool = False,
+        pin_persist_error: bool = False,
     ) -> None:
         self.root = root
         self.mutation = mutation
@@ -68,6 +75,7 @@ class ServiceFakes:
         self.refresh_error_call = refresh_error_call
         self.incremental_page_limit = incremental_page_limit
         self.incremental_response_error = incremental_response_error
+        self.pin_persist_error = pin_persist_error
         self.events: list[str] = []
         self.clients: list[ServiceFakes.Client] = []
         self.handlers: dict[str, object] = {}
@@ -82,6 +90,8 @@ class ServiceFakes:
         self.on_uploaded: object = None
         self.fuse_options: set[str] = set()
         self.catalog_locks: list[object] = []
+        self.persisted_pins = {PINNED_ID}
+        self.pin_hydrated = trio.Event()
         outer = self
 
         class Client:
@@ -112,6 +122,17 @@ class ServiceFakes:
             def stats(self) -> CatalogStats:
                 return CatalogStats(7, 6, 1, 0, 0, 0)
 
+            def pinned_ids(self) -> frozenset[str]:
+                return frozenset(outer.persisted_pins)
+
+            def pin(self, asset_id: str) -> None:
+                if outer.pin_persist_error:
+                    raise OSError("private catalog path")
+                outer.persisted_pins.add(asset_id)
+
+            def unpin(self, asset_id: str) -> None:
+                outer.persisted_pins.discard(asset_id)
+
         class Cache:
             def __init__(
                 self,
@@ -120,9 +141,11 @@ class ServiceFakes:
                 *,
                 max_bytes: int,
                 minimum_free_bytes: int,
+                pinned_ids: frozenset[str],
             ) -> None:
                 self.limit_calls: list[dict[str, int]] = []
                 self.asset_evictions: list[str] = []
+                self.pinned_ids = set(pinned_ids)
                 outer.cache = self
                 outer.events.append(f"cache:{path.relative_to(root)}")
                 outer.events.append(f"cache-policy:{max_bytes}:{minimum_free_bytes}")
@@ -137,6 +160,23 @@ class ServiceFakes:
             def evict(self, asset_id: str) -> bool:
                 self.asset_evictions.append(asset_id)
                 return True
+
+            def describe(self, asset: Asset) -> dict[str, bool]:
+                return {
+                    "cached": True,
+                    "busy": False,
+                    "pinned": asset.id in self.pinned_ids,
+                }
+
+            def pin(self, asset_id: str) -> None:
+                self.pinned_ids.add(asset_id)
+
+            def unpin(self, asset_id: str) -> None:
+                self.pinned_ids.discard(asset_id)
+
+            async def hydrate(self, asset: Asset) -> Path:
+                outer.pin_hydrated.set()
+                return root / "cache" / "originals" / asset.id
 
         class Library:
             def __init__(
@@ -155,7 +195,7 @@ class ServiceFakes:
                 outer.events.append(f"library:mutation={self.mutation_enabled}")
 
             def list(self) -> list[object]:
-                return []
+                return [upload_entry()]
 
             def lookup(self, identity: str | int) -> CatalogAsset | None:
                 return upload_entry() if identity == "new.jpg" else None
@@ -289,6 +329,87 @@ class ServiceFakes:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_failed_pinned_hydration_keeps_the_worker_retryable(self) -> None:
+        async def scenario() -> None:
+            entry = upload_entry()
+            failed = trio.Event()
+            hydrated = trio.Event()
+            pending = {entry.asset.id: entry}
+            inflight: set[str] = set()
+
+            class Catalog:
+                def pinned_ids(self) -> frozenset[str]:
+                    return frozenset({entry.asset.id})
+
+            class Cache:
+                calls = 0
+
+                async def hydrate(self, _asset: Asset) -> Path:
+                    self.calls += 1
+                    if self.calls == 1:
+                        failed.set()
+                        raise OSError("protected path must not reach the log")
+                    hydrated.set()
+                    return Path("/unused")
+
+            cache = Cache()
+            sends, receives = trio.open_memory_channel[bool](1)
+            with self.assertLogs("immich_on_demand.service", level="WARNING") as logs:
+                async with sends, receives, trio.open_nursery() as nursery:
+                    nursery.start_soon(
+                        _pin_worker,
+                        Catalog(),
+                        cache,  # type: ignore[arg-type]
+                        receives,
+                        pending,
+                        inflight,
+                    )
+                    await sends.send(True)
+                    await failed.wait()
+                    pending[entry.asset.id] = entry
+                    try:
+                        sends.send_nowait(True)
+                    except trio.WouldBlock:
+                        pass
+                    await hydrated.wait()
+                    await sends.aclose()
+
+            self.assertEqual(cache.calls, 2)
+            self.assertEqual(pending, {})
+            self.assertEqual(inflight, set())
+            self.assertNotIn("protected path", "\n".join(logs.output))
+
+        trio.run(scenario)
+
+    def test_pin_persistence_failure_leaves_the_mounted_service_running(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(root, pin_persist_error=True)
+            settings = Settings(
+                "https://photos.example.test", root / "mount", refresh_seconds=3600
+            )
+            with fakes.patches():
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    await fakes.main_started.wait()
+                    pin = fakes.handlers["pin"]
+                    with self.assertRaisesRegex(OSError, "private catalog"):
+                        await pin(  # type: ignore[operator]
+                            {
+                                "uri": (root / "mount" / "new.jpg").as_uri(),
+                                "pinned": True,
+                            }
+                        )
+                    status = fakes.handlers["status"]
+                    self.assertEqual((await status({}))["total"], 7)  # type: ignore[index,operator]
+                    assert fakes.cache is not None
+                    self.assertNotIn(ASSET_ID, fakes.cache.pinned_ids)
+                    fakes.stop_main.set()
+
+            self.assertNotIn("fuse-terminate", fakes.events)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_periodic_refresh_wakes_for_the_daily_full_sweep(self) -> None:
         async def scenario() -> None:
             sleeps: list[int] = []
@@ -400,6 +521,8 @@ class ServiceTest(unittest.TestCase):
                     status = fakes.handlers["status"]
                     refresh = fakes.handlers["refresh"]
                     evict = fakes.handlers["evict"]
+                    describe = fakes.handlers["describe"]
+                    pin = fakes.handlers["pin"]
                     self.assertEqual(
                         await status({}),  # type: ignore[operator]
                         {
@@ -435,6 +558,62 @@ class ServiceTest(unittest.TestCase):
                         with self.subTest(uri=uri), self.assertRaises(ValueError):
                             await evict({"uri": uri})  # type: ignore[operator]
 
+                    uri = (root / "mount" / "new.jpg").as_uri()
+                    unknown_uri = (root / "mount" / "unknown.jpg").as_uri()
+                    self.assertEqual(
+                        await describe({"uris": [uri, unknown_uri]}),
+                        {
+                            "items": [
+                                {
+                                    "uri": uri,
+                                    "cached": True,
+                                    "busy": False,
+                                    "pinned": False,
+                                    "recoverable": False,
+                                }
+                            ]
+                        },
+                    )  # type: ignore[operator]
+                    self.assertEqual(
+                        await pin({"asset": PINNED_ID, "pinned": False}),
+                        {
+                            "pinned": False,
+                            "cached": False,
+                            "busy": False,
+                            "scheduled": False,
+                        },
+                    )  # type: ignore[operator]
+                    self.assertNotIn(PINNED_ID, fakes.persisted_pins)
+                    self.assertEqual(
+                        await pin({"uri": uri, "pinned": True}),
+                        {
+                            "pinned": True,
+                            "cached": True,
+                            "busy": False,
+                            "scheduled": True,
+                        },
+                    )  # type: ignore[operator]
+                    await fakes.pin_hydrated.wait()
+                    self.assertIn(ASSET_ID, fakes.persisted_pins)
+                    self.assertEqual(
+                        await pin({"asset": ASSET_ID, "pinned": False}),
+                        {
+                            "pinned": False,
+                            "cached": True,
+                            "busy": False,
+                            "scheduled": False,
+                        },
+                    )  # type: ignore[operator]
+                    self.assertNotIn(ASSET_ID, fakes.persisted_pins)
+                    for params in (
+                        {},
+                        {"uris": []},
+                        {"uris": [uri] * 65},
+                        {"uris": [(root / "outside.jpg").as_uri()]},
+                    ):
+                        with self.subTest(params=params), self.assertRaises(ValueError):
+                            await describe(params)  # type: ignore[operator]
+
                     fakes.preview_gate.set()
                     await fakes.second_refresh.wait()
                     await fakes.background_done.wait()
@@ -469,6 +648,7 @@ class ServiceTest(unittest.TestCase):
             )
             self.assertTrue(all(call == expected_limits for call in fakes.cache.limit_calls[2:]))
             self.assertEqual(fakes.cache.asset_evictions, [ASSET_ID, ASSET_ID])
+            self.assertEqual(fakes.cache.pinned_ids, set())
             self.assertIn("fuse-close:True", fakes.events)
             self.assertIn("control-close", fakes.events)
             self.assertIn("cache-policy:11:33", fakes.events)

@@ -59,8 +59,18 @@ class ControlTests(unittest.TestCase):
                 seen.append(params)
                 return {"mounted": True}
 
+            async def describe(params: dict[str, object]) -> object:
+                return {"items": []}
+
+            async def pin(params: dict[str, object]) -> object:
+                return {"pinned": params["pinned"]}
+
             async with trio.open_nursery() as nursery:
-                await nursery.start(serve_control, path, {"status": status})
+                await nursery.start(
+                    serve_control,
+                    path,
+                    {"status": status, "describe": describe, "pin": pin},
+                )
                 self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(
@@ -72,6 +82,14 @@ class ControlTests(unittest.TestCase):
                 )
                 self.assertEqual(response, {"id": 8, "result": {"mounted": True}})
                 self.assertEqual(closed, b"")
+                self.assertEqual(
+                    await send_request(path, 9, "describe", {"uris": []}),
+                    {"items": []},
+                )
+                self.assertEqual(
+                    await send_request(path, 10, "pin", {"pinned": True}),
+                    {"pinned": True},
+                )
                 nursery.cancel_scope.cancel()
             self.assertFalse(path.exists())
             self.assertEqual(seen, [{"path": "/Photos"}, {}])

@@ -316,141 +316,266 @@ class DesktopApplicationTests(unittest.TestCase):
         )
         application.do_shutdown()
 
-    def test_command_line_actions_use_trio_worker_and_fixed_messages(self) -> None:
+    def test_result_relay_uses_only_fixed_messages(self) -> None:
         module, idle = _load_desktop_app()
-        action_calls: list[tuple[str, str | None, int]] = []
-
-        async def action(name: str, uri: str | None = None):
-            action_calls.append((name, uri, threading.get_ident()))
-            return {"untrusted": "result must not reach the UI"}
-
-        uri = "file:///home/user/Immich/photo.jpg"
-        with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
+        with mock.patch.object(
+            module,
+            "load",
+            return_value=Settings(
+                "https://photos.example.test", Path("/home/user/Immich")
             ),
-            mock.patch.object(module, "run_action", side_effect=action),
         ):
             application = module.DesktopApplication()
             cases = (
-                (["desktop", "--action", "status"], "Service is running."),
-                (["desktop", "--action", "refresh"], "Refresh requested."),
-                (
-                    ["desktop", "--action", "evict", "--uri", uri],
-                    "Eviction requested.",
-                ),
+                ("status-ok", "Service is running."),
+                ("refresh-ok", "Refresh requested."),
+                ("evict-ok", "Eviction requested."),
+                ("pin-cached", "Pinned and cached."),
+                ("pin-retry", "Pin saved; download needs retry."),
+                ("unpin-cached", "Pin removed; cached copy retained."),
             )
-            for index, (arguments, message) in enumerate(cases):
-                with self.subTest(arguments=arguments):
+            for index, (name, message) in enumerate(cases):
+                with self.subTest(name=name):
                     self.assertEqual(
-                        application.do_command_line(_CommandLine(arguments)), 0
+                        application.do_command_line(
+                            _CommandLine(["desktop", "--result", name])
+                        ),
+                        0,
                     )
                     if index == 0:
                         idle.run_next()
-                    idle.run_next()
                     self.assertEqual(application._message.get_text(), message)
 
         self.assertEqual(
-            [(name, value) for name, value, _thread in action_calls],
-            [("status", None), ("refresh", None), ("evict", uri)],
-        )
-        self.assertTrue(
-            all(thread != threading.get_ident() for _name, _uri, thread in action_calls)
-        )
-        self.assertEqual(
             application.do_command_line(
-                _CommandLine(["desktop", "--action", "evict"])
+                _CommandLine(["desktop", "--result", "not-a-real-result"])
             ),
             2,
         )
         self.assertEqual(application._message.get_text(), "Invalid desktop action.")
         application.do_shutdown()
 
-    def test_action_failure_never_displays_the_service_exception(self) -> None:
-        module, idle = _load_desktop_app()
-
-        async def broken_action(_name: str, _uri: str | None = None):
-            raise RuntimeError("api-key=do-not-display")
-
-        with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
-            ),
-            mock.patch.object(module, "run_action", side_effect=broken_action),
-        ):
-            application = module.DesktopApplication()
-            self.assertEqual(
-                application.do_command_line(
-                    _CommandLine(["desktop", "--action", "status"])
-                ),
-                0,
-            )
-            idle.run_next()
-            idle.run_next()
-
-        self.assertEqual(application._message.get_text(), "Could not query service.")
-        self.assertNotIn("do-not-display", application._message.get_text())
-        application.do_shutdown()
-
     def test_worker_bounds_pending_operations(self) -> None:
         module, idle = _load_desktop_app()
-        load_started = threading.Event()
-        release_load = threading.Event()
-        action_calls: list[str] = []
+        save_started = threading.Event()
+        release_save = threading.Event()
+        save_calls: list[Settings] = []
+        settings = Settings(
+            "https://photos.example.test", Path("/home/user/Immich")
+        )
 
-        def slow_load() -> Settings:
-            load_started.set()
-            if not release_load.wait(timeout=2):
+        def slow_save(value: Settings) -> None:
+            save_calls.append(value)
+            save_started.set()
+            if not release_save.wait(timeout=2):
                 raise RuntimeError("test timed out")
-            return Settings(
-                "https://photos.example.test", Path("/home/user/Immich")
-            )
-
-        async def action(name: str, _uri: str | None = None):
-            action_calls.append(name)
-            return {}
 
         with (
-            mock.patch.object(module, "load", side_effect=slow_load),
-            mock.patch.object(module, "run_action", side_effect=action),
+            mock.patch.object(module, "load", return_value=settings),
+            mock.patch.object(module, "save", side_effect=slow_save),
         ):
             application = module.DesktopApplication()
             application.do_activate()
-            self.assertTrue(load_started.wait(timeout=2))
-            application.do_command_line(
-                _CommandLine(["desktop", "--action", "status"])
-            )
-            application.do_command_line(
-                _CommandLine(["desktop", "--action", "refresh"])
-            )
+            idle.run_next()
+            application._save_button.click()
+            self.assertTrue(save_started.wait(timeout=2))
+            application._save_button.click()
+            application._save_button.click()
             self.assertEqual(
                 application._message.get_text(), "Desktop worker is busy."
             )
-            release_load.set()
+            release_save.set()
             idle.run_next()
             idle.run_next()
 
-        self.assertEqual(action_calls, ["status"])
+        self.assertEqual(save_calls, [settings, settings])
         application.do_shutdown()
 
-    def test_main_runs_the_unique_application_with_explicit_arguments(self) -> None:
+    def test_pin_action_process_waits_for_terminal_hydration(self) -> None:
+        module, _idle = _load_desktop_app()
+        uri = "file:///home/user/Immich/photo.jpg"
+        responses = iter(
+            (
+                {"pinned": True, "cached": False, "busy": True, "scheduled": True},
+                {
+                    "items": [
+                        {
+                            "uri": uri,
+                            "cached": False,
+                            "pinned": True,
+                            "busy": True,
+                            "recoverable": False,
+                        }
+                    ]
+                },
+                {
+                    "items": [
+                        {
+                            "uri": uri,
+                            "cached": True,
+                            "pinned": True,
+                            "busy": False,
+                            "recoverable": False,
+                        }
+                    ]
+                },
+            )
+        )
+        calls: list[tuple[str, object]] = []
+        relayed: list[str] = []
+
+        async def action(name: str, target=None):
+            calls.append((name, target))
+            return next(responses)
+
+        async def no_wait(_seconds: float) -> None:
+            pass
+
+        with (
+            mock.patch.object(module, "run_action", side_effect=action),
+            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+            mock.patch.object(module.trio, "sleep", side_effect=no_wait),
+        ):
+            result = module.trio.run(module._run_action_command, "pin", uri)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            calls,
+            [("pin", uri), ("describe", [uri]), ("describe", [uri])],
+        )
+        self.assertEqual(relayed, ["pin-cached"])
+
+    def test_pin_action_reports_retryable_terminal_state(self) -> None:
+        module, _idle = _load_desktop_app()
+        uri = "file:///home/user/Immich/photo.jpg"
+        responses = iter(
+            (
+                {"pinned": True, "cached": False, "busy": True, "scheduled": True},
+                {
+                    "items": [
+                        {
+                            "uri": uri,
+                            "cached": False,
+                            "pinned": True,
+                            "busy": False,
+                            "recoverable": False,
+                        }
+                    ]
+                },
+            )
+        )
+        relayed: list[str] = []
+
+        async def action(_name: str, _target=None):
+            return next(responses)
+
+        with (
+            mock.patch.object(module, "run_action", side_effect=action),
+            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+        ):
+            result = module.trio.run(module._run_action_command, "pin", uri)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(relayed, ["pin-retry"])
+
+    def test_pin_action_timeout_keeps_the_durable_pin_truthful(self) -> None:
+        module, _idle = _load_desktop_app()
+        uri = "file:///home/user/Immich/photo.jpg"
+        relayed: list[str] = []
+
+        async def action(name: str, _target=None):
+            if name == "pin":
+                return {
+                    "pinned": True,
+                    "cached": False,
+                    "busy": True,
+                    "scheduled": True,
+                }
+            return {
+                "items": [
+                    {
+                        "uri": uri,
+                        "cached": False,
+                        "pinned": True,
+                        "busy": True,
+                        "recoverable": False,
+                    }
+                ]
+            }
+
+        with (
+            mock.patch.object(module, "run_action", side_effect=action),
+            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+            mock.patch.object(module, "_ACTION_WAIT_SECONDS", 0.01, create=True),
+        ):
+            result = module.trio.run(module._run_action_command, "pin", uri)
+
+        self.assertEqual(result, 124)
+        self.assertEqual(relayed, ["pin-timeout"])
+
+    def test_unpin_action_finishes_when_the_durable_pin_is_removed(self) -> None:
+        module, _idle = _load_desktop_app()
+        uri = "file:///home/user/Immich/photo.jpg"
+        response = {
+            "pinned": False,
+            "cached": True,
+            "busy": True,
+            "scheduled": False,
+        }
+        relayed: list[str] = []
+        calls: list[tuple[str, object]] = []
+
+        async def action(name: str, target=None):
+            calls.append((name, target))
+            return response
+
+        with (
+            mock.patch.object(module, "run_action", side_effect=action),
+            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+        ):
+            result = module.trio.run(module._run_action_command, "unpin", uri)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [("unpin", uri)])
+        self.assertEqual(relayed, ["unpin-cached"])
+
+    def test_control_failure_relays_only_a_fixed_error(self) -> None:
+        module, _idle = _load_desktop_app()
+        relayed: list[str] = []
+
+        async def broken(_name: str, _target=None):
+            raise RuntimeError("api-key=do-not-display")
+
+        with (
+            mock.patch.object(module, "run_action", side_effect=broken),
+            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+        ):
+            result = module.trio.run(module._run_action_command, "refresh", None)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(relayed, ["refresh-error"])
+
+    def test_main_runs_the_unique_settings_application_without_an_action(self) -> None:
         module, _idle = _load_desktop_app()
 
-        result = module.main(["--action", "status"])
+        result = module.main([])
 
         self.assertEqual(result, 17)
         self.assertEqual(
             _Application.run_calls,
-            [["immich-on-demand-desktop", "--action", "status"]],
+            [["immich-on-demand-desktop"]],
         )
+
+    def test_main_action_bypasses_the_unique_settings_application(self) -> None:
+        module, _idle = _load_desktop_app()
+        run = mock.Mock(return_value=7)
+
+        with mock.patch.object(module.trio, "run", run):
+            result = module.main(["--action", "refresh"])
+
+        self.assertEqual(result, 7)
+        run.assert_called_once_with(module._run_action_command, "refresh", None)
+        self.assertEqual(_Application.run_calls, [])
 
 
 if __name__ == "__main__":

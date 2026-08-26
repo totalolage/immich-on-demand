@@ -18,6 +18,10 @@ class DesktopTest(unittest.TestCase):
                 patch("immich_on_demand.desktop.secrets.randbits", return_value=0),
             ):
                 self.assertEqual(
+                    await run_action("status"),
+                    {"scheduled": True},
+                )
+                self.assertEqual(
                     await run_action("refresh"),
                     {"scheduled": True},
                 )
@@ -26,16 +30,41 @@ class DesktopTest(unittest.TestCase):
                     await run_action("evict", uri),
                     {"scheduled": True},
                 )
+                self.assertEqual(
+                    await run_action("describe", [uri]),
+                    {"scheduled": True},
+                )
+                self.assertEqual(await run_action("pin", uri), {"scheduled": True})
+                self.assertEqual(await run_action("unpin", uri), {"scheduled": True})
 
             self.assertEqual(
                 request.await_args_list,
                 [
+                    call(runtime / "control.sock", 1, "status", {}),
                     call(runtime / "control.sock", 1, "refresh", {}),
                     call(
                         runtime / "control.sock",
                         1,
                         "evict",
                         {"uri": uri},
+                    ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "describe",
+                        {"uris": [uri]},
+                    ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "pin",
+                        {"uri": uri, "pinned": True},
+                    ),
+                    call(
+                        runtime / "control.sock",
+                        1,
+                        "pin",
+                        {"uri": uri, "pinned": False},
                     ),
                 ],
             )
@@ -49,10 +78,23 @@ class DesktopTest(unittest.TestCase):
                 ("evict", None),
                 ("evict", "https://photos.example.test/photo.jpg"),
                 ("refresh", "file:///Photos/photo.jpg"),
+                ("describe", []),
+                ("describe", ["https://photos.example.test/photo.jpg"]),
+                ("describe", ["file:///Photos/photo.jpg"] * 65),
+                ("pin", None),
+                ("unpin", "https://photos.example.test/photo.jpg"),
                 ("unknown", None),
             ):
                 with self.subTest(action=action, uri=uri), self.assertRaises(ValueError):
                     await run_action(action, uri)
+
+        trio.run(scenario)
+
+    def test_describe_request_stays_below_the_desktop_batch_ceiling(self) -> None:
+        async def scenario() -> None:
+            with self.assertRaises(ValueError):
+                # The params fit below 48 KiB, but the complete control frame does not.
+                await run_action("describe", ["file:///" + "a" * 49_074])
 
         trio.run(scenario)
 

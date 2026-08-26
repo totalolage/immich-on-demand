@@ -111,6 +111,13 @@ class CliTest(unittest.TestCase):
             (["refresh"], "refresh", {}),
             (["evict"], "evict", {}),
             (["evict", "--asset", ASSET_ID], "evict", {"asset": ASSET_ID}),
+            (["pin", "--asset", ASSET_ID], "pin", {"asset": ASSET_ID, "pinned": True}),
+            (
+                ["unpin", "--asset", ASSET_ID],
+                "pin",
+                {"asset": ASSET_ID, "pinned": False},
+            ),
+            (["pin-status", "--asset", ASSET_ID], "pin", {"asset": ASSET_ID}),
         )
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory)

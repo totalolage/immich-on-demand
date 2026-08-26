@@ -158,6 +158,27 @@ async def _periodic_refresh(
             pass
 
 
+async def _pin_worker(
+    catalog: Catalog,
+    content_cache: ContentCache,
+    notifications: trio.MemoryReceiveChannel[bool],
+    pending: dict[str, CatalogAsset],
+    inflight: set[str],
+) -> None:
+    async for _ in notifications:
+        while pending:
+            asset_id, entry = pending.popitem()
+            if asset_id not in catalog.pinned_ids():
+                continue
+            inflight.add(asset_id)
+            try:
+                await content_cache.hydrate(entry.asset)
+            except Exception as error:
+                LOGGER.warning("pin hydration failed: %s", type(error).__name__)
+            finally:
+                inflight.discard(asset_id)
+
+
 def _missing_mutation_key(error: RuntimeError) -> bool:
     return "expected one mutation API key" in str(error) and str(error).endswith("found 0")
 
@@ -208,6 +229,7 @@ async def run_service(settings: Settings) -> None:
                 read_client,
                 max_bytes=settings.cache_max_bytes,
                 minimum_free_bytes=settings.minimum_free_bytes,
+                pinned_ids=catalog.pinned_ids(),
             )
             library = Library(
                 catalog,
@@ -221,6 +243,18 @@ async def run_service(settings: Settings) -> None:
             await refresh_catalog(catalog, read_client, read_session, catalog_lock)
 
             requests, refreshes = trio.open_memory_channel[bool](1)
+            pin_requests, pins = trio.open_memory_channel[bool](1)
+            pin_pending: dict[str, CatalogAsset] = {}
+            pin_inflight: set[str] = set()
+            persisted_pins = catalog.pinned_ids()
+            for entry in library.list():
+                if (
+                    entry.asset.id in persisted_pins
+                    and not content_cache.describe(entry.asset)["cached"]
+                ):
+                    pin_pending[entry.asset.id] = entry
+            if pin_pending:
+                pin_requests.send_nowait(True)
             full_requested = [False]
             mount_ready = trio.Event()
             fatal_errors: list[str] = []
@@ -267,6 +301,114 @@ async def run_service(settings: Settings) -> None:
                     pass
                 return {"scheduled": True}
 
+            async def describe(params: dict[str, Any]) -> dict[str, object]:
+                uris = params.get("uris")
+                if (
+                    set(params) != {"uris"}
+                    or not isinstance(uris, list)
+                    or not 0 < len(uris) <= 64
+                    or not all(isinstance(uri, str) for uri in uris)
+                ):
+                    raise ValueError("describe requires 1 to 64 mounted file URIs")
+                items: list[dict[str, object]] = []
+                for uri in uris:
+                    name = _library_name_from_uri(uri, settings.mount_path)
+                    entry = library.lookup(name)
+                    if entry is None:
+                        continue
+                    state = content_cache.describe(entry.asset)
+                    state["busy"] = (
+                        state["busy"]
+                        or entry.asset.id in pin_pending
+                        or entry.asset.id in pin_inflight
+                    )
+                    items.append(
+                        {
+                            "uri": uri,
+                            **state,
+                            "recoverable": False,
+                        }
+                    )
+                return {"items": items}
+
+            async def pin(params: dict[str, Any]) -> dict[str, bool]:
+                if set(params) == {"asset"} and isinstance(params["asset"], str):
+                    asset_id = str(UUID(params["asset"]))
+                    entry = next(
+                        (
+                            candidate
+                            for candidate in library.list()
+                            if candidate.asset.id == asset_id
+                        ),
+                        None,
+                    )
+                    if entry is None:
+                        return {
+                            "pinned": asset_id in catalog.pinned_ids(),
+                            "cached": False,
+                            "busy": asset_id in pin_inflight,
+                            "scheduled": asset_id in pin_pending,
+                        }
+                    return {
+                        **content_cache.describe(entry.asset),
+                        "scheduled": asset_id in pin_pending,
+                    }
+
+                pinned = params.get("pinned")
+                if type(pinned) is not bool or len(params) != 2:
+                    raise ValueError("pin requires one asset identity and a boolean state")
+                asset_id: str | None = None
+                if set(params) == {"asset", "pinned"} and isinstance(
+                    params["asset"], str
+                ):
+                    asset_id = str(UUID(params["asset"]))
+                    entry = next(
+                        (
+                            candidate
+                            for candidate in library.list()
+                            if candidate.asset.id == asset_id
+                        ),
+                        None,
+                    )
+                elif set(params) == {"uri", "pinned"}:
+                    name = _library_name_from_uri(params["uri"], settings.mount_path)
+                    entry = library.lookup(name)
+                else:
+                    raise ValueError("pin requires one asset identity and a boolean state")
+                if entry is not None:
+                    asset_id = entry.asset.id
+                if asset_id is None:
+                    raise ValueError("unknown library entry")
+
+                if not pinned:
+                    pin_pending.pop(asset_id, None)
+                    catalog.unpin(asset_id)
+                    content_cache.unpin(asset_id)
+                    return {
+                        "pinned": False,
+                        "cached": entry is not None
+                        and content_cache.describe(entry.asset)["cached"],
+                        "busy": asset_id in pin_inflight,
+                        "scheduled": False,
+                    }
+                if entry is None:
+                    raise ValueError("unknown library entry")
+
+                state = content_cache.describe(entry.asset)
+                if state["pinned"] and state["cached"]:
+                    return {**state, "scheduled": False}
+                catalog.pin(asset_id)
+                content_cache.pin(asset_id)
+                pin_pending[asset_id] = entry
+                try:
+                    pin_requests.send_nowait(True)
+                except trio.WouldBlock:
+                    pass
+                return {
+                    **content_cache.describe(entry.asset),
+                    "scheduled": True,
+                }
+
             async def evict(params: dict[str, Any]) -> dict[str, object]:
                 if not params:
                     return {
@@ -291,7 +433,7 @@ async def run_service(settings: Settings) -> None:
                     raise ValueError("evict accepts an asset UUID or mounted file URI")
                 return {"evicted": content_cache.evict(asset_id)}
 
-            async with requests, refreshes, trio.open_nursery() as nursery:
+            async with requests, refreshes, pin_requests, pins, trio.open_nursery() as nursery:
                 await nursery.start(
                     _refresh_worker,
                     catalog,
@@ -322,7 +464,21 @@ async def run_service(settings: Settings) -> None:
                     await nursery.start(
                         serve_control,
                         runtime_path() / "control.sock",
-                        {"status": status, "refresh": refresh, "evict": evict},
+                        {
+                            "status": status,
+                            "refresh": refresh,
+                            "evict": evict,
+                            "describe": describe,
+                            "pin": pin,
+                        },
+                    )
+                    nursery.start_soon(
+                        _pin_worker,
+                        catalog,
+                        content_cache,
+                        pins,
+                        pin_pending,
+                        pin_inflight,
                     )
                     nursery.start_soon(
                         _periodic_refresh,

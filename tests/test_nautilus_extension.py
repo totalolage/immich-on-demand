@@ -30,6 +30,7 @@ class _FileInfo:
         self.location = _File(path)
         self.directory = directory
         self.emblems: list[str] = []
+        self.invalidations = 0
 
     def get_location(self):
         return self.location
@@ -42,6 +43,9 @@ class _FileInfo:
 
     def add_emblem(self, emblem: str) -> None:
         self.emblems.append(emblem)
+
+    def invalidate_extension_info(self) -> None:
+        self.invalidations += 1
 
 
 class _MenuItem:
@@ -64,11 +68,30 @@ class _MenuItem:
 
 class _Subprocess:
     calls: list[tuple[list[str], int]] = []
+    pending: list["_Subprocess"] = []
+
+    def __init__(self) -> None:
+        self.callback = None
+        self.callback_args = ()
 
     @classmethod
     def new(cls, argv, flags):
         cls.calls.append((list(argv), flags))
         return cls()
+
+    def wait_async(self, _cancellable, callback, *args) -> None:
+        self.callback = callback
+        self.callback_args = args
+        self.pending.append(self)
+
+    def wait_finish(self, _result) -> bool:
+        return True
+
+    def complete(self) -> None:
+        if self.callback is None:
+            raise AssertionError("subprocess has no completion callback")
+        self.pending.remove(self)
+        self.callback(self, object(), *self.callback_args)
 
 
 class _GObjectBase:
@@ -85,11 +108,17 @@ class _InfoProvider:
 
 class _GLib:
     callbacks: list[tuple[object, tuple[object, ...]]] = []
+    timeouts: list[tuple[int, object, tuple[object, ...]]] = []
 
     @classmethod
     def idle_add(cls, callback, *args) -> int:
         cls.callbacks.append((callback, args))
         return len(cls.callbacks)
+
+    @classmethod
+    def timeout_add(cls, milliseconds: int, callback, *args) -> int:
+        cls.timeouts.append((milliseconds, callback, args))
+        return len(cls.timeouts)
 
 
 class _OperationResult:
@@ -186,7 +215,9 @@ def _drain_deferred_work() -> None:
 
 def _reset_fakes() -> None:
     _Subprocess.calls.clear()
+    _Subprocess.pending.clear()
     _GLib.callbacks.clear()
+    _GLib.timeouts.clear()
     _NautilusRuntime.completions.clear()
     _DeferredThread.created.clear()
 
@@ -307,6 +338,46 @@ class NautilusExtensionTests(unittest.TestCase):
                     (closures[1], provider, handles[1], _OperationResult.COMPLETE),
                 ],
             )
+
+    def test_busy_state_invalidates_again_after_the_cache_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module, extension, mount_path = _configured_extension(root)
+            file = _FileInfo(str(mount_path / "pending.jpg"))
+            uri = file.get_uri()
+            response = {
+                "items": [
+                    {
+                        "uri": uri,
+                        "cached": False,
+                        "pinned": True,
+                        "busy": True,
+                        "recoverable": False,
+                    }
+                ]
+            }
+
+            extension.update_file_info_full(object(), object(), object(), file)
+            callback, args = _GLib.callbacks.pop(0)
+            with (
+                mock.patch("threading.Thread", _DeferredThread),
+                mock.patch.object(
+                    module, "run_action", mock.AsyncMock(return_value=response)
+                ),
+            ):
+                callback(*args)
+                _DeferredThread.created[0].run()
+            callback, args = _GLib.callbacks.pop(0)
+            callback(*args)
+
+            self.assertIn(uri, extension._cache)
+            self.assertEqual(file.invalidations, 0)
+            self.assertEqual(len(_GLib.timeouts), 1)
+            milliseconds, callback, args = _GLib.timeouts.pop(0)
+            self.assertEqual(milliseconds, int(module._CACHE_SECONDS * 1000))
+            self.assertFalse(callback(*args))
+            self.assertNotIn(uri, extension._cache)
+            self.assertEqual(file.invalidations, 1)
 
     def test_cancel_completes_once_and_removes_the_uri_from_pending_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -595,14 +666,26 @@ class NautilusExtensionTests(unittest.TestCase):
             items = extension.get_file_items([_FileInfo(str(asset_path))])
 
             self.assertEqual(
-                [item.properties["label"] for item in items], ["Evict Local Copy"]
+                [item.properties["label"] for item in items],
+                ["Pin for Offline Use", "Evict Local Copy"],
             )
             self.assertEqual(_Subprocess.calls, [])
 
             items[0].activate()
+            items[1].activate()
             self.assertEqual(
                 _Subprocess.calls,
                 [
+                    (
+                        [
+                            "immich-on-demand-desktop",
+                            "--action",
+                            "pin",
+                            "--uri",
+                            asset_path.as_uri(),
+                        ],
+                        0,
+                    ),
                     (
                         [
                             "immich-on-demand-desktop",
@@ -613,6 +696,110 @@ class NautilusExtensionTests(unittest.TestCase):
                         ],
                         0,
                     )
+                ],
+            )
+
+    def test_recent_pinned_state_replaces_pin_and_evict_with_unpin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module, extension, mount_path = _configured_extension(root)
+            asset = _FileInfo(str(mount_path / "pinned.jpg"))
+            extension._cache[asset.get_uri()] = (
+                module.time.monotonic() + 10,
+                {
+                    "cached": True,
+                    "pinned": True,
+                    "busy": False,
+                    "recoverable": False,
+                },
+            )
+
+            items = extension.get_file_items([asset])
+
+            self.assertEqual(
+                [item.properties["label"] for item in items], ["Unpin"]
+            )
+            items[0].activate()
+            self.assertIn(asset.get_uri(), extension._cache)
+            self.assertEqual(asset.invalidations, 0)
+            _Subprocess.pending[0].complete()
+            self.assertNotIn(asset.get_uri(), extension._cache)
+            self.assertEqual(asset.invalidations, 1)
+            self.assertEqual(
+                _Subprocess.calls,
+                [
+                    (
+                        [
+                            "immich-on-demand-desktop",
+                            "--action",
+                            "unpin",
+                            "--uri",
+                            asset.get_uri(),
+                        ],
+                        0,
+                    )
+                ],
+            )
+
+    def test_pin_launch_refreshes_from_the_daemon_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module, extension, mount_path = _configured_extension(root)
+            asset = _FileInfo(str(mount_path / "slow-video.mp4"))
+            uri = asset.get_uri()
+            extension._cache[uri] = (
+                module.time.monotonic() + 10,
+                {
+                    "cached": False,
+                    "pinned": False,
+                    "busy": False,
+                    "recoverable": False,
+                },
+            )
+
+            items = extension.get_file_items([asset])
+            items[0].activate()
+
+            self.assertIn(uri, extension._cache)
+            self.assertEqual(asset.invalidations, 0)
+            self.assertEqual(len(_Subprocess.pending), 1)
+            self.assertEqual(len(_GLib.timeouts), 1)
+            _milliseconds, callback, args = _GLib.timeouts.pop(0)
+            self.assertFalse(callback(*args))
+            self.assertNotIn(uri, extension._cache)
+            self.assertEqual(asset.invalidations, 1)
+            self.assertEqual(len(_Subprocess.pending), 1)
+
+    def test_failed_pinned_download_can_be_retried_or_unpinned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module, extension, mount_path = _configured_extension(root)
+            asset = _FileInfo(str(mount_path / "retry.jpg"))
+            extension._cache[asset.get_uri()] = (
+                module.time.monotonic() + 10,
+                {
+                    "cached": False,
+                    "pinned": True,
+                    "busy": False,
+                    "recoverable": False,
+                },
+            )
+
+            items = extension.get_file_items([asset])
+
+            self.assertEqual(
+                [item.properties["label"] for item in items],
+                ["Retry Pinned Download", "Unpin"],
+            )
+            items[0].activate()
+            self.assertEqual(
+                _Subprocess.calls[0][0],
+                [
+                    "immich-on-demand-desktop",
+                    "--action",
+                    "pin",
+                    "--uri",
+                    asset.get_uri(),
                 ],
             )
 

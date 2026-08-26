@@ -2,7 +2,7 @@
 
 ## Destination
 
-Extend the released Flat library without weakening its safety rules. Later releases may add desktop controls, offline behavior, Views, broader media support, Asset replacement, multiple Profiles, and more platforms.
+Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, and the first desktop controls are implemented but await target acceptance. Later releases may add Restore, offline behavior, Views, broader media support, Asset replacement, multiple Profiles, and more platforms.
 
 ## Rules
 
@@ -17,13 +17,13 @@ Extend the released Flat library without weakening its safety rules. Later relea
 ### 1.0.x: distribute and refine
 
 - [Publish the Arch package to the AUR](issues/01-publish-the-arch-package-to-the-aur.md)
-- [Follow Nautilus sort changes without restart](issues/02-follow-nautilus-sort-changes.md)
-- [Replace full catalog sweeps with bounded incremental refresh](issues/03-add-incremental-refresh.md)
+- [Follow Nautilus sort changes without restart](issues/02-follow-nautilus-sort-changes.md) is resolved.
+- [Bounded incremental refresh](issues/03-add-incremental-refresh.md) is implemented. Target package and service acceptance remain.
 
 ### 1.1: control local residency
 
-- [Add Nautilus actions and a settings GUI](issues/05-add-desktop-controls.md)
-- [Add Pinning](issues/04-add-pinning.md)
+- [Nautilus actions and a settings GUI](issues/05-add-desktop-controls.md) are implemented in the source tree. Package integration and target acceptance remain.
+- [Pinning](issues/04-add-pinning.md), including CLI `pin-status`, is implemented. Target acceptance remains.
 - [Add an explicit trash restore command](issues/06-add-trash-restore.md)
 
 ### 1.2: work through outages

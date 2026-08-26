@@ -1,9 +1,10 @@
 # Replace full catalog sweeps with bounded incremental refresh
 
 Type: feature
-Status: resolved
+Status: implemented
 Target: 1.0.x
 Blocked by: none
+Target acceptance: pending
 
 ## Scope
 
@@ -20,3 +21,7 @@ Use `updatedAfter` with overlap and deduplication to reduce routine catalog traf
 Routine refreshes query from the committed high-water timestamp minus twice the configured refresh interval. They accept shifted duplicate IDs, stage at most the page count of the last complete sweep, and atomically upsert without deleting absent rows. Startup, manual repair, the daily reconciliation, and an over-budget delta use the existing paired stable full sweep. The catalog cursor and page budget advance only in the same transaction that publishes staged rows.
 
 The read-only Reference-server proof reduced one quiet routine refresh from 28 page requests for a paired complete sweep to one request.
+
+## Remaining acceptance
+
+Install the updated service on the target Arch system. Verify a quiet routine refresh, an overlapping metadata change, and a complete reconciliation through the packaged user service. These checks must not mutate the Protected library.

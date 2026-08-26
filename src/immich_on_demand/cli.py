@@ -57,6 +57,11 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="show local catalog counts")
     evict = commands.add_parser("evict", help="evict cached originals")
     evict.add_argument("--asset", type=_asset_id)
+    for command in ("pin", "unpin"):
+        pin = commands.add_parser(command, help=f"{command} a cached original")
+        pin.add_argument("--asset", type=_asset_id, required=True)
+    pin_status = commands.add_parser("pin-status", help="show an original's Pin state")
+    pin_status.add_argument("--asset", type=_asset_id, required=True)
     return result
 
 
@@ -83,13 +88,31 @@ def main(argv: list[str] | None = None) -> int:
             logging.basicConfig(level=logging.INFO)
             trio.run(run_service, load(arguments.config))
             return 0
-        if arguments.command in {"refresh", "status", "evict"}:
-            params = (
-                {"asset": arguments.asset}
-                if arguments.command == "evict" and arguments.asset is not None
-                else {}
-            )
-            return trio.run(_control, arguments.command, params)
+        if arguments.command in {
+            "refresh",
+            "status",
+            "evict",
+            "pin",
+            "unpin",
+            "pin-status",
+        }:
+            if arguments.command in {"pin", "unpin"}:
+                method = "pin"
+                params = {
+                    "asset": arguments.asset,
+                    "pinned": arguments.command == "pin",
+                }
+            elif arguments.command == "pin-status":
+                method = "pin"
+                params = {"asset": arguments.asset}
+            else:
+                method = arguments.command
+                params = (
+                    {"asset": arguments.asset}
+                    if arguments.command == "evict" and arguments.asset is not None
+                    else {}
+                )
+            return trio.run(_control, method, params)
         raise AssertionError(arguments.command)
     except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
         print(f"immich-on-demand: {error}", file=sys.stderr)
