@@ -34,7 +34,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 ### 1.3: add rich library Views
 
 - [The multi-View namespace](issues/09-define-the-multi-view-namespace.md) is resolved.
-- [All, Album, People, Date, and Favorite Views](issues/10-add-rich-library-views.md) are implemented. Target read-only acceptance remains.
+- [All, Album, People, Date, and Favorite Views](issues/10-add-rich-library-views.md) are implemented. The Reference namespace, hardlinks, link counts, and no-Hydration traversal passed; server-inventory and Favorite-versus-Pin checks remain.
 
 ### 1.4: expand mutation and media behavior
 

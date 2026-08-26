@@ -21,3 +21,7 @@ The service fetches complete Album and People inventories as a pair and publishe
 - Assets with several albums or people appear in each relevant directory as hardlinks.
 - Favorite reflects Immich metadata and never implies Pin.
 - Listing every View performs no Hydration.
+
+## Reference result
+
+The read-only namespace scan passed on August 26, 2026. The Library root contained exactly the five fixed Views and no files. It found 22,575 aliases for 11,238 file inodes, every inode appeared in more than one View, the largest alias set contained four paths, and every reported link count matched the observed aliases. The complete traversal took 0.741 seconds and left the original cache at 243 files. Server-inventory comparison and the Favorite versus Pin check remain pending.
