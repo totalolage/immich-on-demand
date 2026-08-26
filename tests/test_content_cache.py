@@ -333,6 +333,66 @@ class ContentCacheTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_replacement_pin_hydrates_new_original_and_retires_old_pin(self) -> None:
+        old_content = b"old original"
+        replacement_content = b"replacement original"
+
+        async def scenario(root: Path) -> None:
+            old = asset(old_content)
+            replacement = asset(replacement_content, OTHER_ID)
+            old_path = root / old.id
+            old_path.write_bytes(old_content)
+            os.utime(old_path, ns=(1, old.modified_ns))
+            client = Client([replacement_content])
+            cache = ContentCache(
+                root,
+                client,  # type: ignore[arg-type]
+                pinned_ids={old.id},
+            )
+
+            await cache.transfer_pin(old.id, replacement, pinned=True)
+
+            self.assertEqual(
+                cache.describe(old),
+                {"cached": True, "busy": False, "pinned": False},
+            )
+            self.assertEqual(
+                cache.describe(replacement),
+                {"cached": True, "busy": False, "pinned": True},
+            )
+            self.assertEqual((root / replacement.id).read_bytes(), replacement_content)
+            self.assertEqual(client.calls, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_failed_replacement_pin_keeps_new_pin_without_publishing_bad_bytes(
+        self,
+    ) -> None:
+        replacement_content = b"replacement original"
+
+        async def scenario(root: Path) -> None:
+            old = asset(b"old original")
+            replacement = asset(replacement_content, OTHER_ID)
+            cache = ContentCache(
+                root,
+                Client([b"wrong replacement"]),  # type: ignore[arg-type]
+                pinned_ids={old.id},
+            )
+
+            with self.assertRaises(CacheIntegrityError):
+                await cache.transfer_pin(old.id, replacement, pinned=True)
+
+            self.assertFalse(cache.describe(old)["pinned"])
+            self.assertEqual(
+                cache.describe(replacement),
+                {"cached": False, "busy": False, "pinned": True},
+            )
+            self.assertFalse((root / replacement.id).exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_rejects_a_symlink_cache_root_without_touching_its_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

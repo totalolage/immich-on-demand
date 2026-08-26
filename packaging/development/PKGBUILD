@@ -1,6 +1,6 @@
 pkgname=immich-on-demand-git
 _project=immich-on-demand
-pkgver=1.3.0.dev0.r83.gda45ee5
+pkgver=1.4.0.dev0.r85.g07a5573
 pkgrel=1
 pkgdesc='Expose an Immich library as a Linux filesystem with files on demand'
 arch=('any')

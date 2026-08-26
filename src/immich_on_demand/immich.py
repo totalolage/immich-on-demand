@@ -25,7 +25,7 @@ CORE_READ_PERMISSIONS = frozenset(
 )
 READ_PERMISSIONS = CORE_READ_PERMISSIONS | {"album.read", "person.read"}
 UPLOAD_PERMISSIONS = CORE_READ_PERMISSIONS | {"asset.upload"}
-MUTATION_PERMISSIONS = UPLOAD_PERMISSIONS | {"asset.delete"}
+MUTATION_PERMISSIONS = UPLOAD_PERMISSIONS | {"asset.copy", "asset.delete"}
 LOGGER = logging.getLogger(__name__)
 UPLOAD_MARKER_KEY = "immich-on-demand.upload"
 UPLOAD_RETRY_STATUSES = frozenset({408, 425, 429}) | frozenset(range(500, 600))
@@ -330,8 +330,21 @@ class ImmichClient:
                 raise ImmichPageLimitError("Immich search exceeded its page limit")
             page += 1
 
-    async def albums(self) -> list[Album]:
-        response = await self._request("GET", "albums")
+    async def albums(self, *, asset_id: str | None = None) -> list[Album]:
+        if asset_id is not None:
+            if not isinstance(asset_id, str):
+                raise ValueError("asset_id must be a canonical UUID")
+            try:
+                canonical_asset_id = str(UUID(asset_id))
+            except ValueError as error:
+                raise ValueError("asset_id must be a canonical UUID") from error
+            if canonical_asset_id != asset_id:
+                raise ValueError("asset_id must be a canonical UUID")
+        response = await self._request(
+            "GET",
+            "albums",
+            params={"assetId": asset_id} if asset_id is not None else None,
+        )
         try:
             value = response.json()
         except ValueError as error:
@@ -526,12 +539,45 @@ class ImmichClient:
             raise ImmichResponseError("Immich returned invalid upload metadata")
         return upload_id
 
+    async def copy_albums(
+        self, source_asset_id: str, target_asset_id: str
+    ) -> None:
+        for label, asset_id in (
+            ("source asset ID", source_asset_id),
+            ("target asset ID", target_asset_id),
+        ):
+            if not isinstance(asset_id, str):
+                raise ValueError(f"{label} must be a canonical UUID")
+            try:
+                canonical_asset_id = str(UUID(asset_id))
+            except ValueError as error:
+                raise ValueError(f"{label} must be a canonical UUID") from error
+            if canonical_asset_id != asset_id:
+                raise ValueError(f"{label} must be a canonical UUID")
+        response = await self._request(
+            "PUT",
+            "assets/copy",
+            json={
+                "sourceId": source_asset_id,
+                "targetId": target_asset_id,
+                "albums": True,
+                "favorite": False,
+                "sharedLinks": False,
+                "sidecar": False,
+                "stack": False,
+            },
+        )
+        if response.status_code != 204 or response.content:
+            raise ImmichResponseError("Immich returned an invalid album copy response")
+
     async def upload(
         self,
         descriptor: int,
         requested_name: str,
         media_types: frozenset[str],
         upload_id: str,
+        *,
+        replacement_source: Asset | None = None,
     ) -> UploadResult:
         if not isinstance(requested_name, str):
             raise ValueError("requested upload name must be a string")
@@ -548,9 +594,29 @@ class ImmichClient:
             raise ValueError("upload ID must be a canonical UUID")
         if type(descriptor) is not int or descriptor < 0:
             raise ValueError("upload payload descriptor is invalid")
+        if replacement_source is not None and (
+            not isinstance(replacement_source, Asset)
+            or type(replacement_source.created_ns) is not int
+            or type(replacement_source.is_favorite) is not bool
+            or not isinstance(replacement_source.visibility, str)
+            or replacement_source.visibility
+            not in {"archive", "hidden", "locked", "timeline"}
+        ):
+            raise ValueError("replacement source has invalid metadata")
         checksum = await trio.to_thread.run_sync(_sha1, descriptor)
         stats = os.fstat(descriptor)
-        created = datetime.fromtimestamp(stats.st_ctime, timezone.utc).isoformat()
+        if replacement_source is None:
+            created = datetime.fromtimestamp(stats.st_ctime, timezone.utc).isoformat()
+        else:
+            seconds, nanoseconds = divmod(replacement_source.created_ns, 1_000_000_000)
+            try:
+                created = (
+                    datetime.fromtimestamp(seconds, timezone.utc)
+                    .replace(microsecond=nanoseconds // 1000)
+                    .isoformat()
+                )
+            except (OverflowError, OSError, ValueError) as error:
+                raise ValueError("replacement source has invalid metadata") from error
         modified = datetime.fromtimestamp(stats.st_mtime, timezone.utc).isoformat()
         metadata = json.dumps(
             [
@@ -561,6 +627,15 @@ class ImmichClient:
             ],
             separators=(",", ":"),
         )
+        data = {
+            "fileCreatedAt": created,
+            "fileModifiedAt": modified,
+            "filename": requested_name,
+            "metadata": metadata,
+        }
+        if replacement_source is not None:
+            data["isFavorite"] = "true" if replacement_source.is_favorite else "false"
+            data["visibility"] = replacement_source.visibility
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             stream.seek(0)
             response = await self._request(
@@ -569,12 +644,7 @@ class ImmichClient:
                 retry_statuses=UPLOAD_RETRY_STATUSES,
                 passthrough_statuses=frozenset(range(200, 400)),
                 headers={"x-immich-checksum": base64.b64encode(checksum).decode("ascii")},
-                data={
-                    "fileCreatedAt": created,
-                    "fileModifiedAt": modified,
-                    "filename": requested_name,
-                    "metadata": metadata,
-                },
+                data=data,
                 files={
                     "assetData": (
                         requested_name,

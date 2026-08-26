@@ -27,7 +27,7 @@ The source tree also contains the desktop entry, Nautilus loader, and applicatio
 
 ## Remaining acceptance
 
-- Build the development Arch package and test install, upgrade, restart, disable, and uninstall on the target system.
-- Load the adapter in Nautilus 50 on the target system. Verify that menus and emblems appear only inside the configured mount and update after each action.
+- Build the development Arch package and test install, upgrade, restart, disable, and uninstall on the Reference system.
+- Load the adapter in Nautilus 50 on the Reference system. Verify that menus and emblems appear only inside the configured mount and update after each action.
 - Save settings and replacement keys through the GUI. Restart the service and verify the saved configuration without exposing either key.
 - Temporarily disable the loader, launcher, and GUI executable separately, prove that the daemon and CLI still work, then restore package integrity by reinstalling.

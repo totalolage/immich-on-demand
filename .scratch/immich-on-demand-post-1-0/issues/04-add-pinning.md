@@ -25,4 +25,4 @@ The control API reports `pinned`, `cached`, `busy`, and `scheduled`. The CLI exp
 
 ## Remaining acceptance
 
-Use one recorded Test asset on the target system. Pin it while uncached, verify the downloaded bytes, restart the service, and prove that both automatic and manual Eviction skip it. Then Unpin it, verify that the cached bytes remain, and Evict it. Do not Pin or Evict a Protected-library asset during mutation acceptance.
+Use one recorded Test asset on the Reference system. Pin it while uncached, verify the downloaded bytes, restart the service, and prove that both automatic and manual Eviction skip it. Then Unpin it, verify that the cached bytes remain, and Evict it. Do not Pin or Evict a Protected-library asset during mutation acceptance.

@@ -76,7 +76,7 @@ Keep the extension and GUI as leaf adapters. Removing either installed file or d
 
 ## Acceptance plan
 
-Automate the contract before the target-system check:
+Automate the contract before the Reference-system check:
 
 1. Test the `Gio.File` scope predicate for the root, descendants, siblings with a shared text prefix, spaces, non-file URIs, and invalid configuration.
 2. Test providers with fake `FileInfo` objects. Out-of-scope, mixed, and oversized selections return no action and make no control call. In-scope callbacks construct the exact subprocess argument vector with the URI as one argument.

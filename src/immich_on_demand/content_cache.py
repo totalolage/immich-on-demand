@@ -119,6 +119,24 @@ class ContentCache:
         UUID(asset_id)
         self._pinned.discard(asset_id)
 
+    async def transfer_pin(
+        self,
+        source_asset_id: str,
+        replacement: Asset,
+        *,
+        pinned: bool,
+    ) -> Path | None:
+        UUID(source_asset_id)
+        UUID(replacement.id)
+        if type(pinned) is not bool:
+            raise TypeError("replacement pin state must be a boolean")
+        self._pinned.discard(source_asset_id)
+        if not pinned:
+            self._pinned.discard(replacement.id)
+            return None
+        self._pinned.add(replacement.id)
+        return await self.hydrate(replacement)
+
     def acquire(self, asset_id: str) -> None:
         UUID(asset_id)
         self._open[asset_id] = self._open.get(asset_id, 0) + 1

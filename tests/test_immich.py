@@ -1,5 +1,6 @@
 import unittest
 from contextlib import aclosing
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import logging
@@ -18,9 +19,11 @@ from immich_on_demand.immich import (
     ImmichResponseError,
     ImmichRetryableError,
     ImmichUnavailableError,
+    MUTATION_PERMISSIONS,
     READ_PERMISSIONS,
+    UPLOAD_PERMISSIONS,
 )
-from immich_on_demand.model import Album, Person
+from immich_on_demand.model import Album, Asset, Person
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
@@ -83,6 +86,15 @@ def person(
 
 
 class ImmichClientTest(unittest.TestCase):
+    def test_mutation_permissions_add_copy_only_to_destructive_uploads(self) -> None:
+        self.assertEqual(
+            MUTATION_PERMISSIONS,
+            UPLOAD_PERMISSIONS | {"asset.copy", "asset.delete"},
+        )
+        self.assertTrue(
+            MUTATION_PERMISSIONS.isdisjoint({"album.read", "person.read"})
+        )
+
     def test_people_validates_paginates_and_sorts_the_inventory(self) -> None:
         requests = 0
 
@@ -224,6 +236,33 @@ class ImmichClientTest(unittest.TestCase):
                 )
 
         trio.run(scenario)
+
+    def test_albums_filters_by_one_canonical_asset_id(self) -> None:
+        requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            self.assertEqual((request.method, request.url.path), ("GET", "/api/albums"))
+            self.assertEqual(dict(request.url.params), {"assetId": ASSET_ID})
+            return httpx.Response(200, json=[])
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                self.assertEqual(await client.albums(asset_id=ASSET_ID), [])
+                for invalid in (ASSET_ID.upper(), "not-a-uuid", 7):
+                    with self.subTest(invalid=invalid):
+                        with self.assertRaisesRegex(
+                            ValueError, "asset_id must be a canonical UUID"
+                        ):
+                            await client.albums(asset_id=invalid)  # type: ignore[arg-type]
+
+        trio.run(scenario)
+        self.assertEqual(requests, 1)
 
     def test_albums_rejects_malformed_or_duplicate_records(self) -> None:
         cases: tuple[object, ...] = (
@@ -839,6 +878,8 @@ class ImmichClientTest(unittest.TestCase):
             )
             self.assertIn(b'name="assetData"; filename="photo.jpg"', body)
             self.assertIn(b"content", body)
+            self.assertNotIn(b'name="isFavorite"', body)
+            self.assertNotIn(b'name="visibility"', body)
             return httpx.Response(201, json={"status": "created", "id": ASSET_ID})
 
         async def scenario(descriptor: int) -> None:
@@ -865,6 +906,89 @@ class ImmichClientTest(unittest.TestCase):
             with path.open("rb") as payload:
                 trio.run(scenario, payload.fileno())
         self.assertEqual(requests, ["/api/assets"])
+
+    def test_replacement_upload_preserves_source_metadata_in_utc(self) -> None:
+        bodies: list[bytes] = []
+        source_value = asset()
+        source_value["isFavorite"] = True
+        source_value["visibility"] = "archive"
+        source = Asset.from_api(source_value)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(request.read())
+            return httpx.Response(201, json={"status": "created", "id": OTHER_ID})
+
+        async def scenario(descriptor: int) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                await client.upload(
+                    descriptor,
+                    "photo.jpg",
+                    frozenset({".jpg"}),
+                    UPLOAD_ID,
+                    replacement_source=source,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            path.write_bytes(b"replacement")
+            with path.open("rb") as payload:
+                trio.run(scenario, payload.fileno())
+
+        body = bodies[0]
+        self.assertIn(
+            b'name="fileCreatedAt"\r\n\r\n2026-08-25T10:00:00+00:00', body
+        )
+        self.assertIn(b'name="isFavorite"\r\n\r\ntrue', body)
+        self.assertIn(b'name="visibility"\r\n\r\narchive', body)
+
+    def test_replacement_upload_rejects_invalid_source_metadata_before_network(
+        self,
+    ) -> None:
+        requests = 0
+        source = Asset.from_api(asset())
+        cases = (
+            object(),
+            replace(source, created_ns=True),
+            replace(source, created_ns=10**100),
+            replace(source, is_favorite=1),
+            replace(source, visibility=[]),
+            replace(source, visibility="public"),
+        )
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            raise AssertionError("invalid replacement source reached the network")
+
+        async def scenario(descriptor: int, invalid: object) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ValueError, "^replacement source has invalid metadata$"
+                ):
+                    await client.upload(
+                        descriptor,
+                        "photo.jpg",
+                        frozenset({".jpg"}),
+                        UPLOAD_ID,
+                        replacement_source=invalid,  # type: ignore[arg-type]
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            path.write_bytes(b"replacement")
+            for invalid in cases:
+                with self.subTest(invalid=invalid):
+                    with path.open("rb") as payload:
+                        trio.run(scenario, payload.fileno(), invalid)
+        self.assertEqual(requests, 0)
 
     def test_upload_uses_the_supplied_validated_descriptor(self) -> None:
         bodies: list[bytes] = []
@@ -1115,6 +1239,146 @@ class ImmichClientTest(unittest.TestCase):
         for value in ({"id": ASSET_ID}, asset(OTHER_ID)):
             with self.subTest(value=value):
                 trio.run(scenario, value)
+
+    def test_asset_read_confirms_the_old_asset_is_trashed(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(
+                (request.method, request.url.path),
+                ("GET", f"/api/assets/{ASSET_ID}"),
+            )
+            value = asset()
+            value["isTrashed"] = True
+            return httpx.Response(200, json=value)
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                self.assertTrue((await client.asset(ASSET_ID)).is_trashed)
+
+        trio.run(scenario)
+
+    def test_asset_read_sanitizes_a_missing_old_asset(self) -> None:
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "api-secret",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(
+                        404,
+                        content=b"api-secret private response",
+                        headers={"x-correlation-id": "request-8"},
+                    )
+                ),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichError,
+                    f"^Immich GET assets/{ASSET_ID} failed with 404; correlation request-8$",
+                ) as raised:
+                    await client.asset(ASSET_ID)
+                self.assertNotIn("api-secret", str(raised.exception))
+                self.assertNotIn("private", str(raised.exception))
+
+        trio.run(scenario)
+
+    def test_copy_albums_sends_only_the_explicit_album_operation(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            self.assertEqual(
+                request.read(),
+                b'{"sourceId":"12345678-1234-4234-8234-123456789abc",'
+                b'"targetId":"22345678-1234-4234-8234-123456789abc",'
+                b'"albums":true,"favorite":false,"sharedLinks":false,'
+                b'"sidecar":false,"stack":false}',
+            )
+            return httpx.Response(204)
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                await client.copy_albums(ASSET_ID, OTHER_ID)
+
+        trio.run(scenario)
+        self.assertEqual(requests, [("PUT", "/api/assets/copy")])
+
+    def test_copy_albums_requires_canonical_asset_ids_before_network(self) -> None:
+        requests = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            raise AssertionError("invalid copy reached the network")
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                cases = (
+                    (ASSET_ID.upper(), OTHER_ID, "source asset ID"),
+                    (ASSET_ID, "not-a-uuid", "target asset ID"),
+                    (ASSET_ID, 7, "target asset ID"),
+                )
+                for source_id, target_id, message in cases:
+                    with self.subTest(source_id=source_id, target_id=target_id):
+                        with self.assertRaisesRegex(ValueError, message):
+                            await client.copy_albums(  # type: ignore[arg-type]
+                                source_id, target_id
+                            )
+
+        trio.run(scenario)
+        self.assertEqual(requests, 0)
+
+    def test_copy_albums_rejects_wrong_success_or_response_content(self) -> None:
+        async def scenario(status: int, content: bytes) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(status, content=content)
+                ),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichResponseError,
+                    "^Immich returned an invalid album copy response$",
+                ) as raised:
+                    await client.copy_albums(ASSET_ID, OTHER_ID)
+                self.assertNotIn("private", str(raised.exception))
+
+        for status, content in ((200, b""), (204, b"private response")):
+            with self.subTest(status=status, content=content):
+                trio.run(scenario, status, content)
+
+    def test_copy_albums_sanitizes_http_failures(self) -> None:
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "api-secret",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(
+                        403,
+                        content=b"api-secret private response",
+                        headers={"x-correlation-id": "request-7"},
+                    )
+                ),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichError,
+                    "^Immich PUT assets/copy failed with 403; correlation request-7$",
+                ) as raised:
+                    await client.copy_albums(ASSET_ID, OTHER_ID)
+                self.assertNotIn("api-secret", str(raised.exception))
+                self.assertNotIn("private", str(raised.exception))
+
+        trio.run(scenario)
 
     def test_upload_checks_requested_name_extension_before_network(self) -> None:
         requests = 0

@@ -2,13 +2,13 @@
 
 Status: implementation-ready research
 Date: 2026-08-26
-Examined baseline: Immich On-Demand 1.3.0.dev0, Arch Linux, Nautilus 50
+Examined baseline: Immich On-Demand 1.4.0.dev0, Arch Linux, Nautilus 50
 
 ## Decision
 
-Keep `packaging/PKGBUILD` as the checksum-pinned version 1.0.0 release recipe. Add the moving development recipe only at `packaging/development/PKGBUILD`, named `immich-on-demand-git`. This keeps release builds reproducible while providing one target-system package for the current daemon, CLI, GTK application, Nautilus adapter, and icons.
+Keep `packaging/PKGBUILD` as the checksum-pinned version 1.0.0 release recipe. Add the moving development recipe only at `packaging/development/PKGBUILD`, named `immich-on-demand-git`. This keeps release builds reproducible while providing one Reference-system package for the current daemon, CLI, GTK application, Nautilus adapter, and icons.
 
-Use a Git source named `immich-on-demand`, fetched from the HTTPS `main` branch, and derive `pkgver` as `1.3.0.dev0.r<commit-count>.g<short-hash>`. The repository's last tag is still 1.0.0, so reading the development version from `pyproject.toml` and appending a monotonic revision identifies the current source more accurately than `git describe` alone. Arch's VCS guidance permits parsing project files for the release component and recommends the `RELEASE.rREVISION` form, a `-git` package name, the VCS tool in `makedepends`, and `SKIP` for a moving VCS checksum. It also recommends versioned `provides`, `conflicts`, and no `replaces`. See the official [VCS package guidelines](https://wiki.archlinux.org/title/VCS_package_guidelines) and [PKGBUILD relations](https://wiki.archlinux.org/title/PKGBUILD#Package_relations).
+Use a Git source named `immich-on-demand`, fetched from the HTTPS `main` branch, and derive `pkgver` as `1.4.0.dev0.r<commit-count>.g<short-hash>`. The repository's last tag is still 1.0.0, so reading the development version from `pyproject.toml` and appending a monotonic revision identifies the current source more accurately than `git describe` alone. Arch's VCS guidance permits parsing project files for the release component and recommends the `RELEASE.rREVISION` form, a `-git` package name, the VCS tool in `makedepends`, and `SKIP` for a moving VCS checksum. It also recommends versioned `provides`, `conflicts`, and no `replaces`. See the official [VCS package guidelines](https://wiki.archlinux.org/title/VCS_package_guidelines) and [PKGBUILD relations](https://wiki.archlinux.org/title/PKGBUILD#Package_relations).
 
 Use:
 
@@ -82,7 +82,7 @@ nautilus -q
 NAUTILUS_PYTHON_DEBUG=misc nautilus
 ```
 
-Confirm that the printed Arch version ends in the source commit hash, the Python version is `1.3.0.dev0`, every table destination is owned by the package, the service is active, and Nautilus reports no loader traceback. Then perform ticket 05's mount-scope, action, emblem, settings, replacement-key, and daemon/CLI independence checks.
+Confirm that the printed Arch version ends in the source commit hash, the Python version is `1.4.0.dev0`, every table destination is owned by the package, the service is active, and Nautilus reports no loader traceback. Then perform ticket 05's mount-scope, action, emblem, settings, replacement-key, and daemon/CLI independence checks.
 
 For the uninstall check, stop and disable the user service first, remove the package, and restart Nautilus:
 

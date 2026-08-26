@@ -114,10 +114,12 @@ class LibraryTest(unittest.TestCase):
                     remote_delete=True,
                 )
                 self.assertFalse(mounted.mutation_enabled)
+                self.assertFalse(mounted.replacement_enabled)
 
                 mounted.enable_mutations(mutation, session())  # type: ignore[arg-type]
 
                 self.assertTrue(mounted.mutation_enabled)
+                self.assertTrue(mounted.replacement_enabled)
                 self.assertEqual(mounted.upload_access(), (mutation, session()))
                 await mounted.remote_trash(entry)
                 await mounted.remote_restore(entry.asset.id)
@@ -134,6 +136,7 @@ class LibraryTest(unittest.TestCase):
                 mounted = library(catalog, root)
 
                 self.assertFalse(mounted.mutation_enabled)
+                self.assertFalse(mounted.replacement_enabled)
                 self.assertEqual(mounted.list(), [entry])
                 self.assertEqual(await mounted.read(entry, 1, 3), b"ell")
                 mounted.acquire(entry)

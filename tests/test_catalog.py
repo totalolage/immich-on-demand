@@ -1834,6 +1834,208 @@ class CatalogTest(unittest.TestCase):
 
                 self.assertEqual(added.name, f"photo__{OTHER_ID}__2.jpg")
 
+    def test_replacement_atomically_moves_identity_name_pin_and_every_view(self) -> None:
+        occupied_old_name = f"photo__{ASSET_ID}.jpg"
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage(
+                    [
+                        viewed_asset(is_favorite=True),
+                        asset(LITERAL_ID, occupied_old_name),
+                    ]
+                )
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                catalog.replace_album_people(
+                    albums=(album(),),
+                    album_memberships=((ALBUM_ID, ASSET_ID),),
+                    people=(person(),),
+                    person_memberships=((PERSON_ID, ASSET_ID),),
+                    trusted_profile=rich_profile(),
+                )
+                catalog.pin(ASSET_ID)
+                old = catalog.by_id(ASSET_ID)
+                occupied = catalog.by_id(LITERAL_ID)
+                assert old is not None
+                assert occupied is not None
+                old_aliases = catalog.aliases(ASSET_ID)
+                self.assertEqual(catalog.album_ids(ASSET_ID), (ALBUM_ID,))
+
+                replacement = catalog.publish_replacement(
+                    old_asset_id=ASSET_ID,
+                    candidate=viewed_asset(
+                        OTHER_ID,
+                        "replacement.jpg",
+                        is_favorite=True,
+                    ),
+                )
+
+                retired = catalog.by_id(ASSET_ID)
+                assert retired is not None
+                self.assertEqual(replacement.asset.id, OTHER_ID)
+                self.assertEqual(replacement.name, old.name)
+                self.assertNotEqual(replacement.inode, old.inode)
+                self.assertEqual(catalog.by_inode(replacement.inode), replacement)
+                self.assertEqual(catalog.by_inode(old.inode), retired)
+                self.assertTrue(retired.asset.is_trashed)
+                self.assertEqual(retired.inode, old.inode)
+                self.assertEqual(retired.name, f"photo__{ASSET_ID}__2.jpg")
+                self.assertEqual(catalog.by_id(LITERAL_ID), occupied)
+                self.assertEqual(catalog.aliases(ASSET_ID), ())
+                self.assertEqual(catalog.album_ids(ASSET_ID), ())
+                self.assertEqual(catalog.album_ids(OTHER_ID), (ALBUM_ID,))
+                self.assertEqual(
+                    catalog.aliases(OTHER_ID),
+                    tuple(path.with_name(old.name) for path in old_aliases),
+                )
+                self.assertEqual(catalog.pinned_ids(), frozenset({OTHER_ID}))
+
+                catalog.mark_restored(ASSET_ID)
+
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (
+                        PurePosixPath(f"All/{retired.name}"),
+                        PurePosixPath(f"Favorites/{retired.name}"),
+                        PurePosixPath(f"by Date/2026/08/25/{retired.name}"),
+                    ),
+                )
+                self.assertEqual(
+                    catalog.aliases(OTHER_ID),
+                    tuple(path.with_name(old.name) for path in old_aliases),
+                )
+
+    def test_replacement_rejects_conflicts_without_changing_the_live_asset(self) -> None:
+        invalid_candidates = (
+            asset(ASSET_ID),
+            replace(asset(OTHER_ID), owner_id=LITERAL_ID),
+            replace(asset(OTHER_ID), is_trashed=True),
+            replace(asset(OTHER_ID), is_offline=True),
+            replace(asset(OTHER_ID), visibility="hidden"),
+            replace(asset(OTHER_ID), size=None),
+            replace(asset(OTHER_ID), library_id=LITERAL_ID),
+            replace(asset(OTHER_ID), local_date="2026-08-26"),
+            replace(asset(OTHER_ID), is_favorite=True),
+        )
+        for candidate in invalid_candidates:
+            with self.subTest(candidate=candidate):
+                with tempfile.TemporaryDirectory() as directory:
+                    with Catalog(Path(directory) / "catalog.db") as catalog:
+                        original = catalog.add_uploaded(asset(), "photo.jpg")
+                        catalog.pin(ASSET_ID)
+                        aliases = catalog.aliases(ASSET_ID)
+
+                        with self.assertRaises(ValueError):
+                            catalog.publish_replacement(
+                                old_asset_id=ASSET_ID,
+                                candidate=candidate,
+                            )
+
+                        self.assertEqual(catalog.by_id(ASSET_ID), original)
+                        self.assertEqual(catalog.aliases(ASSET_ID), aliases)
+                        self.assertEqual(catalog.pinned_ids(), frozenset({ASSET_ID}))
+                        self.assertIsNone(catalog.by_id(OTHER_ID))
+
+    def test_replacement_requires_distinct_live_catalog_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                old = catalog.add_uploaded(asset(), "photo.jpg")
+                existing = catalog.add_uploaded(asset(OTHER_ID), "other.jpg")
+
+                with self.assertRaisesRegex(ValueError, "already in the catalog"):
+                    catalog.publish_replacement(
+                        old_asset_id=ASSET_ID,
+                        candidate=asset(OTHER_ID),
+                    )
+
+                self.assertEqual(catalog.by_id(ASSET_ID), old)
+                self.assertEqual(catalog.by_id(OTHER_ID), existing)
+
+                catalog.mark_trashed(ASSET_ID)
+                retired = catalog.by_id(ASSET_ID)
+                with self.assertRaisesRegex(ValueError, "live managed asset"):
+                    catalog.publish_replacement(
+                        old_asset_id=ASSET_ID,
+                        candidate=asset(LITERAL_ID),
+                    )
+
+                self.assertEqual(catalog.by_id(ASSET_ID), retired)
+                self.assertIsNone(catalog.by_id(LITERAL_ID))
+                with self.assertRaisesRegex(ValueError, "canonical"):
+                    catalog.publish_replacement(
+                        old_asset_id=ASSET_ID.upper(),
+                        candidate=asset(LITERAL_ID),
+                    )
+
+    def test_replacement_rolls_back_a_failure_after_the_transaction_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                original = catalog.add_uploaded(asset(), "photo.jpg")
+                catalog.pin(ASSET_ID)
+                aliases = catalog.aliases(ASSET_ID)
+                next_inode = catalog._connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'next_inode'"
+                ).fetchone()[0]
+                catalog._connection.execute(
+                    f"""
+                    CREATE TEMP TRIGGER reject_replacement
+                    BEFORE INSERT ON assets WHEN NEW.id = '{OTHER_ID}'
+                    BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END
+                    """
+                )
+
+                with self.assertRaises(sqlite3.IntegrityError):
+                    catalog.publish_replacement(
+                        old_asset_id=ASSET_ID,
+                        candidate=asset(OTHER_ID),
+                    )
+
+                self.assertEqual(catalog.by_id(ASSET_ID), original)
+                self.assertEqual(catalog.aliases(ASSET_ID), aliases)
+                self.assertEqual(catalog.pinned_ids(), frozenset({ASSET_ID}))
+                self.assertIsNone(catalog.by_id(OTHER_ID))
+                self.assertEqual(
+                    catalog._connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'next_inode'"
+                    ).fetchone()[0],
+                    next_inode,
+                )
+
+    def test_album_ids_returns_sorted_canonical_active_memberships(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                catalog.replace_album_people(
+                    albums=(
+                        album(OTHER_ALBUM_ID, "Other"),
+                        album(ALBUM_ID, "Trips"),
+                    ),
+                    album_memberships=(
+                        (OTHER_ALBUM_ID, ASSET_ID),
+                        (ALBUM_ID, ASSET_ID),
+                    ),
+                    people=(person(),),
+                    person_memberships=((PERSON_ID, ASSET_ID),),
+                    trusted_profile=rich_profile(),
+                )
+
+                self.assertEqual(
+                    catalog.album_ids(ASSET_ID),
+                    tuple(sorted((ALBUM_ID, OTHER_ALBUM_ID))),
+                )
+                self.assertEqual(catalog.album_ids(OTHER_ID), ())
+                with self.assertRaises(ValueError):
+                    catalog.album_ids(ASSET_ID.upper())
+
+                catalog._connection.execute(
+                    "UPDATE namespace_directories SET identity = ? WHERE identity = ?",
+                    (f"album:{ALBUM_ID.upper()}", f"album:{ALBUM_ID}"),
+                )
+                with self.assertRaisesRegex(ValueError, "album identity"):
+                    catalog.album_ids(ASSET_ID)
+
     def test_marks_only_a_known_asset_trashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with Catalog(Path(directory) / "catalog.db") as catalog:

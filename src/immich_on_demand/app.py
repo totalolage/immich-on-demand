@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from contextlib import aclosing
+from collections.abc import Callable
 
 import trio
 
 from .catalog import Catalog, CatalogStats, TrustedProfile
 from .immich import ImmichClient, ImmichError, ServerSession
-from .model import timestamp_nanoseconds
+from .model import Asset, timestamp_nanoseconds
 
 
 MAX_REFRESH_SWEEPS = 3
+_RefreshSuppression = tuple[
+    tuple[Asset, ...],
+    frozenset[str],
+    frozenset[tuple[str, int, str]],
+]
 
 
 class FullRefreshRequired(ImmichError):
@@ -27,6 +33,10 @@ async def refresh_catalog(
     catalog_lock: trio.Lock,
     *,
     trusted_profile: TrustedProfile | None = None,
+    preserve_assets: tuple[Asset, ...] = (),
+    exclude_asset_ids: frozenset[str] = frozenset(),
+    exclude_asset_signatures: frozenset[tuple[str, int, str]] = frozenset(),
+    suppression: Callable[[], _RefreshSuppression] | None = None,
 ) -> CatalogStats:
     if trusted_profile is not None and (
         trusted_profile.owner_id != session.owner_id
@@ -34,6 +44,13 @@ async def refresh_catalog(
     ):
         raise ValueError("trusted profile does not match the validated server session")
     async with catalog_lock:
+        if suppression is not None:
+            if preserve_assets or exclude_asset_ids or exclude_asset_signatures:
+                raise ValueError("refresh suppression is ambiguous")
+            preserve_assets, exclude_asset_ids, exclude_asset_signatures = suppression()
+        preserved = {asset.id: asset for asset in preserve_assets}
+        if len(preserved) != len(preserve_assets) or preserved.keys() & exclude_asset_ids:
+            raise ValueError("refresh suppression identities are invalid")
         previous_ids: set[str] | None = None
         for _ in range(MAX_REFRESH_SWEEPS):
             catalog.begin_refresh()
@@ -44,12 +61,27 @@ async def refresh_catalog(
             async with aclosing(client.asset_pages(session.owner_id)) as pages:
                 async for page in pages:
                     page_count += 1
+                    staged: list[Asset] = []
                     for asset in page:
+                        high_water_ms = max(high_water_ms, _updated_ms(asset.updated_at))
                         if asset.id in asset_ids:
                             duplicate = True
                         asset_ids.add(asset.id)
-                        high_water_ms = max(high_water_ms, _updated_ms(asset.updated_at))
-                    catalog.stage(page)
+                        if asset.id in exclude_asset_ids or asset.id in preserved:
+                            continue
+                        if asset.size is not None and (
+                            asset.owner_id,
+                            asset.size,
+                            asset.checksum,
+                        ) in exclude_asset_signatures:
+                            existing = catalog.by_id(asset.id)
+                            if existing is not None:
+                                staged.append(existing.asset)
+                            continue
+                        staged.append(asset)
+                    catalog.stage(staged)
+            catalog.stage(preserve_assets)
+            asset_ids.update(preserved)
             if duplicate:
                 previous_ids = None
             elif asset_ids == previous_ids:
@@ -152,6 +184,9 @@ async def refresh_catalog_incremental(
     catalog_lock: trio.Lock,
     *,
     refresh_seconds: int,
+    preserve_asset_ids: frozenset[str] = frozenset(),
+    exclude_asset_ids: frozenset[str] = frozenset(),
+    exclude_asset_signatures: frozenset[tuple[str, int, str]] = frozenset(),
 ) -> CatalogStats:
     async with catalog_lock:
         high_water_ms, full_refresh_pages = catalog.refresh_state()
@@ -171,10 +206,25 @@ async def refresh_catalog_incremental(
             )
         ) as pages:
             async for page in pages:
+                staged: list[Asset] = []
                 for asset in page:
                     next_high_water_ms = max(
                         next_high_water_ms,
                         _updated_ms(asset.updated_at),
                     )
-                catalog.stage(page)
+                    if (
+                        asset.id not in preserve_asset_ids
+                        and asset.id not in exclude_asset_ids
+                        and (
+                            asset.size is None
+                            or (
+                                asset.owner_id,
+                                asset.size,
+                                asset.checksum,
+                            )
+                            not in exclude_asset_signatures
+                        )
+                    ):
+                        staged.append(asset)
+                catalog.stage(staged)
         return catalog.finish_incremental(high_water_ms=next_high_water_ms)

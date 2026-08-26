@@ -441,6 +441,55 @@ class AppTest(unittest.TestCase):
 
         trio.run(scenario)
 
+    def test_incremental_refresh_suppresses_active_replacement_assets(self) -> None:
+        candidate_id = "32345678-1234-4234-8234-123456789abc"
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                with Catalog(Path(directory) / "catalog.db") as catalog:
+                    local_old = replace(asset(), original_name="local-old.jpg")
+                    catalog.begin_refresh()
+                    catalog.stage([local_old])
+                    catalog.finish_refresh(
+                        high_water_ms=1_787_659_200_000,
+                        page_count=1,
+                    )
+                    remote_old = replace(
+                        asset(),
+                        original_name="remote-old.jpg",
+                        updated_at="2026-08-25T12:05:00Z",
+                    )
+                    candidate = replace(
+                        asset(candidate_id, "candidate.jpg"),
+                        size=456,
+                        checksum="kbXAptRwH+Atw7TrN98pxXGansY=",
+                        updated_at="2026-08-25T12:10:00Z",
+                    )
+                    client = IncrementalClient(
+                        [[remote_old, candidate, asset(OTHER_ID, "new.jpg")]]
+                    )
+                    session = ServerSession(OWNER_ID, "3.0.3", frozenset(), True)
+
+                    await refresh_catalog_incremental(
+                        catalog,
+                        client,  # type: ignore[arg-type]
+                        session,
+                        trio.Lock(),
+                        refresh_seconds=300,
+                        preserve_asset_ids=frozenset({ASSET_ID}),
+                        exclude_asset_signatures=frozenset(
+                            {(OWNER_ID, 456, "kbXAptRwH+Atw7TrN98pxXGansY=")}
+                        ),
+                    )
+
+                    current = catalog.by_id(ASSET_ID)
+                    self.assertEqual(current and current.asset, local_old)
+                    self.assertIsNone(catalog.by_id(candidate_id))
+                    self.assertIsNotNone(catalog.by_id(OTHER_ID))
+                    self.assertEqual(catalog.refresh_state(), (1_787_659_800_000, 1))
+
+        trio.run(scenario)
+
     def test_incremental_refresh_applies_same_timestamp_restore(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
@@ -483,6 +532,96 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(catalog.list_visible()[0].asset.id, ASSET_ID)
                     self.assertEqual(client.calls, 2)
                     self.assertEqual(catalog.refresh_state(), (1_787_659_200_000, 1))
+
+        trio.run(scenario)
+
+    def test_complete_refresh_suppresses_active_replacement_assets(self) -> None:
+        candidate_id = "32345678-1234-4234-8234-123456789abc"
+        matching_id = "42345678-1234-4234-8234-123456789abc"
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                with Catalog(Path(directory) / "catalog.db") as catalog:
+                    local_old = replace(asset(), original_name="local-old.jpg")
+                    catalog.begin_refresh()
+                    local_match = replace(
+                        asset(matching_id, "local-match.jpg"),
+                        size=456,
+                        checksum="kbXAptRwH+Atw7TrN98pxXGansY=",
+                    )
+                    catalog.stage(
+                        [local_old, local_match, asset(OTHER_ID, "missing.jpg")]
+                    )
+                    catalog.finish_refresh(
+                        high_water_ms=1_787_659_200_000,
+                        page_count=1,
+                    )
+                    remote_old = replace(
+                        asset(),
+                        original_name="remote-old.jpg",
+                        updated_at="2026-08-25T12:05:00Z",
+                    )
+                    candidate = replace(
+                        asset(candidate_id, "candidate.jpg"),
+                        size=456,
+                        checksum="kbXAptRwH+Atw7TrN98pxXGansY=",
+                        updated_at="2026-08-25T12:10:00Z",
+                    )
+                    remote_match = replace(
+                        local_match,
+                        original_name="remote-match.jpg",
+                        updated_at="2026-08-25T12:07:00Z",
+                    )
+                    duplicate = [[remote_old, remote_match, candidate], [candidate]]
+                    stable = [[remote_old, remote_match, candidate]]
+                    client = FakeClient([duplicate, stable, stable])
+                    session = ServerSession(OWNER_ID, "3.0.3", frozenset(), True)
+
+                    await refresh_catalog(
+                        catalog,
+                        client,  # type: ignore[arg-type]
+                        session,
+                        trio.Lock(),
+                        preserve_assets=(local_old,),
+                        exclude_asset_signatures=frozenset(
+                            {(OWNER_ID, 456, "kbXAptRwH+Atw7TrN98pxXGansY=")}
+                        ),
+                    )
+
+                    current = catalog.by_id(ASSET_ID)
+                    self.assertEqual(current and current.asset, local_old)
+                    self.assertIsNone(catalog.by_id(candidate_id))
+                    matching = catalog.by_id(matching_id)
+                    self.assertEqual(matching and matching.asset, local_match)
+                    self.assertIsNone(catalog.by_id(OTHER_ID))
+                    self.assertEqual(catalog.refresh_state(), (1_787_659_800_000, 1))
+                    self.assertEqual(client.calls, 3)
+
+        trio.run(scenario)
+
+    def test_complete_refresh_resolves_suppression_while_holding_catalog_lock(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                with Catalog(Path(directory) / "catalog.db") as catalog:
+                    lock = trio.Lock()
+                    calls = 0
+
+                    def suppression():
+                        nonlocal calls
+                        self.assertTrue(lock.locked())
+                        calls += 1
+                        return (), frozenset(), frozenset()
+
+                    await refresh_catalog(
+                        catalog,
+                        FakeClient([[[asset()]], [[asset()]]]),  # type: ignore[arg-type]
+                        ServerSession(OWNER_ID, "3.0.3", frozenset(), True),
+                        lock,
+                        suppression=suppression,
+                    )
+                    self.assertEqual(calls, 1)
 
         trio.run(scenario)
 

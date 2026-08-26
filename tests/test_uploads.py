@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,7 @@ from unittest.mock import patch
 
 from immich_on_demand.uploads import (
     UploadErrorCode,
+    UploadOperation,
     UploadQueue,
     UploadQueueError,
     UploadState,
@@ -20,7 +23,25 @@ from immich_on_demand.uploads import (
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
+OTHER_ASSET_ID = "23456789-2345-4345-8345-23456789abcd"
+LIBRARY_ID = "3456789a-3456-4456-8456-3456789abcde"
+ALBUM_ID = "456789ab-4567-4567-8567-456789abcdef"
+OTHER_ALBUM_ID = "56789abc-5678-4678-8678-56789abcdef0"
 ORIGIN = "https://photos.example.test"
+
+REPLACEMENT = {
+    "old_asset_id": ASSET_ID,
+    "old_inode": 42,
+    "old_name": "photo.jpg",
+    "source_owner_id": OWNER_ID,
+    "source_library_id": LIBRARY_ID,
+    "source_checksum": "aGVsbG8=",
+    "source_updated_at": "2026-08-25T12:30:00.000Z",
+    "source_created_ns": 1_777_777_777_000_000_000,
+    "source_is_favorite": True,
+    "source_visibility": "timeline",
+    "source_album_ids": (ALBUM_ID, OTHER_ALBUM_ID),
+}
 
 
 class UploadQueueTest(unittest.TestCase):
@@ -117,6 +138,397 @@ class UploadQueueTest(unittest.TestCase):
             self.assertIsInstance(restored.modified_ns, int)
             self.assertEqual(restored.payload_path.read_bytes(), content)
             self.assertGreater(restored.revision, draft.revision)
+
+    def test_writing_replacement_keeps_its_draft_and_fingerprint_across_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                draft = queue.begin("upload.tmp", ORIGIN, OWNER_ID)
+                marked = queue.mark_replacement(
+                    draft.id,
+                    revision=draft.revision,
+                    **REPLACEMENT,
+                )
+
+                self.assertEqual(marked.state, UploadState.WRITING)
+                self.assertEqual(marked.requested_name, "photo.jpg")
+                self.assertEqual(marked.operation, UploadOperation.REPLACEMENT)
+                self.assertEqual(marked.revision, draft.revision)
+                self.assertEqual(marked.old_asset_id, ASSET_ID)
+                self.assertEqual(marked.old_inode, 42)
+                self.assertEqual(marked.old_name, "photo.jpg")
+                self.assertEqual(marked.source_owner_id, OWNER_ID)
+                self.assertEqual(marked.source_library_id, LIBRARY_ID)
+                self.assertEqual(marked.source_checksum, "aGVsbG8=")
+                self.assertEqual(
+                    marked.source_updated_at,
+                    "2026-08-25T12:30:00.000Z",
+                )
+                self.assertEqual(
+                    marked.source_created_ns,
+                    1_777_777_777_000_000_000,
+                )
+                self.assertIs(marked.source_is_favorite, True)
+                self.assertEqual(marked.source_visibility, "timeline")
+                self.assertEqual(
+                    marked.source_album_ids,
+                    (ALBUM_ID, OTHER_ALBUM_ID),
+                )
+
+                queue.write(draft, 0, b"replacement bytes")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+
+            with UploadQueue(root) as queue:
+                restored = queue.status(pending.id)
+
+            self.assertEqual(restored, pending)
+            assert restored is not None
+            self.assertEqual(restored.operation, UploadOperation.REPLACEMENT)
+            self.assertEqual(restored.source_album_ids, (ALBUM_ID, OTHER_ALBUM_ID))
+            self.assertEqual(restored.payload_path.read_bytes(), b"replacement bytes")
+
+    def test_pending_job_can_be_marked_as_replacement_only_before_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                draft = queue.begin("upload.tmp", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"replacement bytes")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+
+                self.assertEqual(pending.operation, UploadOperation.ORDINARY)
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^upload changed before replacement$",
+                ):
+                    queue.mark_replacement(
+                        pending.id,
+                        revision=pending.revision - 1,
+                        **REPLACEMENT,
+                    )
+                self.assertEqual(queue.status(pending.id), pending)
+
+                marked = queue.mark_replacement(
+                    pending.id,
+                    revision=pending.revision,
+                    **REPLACEMENT,
+                )
+                self.assertEqual(marked.revision, pending.revision + 1)
+                self.assertEqual(marked.requested_name, "photo.jpg")
+                self.assertEqual(marked.operation, UploadOperation.REPLACEMENT)
+                self.assertEqual(
+                    tuple(job.requested_name for job in queue.list()),
+                    ("photo.jpg",),
+                )
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^upload changed before attempt$",
+                ):
+                    queue.open_attempt(marked.id, revision=pending.revision)
+                self.assertEqual(queue.status(marked.id), marked)
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^upload cannot become a replacement$",
+                ):
+                    queue.mark_replacement(
+                        marked.id,
+                        revision=marked.revision,
+                        **REPLACEMENT,
+                    )
+
+                attempting = queue.begin_attempt(marked.id)
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^upload cannot become a replacement$",
+                ):
+                    queue.mark_replacement(
+                        attempting.id,
+                        revision=attempting.revision,
+                        **REPLACEMENT,
+                    )
+
+    def test_replacing_phase_retains_candidate_and_resumes_after_block(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                draft = queue.begin("photo.jpg", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"replacement bytes")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+                marked = queue.mark_replacement(
+                    pending.id,
+                    revision=pending.revision,
+                    **REPLACEMENT,
+                )
+                attempting = queue.begin_attempt(marked.id)
+                candidate = queue.record_candidate(attempting.id, OTHER_ASSET_ID)
+                self.assertIs(candidate.candidate_verified, False)
+                deferred = queue.retry(
+                    candidate.id,
+                    at_ns=0,
+                    error=UploadErrorCode.UPLOAD_UNAVAILABLE,
+                )
+                self.assertEqual(deferred.state, UploadState.ATTEMPTING)
+                self.assertEqual(deferred.candidate_asset_id, OTHER_ASSET_ID)
+                candidate = queue.begin_attempt(deferred.id)
+
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^replacement has not entered replacing$",
+                ):
+                    queue.commit(candidate.id)
+                replacing = queue.begin_replacing(candidate.id)
+                self.assertEqual(replacing.state, UploadState.REPLACING)
+                self.assertIs(replacing.candidate_verified, True)
+                self.assertEqual(replacing.candidate_asset_id, OTHER_ASSET_ID)
+                self.assertEqual(replacing.old_asset_id, ASSET_ID)
+
+            with UploadQueue(root) as queue:
+                restored = queue.status(replacing.id)
+                self.assertEqual(restored, replacing)
+                self.assertEqual(queue.next_due(), replacing)
+                blocked = queue.block(
+                    replacing.id,
+                    UploadErrorCode.LOCAL_STATE_FAILED,
+                )
+                retried = queue.retry(blocked.id, at_ns=0)
+                self.assertEqual(retried.state, UploadState.REPLACING)
+                self.assertEqual(retried.candidate_asset_id, OTHER_ASSET_ID)
+                self.assertEqual(retried.source_album_ids, (ALBUM_ID, OTHER_ALBUM_ID))
+                committed = queue.commit(retried.id)
+                self.assertEqual(committed.state, UploadState.COMMITTED)
+                queue.remove(committed.id)
+                self.assertIsNone(queue.status(committed.id))
+
+    def test_legacy_v1_manifest_loads_as_an_ordinary_upload(self) -> None:
+        replacement_fields = {
+            "candidate_verified",
+            "operation",
+            "old_asset_id",
+            "old_inode",
+            "old_name",
+            "source_owner_id",
+            "source_library_id",
+            "source_checksum",
+            "source_updated_at",
+            "source_created_ns",
+            "source_is_favorite",
+            "source_visibility",
+            "source_album_ids",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                draft = queue.begin("photo.jpg", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"ordinary bytes")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+
+            manifest_path = pending.payload_path.parent / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            for field in replacement_fields:
+                manifest.pop(field)
+            manifest["format_version"] = 1
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+            )
+
+            with UploadQueue(root) as queue:
+                restored = queue.status(pending.id)
+                assert restored is not None
+                self.assertEqual(restored.operation, UploadOperation.ORDINARY)
+                self.assertIsNone(restored.old_asset_id)
+                attempting = queue.begin_attempt(restored.id)
+
+            rewritten = json.loads(manifest_path.read_text())
+            self.assertEqual(rewritten["format_version"], 2)
+            self.assertEqual(rewritten["operation"], "ordinary")
+            self.assertEqual(attempting.state, UploadState.ATTEMPTING)
+
+    def test_invalid_replacement_fingerprint_leaves_job_ordinary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                draft = queue.begin("photo.jpg", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"ordinary bytes")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+                cases = (
+                    (
+                        "source_album_ids",
+                        (ALBUM_ID, ALBUM_ID),
+                        "replacement album IDs must be sorted and unique",
+                    ),
+                    (
+                        "source_created_ns",
+                        -1,
+                        "replacement source creation time is invalid",
+                    ),
+                    (
+                        "source_created_ns",
+                        True,
+                        "replacement source creation time is invalid",
+                    ),
+                )
+                for field, value, message in cases:
+                    with self.subTest(field=field, value=value):
+                        invalid = dict(REPLACEMENT)
+                        invalid[field] = value
+                        with self.assertRaisesRegex(ValueError, f"^{message}$"):
+                            queue.mark_replacement(
+                                pending.id,
+                                revision=pending.revision,
+                                **invalid,
+                            )
+                self.assertEqual(queue.status(pending.id), pending)
+
+    def test_open_local_reads_every_sealed_live_state_without_mutation(self) -> None:
+        def assert_read_only(
+            queue: UploadQueue,
+            job_id: str,
+            expected: bytes,
+        ) -> None:
+            before = queue.status(job_id)
+            assert before is not None
+            descriptor = queue.open_local(job_id)
+            try:
+                self.assertEqual(os.read(descriptor, len(expected) + 1), expected)
+                self.assertEqual(
+                    fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE,
+                    os.O_RDONLY,
+                )
+                self.assertTrue(
+                    fcntl.fcntl(descriptor, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+                )
+                self.assertEqual(
+                    os.fstat(descriptor).st_ino,
+                    before.payload_path.stat().st_ino,
+                )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(queue.status(job_id), before)
+
+        content = b"replacement bytes"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                draft = queue.begin("upload.tmp", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, content)
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+                pending = queue.mark_replacement(
+                    pending.id,
+                    revision=pending.revision,
+                    **REPLACEMENT,
+                )
+                assert_read_only(queue, pending.id, content)
+
+                blocked = queue.block(
+                    pending.id,
+                    UploadErrorCode.UPLOAD_UNAVAILABLE,
+                )
+                assert_read_only(queue, blocked.id, content)
+
+                pending = queue.retry(blocked.id, at_ns=0)
+                attempting = queue.begin_attempt(pending.id)
+                assert_read_only(queue, attempting.id, content)
+
+                candidate = queue.record_candidate(attempting.id, OTHER_ASSET_ID)
+                replacing = queue.begin_replacing(candidate.id)
+                assert_read_only(queue, replacing.id, content)
+
+    def test_open_local_rejects_unsealed_and_finished_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                writing = queue.begin("writing.jpg", ORIGIN, OWNER_ID)
+                queue.write(writing, 0, b"partial")
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^upload payload is not locally readable$",
+                ):
+                    queue.open_local(writing.id)
+                incomplete = queue.block_writing(
+                    writing,
+                    UploadErrorCode.LOCAL_WRITE_FAILED,
+                )
+                os.close(writing.descriptor)
+                with self.assertRaisesRegex(
+                    UploadQueueError,
+                    "^upload payload is invalid$",
+                ):
+                    queue.open_local(incomplete.id)
+
+                draft = queue.begin("committed.jpg", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"committed")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+                attempting = queue.begin_attempt(pending.id)
+                candidate = queue.record_candidate(attempting.id, ASSET_ID)
+                committed = queue.commit(candidate.id)
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^upload payload is not locally readable$",
+                ):
+                    queue.open_local(committed.id)
+
+                draft = queue.begin("cancelled.jpg", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"cancelled")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+                with (
+                    patch(
+                        "immich_on_demand.uploads.os.rename",
+                        side_effect=OSError("injected crash"),
+                    ),
+                    self.assertRaisesRegex(OSError, "^injected crash$"),
+                ):
+                    queue.cancel(
+                        pending.id,
+                        requested_name=pending.requested_name,
+                        revision=pending.revision,
+                    )
+                cancelled = queue.status(pending.id)
+                assert cancelled is not None
+                self.assertEqual(cancelled.state, UploadState.CANCELLED)
+                with self.assertRaisesRegex(
+                    UploadStateError,
+                    "^upload payload is not locally readable$",
+                ):
+                    queue.open_local(cancelled.id)
+
+    def test_open_local_rejects_tampered_and_symlink_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            with UploadQueue(root) as queue:
+                draft = queue.begin("tampered.jpg", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"original")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+                pending.payload_path.write_bytes(b"tampered")
+                with self.assertRaisesRegex(
+                    UploadQueueError,
+                    "^upload payload is invalid$",
+                ):
+                    queue.open_local(pending.id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "uploads"
+            outside = Path(directory) / "outside"
+            outside.write_bytes(b"outside")
+            outside.chmod(0o600)
+            with UploadQueue(root) as queue:
+                draft = queue.begin("symlink.jpg", ORIGIN, OWNER_ID)
+                queue.write(draft, 0, b"original")
+                pending = queue.seal(draft)
+                os.close(draft.descriptor)
+                pending.payload_path.unlink()
+                pending.payload_path.symlink_to(outside)
+                with self.assertRaises(OSError):
+                    queue.open_local(pending.id)
 
     def test_restart_blocks_an_interrupted_write_without_discarding_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

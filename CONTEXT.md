@@ -17,7 +17,7 @@ The single mounted directory containing one entry for every visible Immich asset
 _Avoid_: Timeline, virtual views
 
 **Library root**:
-The mounted top directory that contains the Flat library in version 1.0 and the top-level Views from version 1.3.
+The mounted top directory that contains the Flat library in version 1.0 and the top-level Views from version 1.3 onward.
 _Avoid_: Library, mountpoint
 
 **View**:
@@ -45,11 +45,11 @@ Removing a hydrated original from the local cache while preserving its Library e
 _Avoid_: Delete, trash
 
 **Upload**:
-Creating a new Immich asset from a new file written to the version 1.0 Flat library or the version 1.3 All View. Upload never replaces an existing asset.
+Creating a new Immich asset from a new file written to the version 1.0 Flat library or the All View. Upload never replaces an existing asset.
 _Avoid_: Update, overwrite, synchronization
 
 **Pending upload**:
-A complete private local file whose close finished but whose Immich creation has not been confirmed. It stays outside the mounted namespace until a retry succeeds. The user can retry it idempotently or explicitly cancel its local bytes.
+A complete private local file whose close finished but whose Immich creation has not been confirmed. Its staged mounted name remains locally readable until publication. The user can retry it idempotently or explicitly cancel its local bytes when no remote candidate may exist.
 _Avoid_: Staged file, cached original, upload recovery
 
 **Upload recovery**:
@@ -57,7 +57,7 @@ Private local bytes retained because the write did not finish or Upload completi
 _Avoid_: Pending upload, backup, cached original
 
 **Asset replacement**:
-A future operation that creates a new Immich asset from changed bytes and resolves the old asset separately. Immich On-Demand never overwrites an original in place.
+Creating and verifying a new Immich asset from a temporary file renamed over an existing All entry, then moving the old asset to trash and transferring the stable mounted name. Immich On-Demand never overwrites an original in place.
 _Avoid_: Update, overwrite, synchronization
 
 **Remote deletion**:

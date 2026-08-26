@@ -1062,6 +1062,28 @@ class Catalog:
         ).fetchall()
         return tuple(PurePosixPath(row["path"]) for row in rows)
 
+    def album_ids(self, asset_id: str) -> tuple[str, ...]:
+        asset_id = self._canonical_id(asset_id, "asset id")
+        rows = self._connection.execute(
+            """
+            SELECT directories.identity
+              FROM namespace_memberships AS memberships
+              JOIN namespace_directories AS directories
+                ON directories.inode = memberships.directory_inode
+             WHERE memberships.asset_id = ? AND directories.active = 1
+               AND directories.identity LIKE 'album:%'
+             ORDER BY directories.identity
+            """,
+            (asset_id,),
+        ).fetchall()
+        return tuple(
+            self._canonical_id(
+                row["identity"].removeprefix("album:"),
+                "album identity",
+            )
+            for row in rows
+        )
+
     def trusted_profile(self) -> TrustedProfile | None:
         rows = self._connection.execute("SELECT * FROM trusted_profile").fetchall()
         if not rows:
@@ -1458,6 +1480,186 @@ class Catalog:
             self._refresh_date_activity()
             inserted = self._connection.execute(
                 "SELECT * FROM assets WHERE id = ?", (asset.id,)
+            ).fetchone()
+        assert inserted is not None
+        return self._catalog_asset(inserted)
+
+    def publish_replacement(
+        self,
+        *,
+        old_asset_id: str,
+        candidate: Asset,
+    ) -> CatalogAsset:
+        old_asset_id = self._canonical_id(old_asset_id, "old asset id")
+        if type(candidate) is not Asset:
+            raise ValueError("replacement candidate must be an Asset")
+        candidate_id = self._canonical_id(candidate.id, "replacement candidate id")
+        candidate_owner = self._canonical_id(
+            candidate.owner_id, "replacement candidate owner"
+        )
+        if candidate_id == old_asset_id:
+            raise ValueError("replacement candidate must have a new asset id")
+
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            old = self._connection.execute(
+                "SELECT * FROM assets WHERE id = ?", (old_asset_id,)
+            ).fetchone()
+            if old is None:
+                raise ValueError("replacement source is not in the catalog")
+            if (
+                type(old["is_trashed"]) is not int
+                or old["is_trashed"] != 0
+                or type(old["is_offline"]) is not int
+                or old["is_offline"] != 0
+                or type(old["size"]) is not int
+                or old["size"] < 0
+                or not isinstance(old["visibility"], str)
+                or old["visibility"] == "hidden"
+                or old["library_id"] is not None
+                or type(old["is_favorite"]) is not int
+                or old["is_favorite"] not in {0, 1}
+            ):
+                raise ValueError("replacement source must be a live managed asset")
+            if (
+                type(candidate.is_trashed) is not bool
+                or candidate.is_trashed
+                or type(candidate.is_offline) is not bool
+                or candidate.is_offline
+                or type(candidate.size) is not int
+                or candidate.size < 0
+                or not isinstance(candidate.visibility, str)
+                or candidate.visibility == "hidden"
+                or candidate.library_id is not None
+            ):
+                raise ValueError("replacement candidate must be a live managed asset")
+            if candidate_owner != old["owner_id"]:
+                raise ValueError("replacement assets must have the same owner")
+            if (
+                candidate.visibility != old["visibility"]
+                or candidate.local_date != old["local_date"]
+                or type(candidate.is_favorite) is not bool
+                or candidate.is_favorite != bool(old["is_favorite"])
+            ):
+                raise ValueError("replacement candidate changed mounted View state")
+            self._date_parts(candidate.local_date)
+            if self._connection.execute(
+                "SELECT 1 FROM assets WHERE id = ?", (candidate_id,)
+            ).fetchone() is not None:
+                raise ValueError("replacement candidate is already in the catalog")
+
+            old_inode = old["inode"]
+            old_name = old["name"]
+            if (
+                type(old_inode) is not int
+                or old_inode <= ROOT_INODE
+                or not isinstance(old_name, str)
+                or safe_filename(old_name, old_asset_id) != old_name
+                or self._connection.execute(
+                    "SELECT 1 FROM namespace_directories WHERE inode = ?", (old_inode,)
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("replacement source identity is invalid")
+            candidate_inode_row = self._connection.execute(
+                "SELECT value FROM metadata WHERE key = 'next_inode'"
+            ).fetchone()
+            candidate_inode = candidate_inode_row[0] if candidate_inode_row else None
+            if (
+                type(candidate_inode) is not int
+                or candidate_inode <= ROOT_INODE
+                or self._connection.execute(
+                    "SELECT 1 FROM assets WHERE inode = ?", (candidate_inode,)
+                ).fetchone()
+                is not None
+                or self._connection.execute(
+                    "SELECT 1 FROM namespace_directories WHERE inode = ?",
+                    (candidate_inode,),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("replacement candidate inode is unavailable")
+
+            used_names = {
+                row["name"]
+                for row in self._connection.execute(
+                    "SELECT name FROM assets WHERE id != ?", (old_asset_id,)
+                )
+            }
+            retired_name = None
+            for ordinal in range(1, len(used_names) + 2):
+                value = collision_name(
+                    old_name,
+                    old_asset_id,
+                    ordinal=ordinal,
+                )
+                if value not in used_names:
+                    retired_name = value
+                    break
+            if retired_name is None:
+                raise ValueError("replacement source name cannot be retired")
+
+            old_pinned = self._connection.execute(
+                "SELECT 1 FROM pins WHERE asset_id = ?", (old_asset_id,)
+            ).fetchone() is not None
+            updated = self._connection.execute(
+                """
+                UPDATE assets SET name = ?, is_trashed = 1
+                 WHERE id = ? AND inode = ? AND name = ? AND is_trashed = 0
+                """,
+                (retired_name, old_asset_id, old_inode, old_name),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("replacement source changed before publication")
+            allocated_inode = self._next_inode()
+            if allocated_inode != candidate_inode:
+                raise ValueError("replacement candidate inode changed before publication")
+            self._connection.execute(
+                """
+                INSERT INTO assets (
+                    id, inode, name, owner_id, original_name, mime_type, size,
+                    created_ns, modified_ns, updated_at, checksum, visibility,
+                    is_trashed, is_offline, library_id, local_date, is_favorite
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.id,
+                    candidate_inode,
+                    old_name,
+                    candidate.owner_id,
+                    candidate.original_name,
+                    candidate.mime_type,
+                    candidate.size,
+                    candidate.created_ns,
+                    candidate.modified_ns,
+                    candidate.updated_at,
+                    candidate.checksum,
+                    candidate.visibility,
+                    int(candidate.is_trashed),
+                    int(candidate.is_offline),
+                    candidate.library_id,
+                    candidate.local_date,
+                    int(candidate.is_favorite),
+                ),
+            )
+            self._connection.execute(
+                "UPDATE namespace_links SET asset_id = ? WHERE asset_id = ?",
+                (candidate_id, old_asset_id),
+            )
+            self._connection.execute(
+                "UPDATE namespace_memberships SET asset_id = ? WHERE asset_id = ?",
+                (candidate_id, old_asset_id),
+            )
+            self._connection.execute(
+                "DELETE FROM pins WHERE asset_id IN (?, ?)",
+                (old_asset_id, candidate_id),
+            )
+            if old_pinned:
+                self._connection.execute(
+                    "INSERT INTO pins(asset_id) VALUES (?)", (candidate_id,)
+                )
+            inserted = self._connection.execute(
+                "SELECT * FROM assets WHERE id = ?", (candidate_id,)
             ).fetchone()
         assert inserted is not None
         return self._catalog_asset(inserted)

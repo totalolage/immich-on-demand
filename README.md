@@ -2,13 +2,13 @@
 
 Immich On-Demand mounts one user's Immich library as a Linux filesystem. Directory listings use a local metadata catalog. Nautilus uses Immich-generated previews, and an application downloads an original only when it reads the file.
 
-Released version 1.0 exposes a flat directory and targets Arch Linux, Niri, Nautilus 50, FUSE 3, and Immich 3.0.3. The current source tree is version 1.3.0.dev0. It implements rich Views, but read-only acceptance on the Reference system remains pending. Other systems are not tested.
+Released version 1.0 exposes a flat directory and targets Arch Linux, Niri, Nautilus 50, FUSE 3, and Immich 3.0.3. The current source tree is version 1.4.0.dev0. It implements rich Views and queued Asset replacement. Reference-system acceptance remains pending. Other systems are not tested.
 
 ## Filesystem contract
 
 The released 1.0 mount contains one file for each visible asset. The first asset with a given safe basename keeps that name. Later collisions include the complete asset UUID before the extension.
 
-The 1.3 development mount has this root namespace:
+The 1.4 development mount has this root namespace:
 
 ```text
 /
@@ -21,13 +21,19 @@ The 1.3 development mount has this root namespace:
 
 `All` contains every visible asset. An asset can also appear in several Albums, People, one date directory, and Favorites. Every alias has the same inode and reports the number of visible aliases as its hardlink count. Aliases share original-byte cache, Pin, and mutation state.
 
-Existing assets are immutable. Applications can list, read, and copy them through ordinary read-only opens. A read-only remote open with `O_NOATIME` returns `EOPNOTSUPP` before it can download the original. Applications cannot overwrite, truncate, rename, link, or change their metadata.
+Existing asset inodes are immutable. Applications can list, read, and copy them through ordinary read-only opens. A read-only remote open with `O_NOATIME` returns `EOPNOTSUPP` before it can download the original. Direct overwrite, truncation, rename, link, and metadata changes return `EROFS`.
 
-Released 1.0 accepts create and unlink at the mount root. Development 1.3 accepts them only in `All`; every other View is read-only. Creating a new file stages private local bytes. Flush and `fsync` make those bytes locally durable but do not contact Immich. The last close seals a Pending upload and removes its temporary name from the mount. One service-owned worker uploads it, verifies the returned asset, publishes the Library entry, and then removes the private copy. Temporary outages retry with bounded backoff; blocked jobs remain available for explicit Retry or confirmed Cancel. FUSE cannot report upload completion from release, so a successful close means only that the local Pending copy is durable.
+Released 1.0 accepts create and unlink at the mount root. Development 1.4 accepts them only in `All`; every other View is read-only. Creating a new file stages private local bytes. Flush and `fsync` make those bytes locally durable but do not contact Immich. The last close seals a Pending upload, but the staged name and bytes remain readable until the upload finishes. One service-owned worker uploads it, verifies the returned asset, publishes the Library entry, and then removes the private copy. Temporary outages retry with bounded backoff; blocked jobs remain available for explicit Retry or confirmed Cancel. FUSE cannot report upload completion from `close`, so a successful close means only that the local Pending copy is durable.
+
+Development 1.4 supports the temp-file save pattern for replacement. An application creates and writes a temporary file in `All`, then renames it over an existing `All` entry. The target immediately reads the durable local payload while the worker verifies the candidate, copies album membership, and moves the old asset to Immich trash with `force: false`. The catalog then gives the stable target name, Pin, and every View alias to the candidate's new UUID and inode. The old UUID and inode remain recorded as trashed under a collision-safe name, so Restore cannot displace the replacement.
+
+Replacing a Pinned asset transfers the Pin and verifies the candidate's cached original before the queue job completes. Unpinned replacements enter the normal original cache on first read.
+
+The service defers a newly sealed ordinary upload for one second so an editor can issue rename-over after close. After the worker admits that upload, a late rename-over returns `EBUSY`. Direct writes and truncation of the existing target remain `EROFS` because every View alias shares its inode.
 
 By default, unlink is disabled. If you enable remote deletion, unlink moves an owned asset to Immich trash. The client refuses deletion when the server has disabled trash, and it never requests permanent deletion. Cache eviction is a separate local operation and never changes Immich.
 
-Previews are supported for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Development 1.3 installs a Preview for every alias but groups work by asset, so all aliases use at most one server Preview fetch. Its missing-preview queue follows the Nautilus sort saved for `All` and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Other Preview formats remain future work.
+Previews are supported for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Development 1.4 installs a Preview for every alias but groups work by asset, so all aliases use at most one server Preview fetch. Its missing-preview queue follows the Nautilus sort saved for `All` and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Other Preview formats remain future work.
 
 ## Build and install the Arch package
 
@@ -44,7 +50,7 @@ makepkg -si
 
 ## Store API keys in Secret Service
 
-For the current 1.3 development tree, create a read-only API key in Immich with exactly these permissions:
+For the current 1.4 development tree, create a read-only API key in Immich with exactly these permissions:
 
 - `user.read`
 - `asset.read`
@@ -75,6 +81,7 @@ To upload files, create a separate mutation key with exactly these five permissi
 
 If you enable remote deletion, also grant the mutation key:
 
+- `asset.copy`
 - `asset.delete`
 
 Do not grant `album.read` or `person.read` to the mutation key. Album and People access belongs only to the read-only key.
@@ -120,9 +127,9 @@ In the development tree, routine background refreshes request only assets update
 
 Album and People relations refresh as one pair after a complete asset sweep. The catalog publishes the pair only after both server inventories validate. Incremental asset refreshes update View aliases from current asset facts but never infer Album or People relation removal.
 
-The 1.3 implementation has automated coverage. Read-only acceptance of its rich Views and package lifecycle on the Reference system remains pending.
+The 1.4 implementation has automated coverage. Read-only rich-View acceptance, Asset-replacement acceptance with project-owned Test assets, and package lifecycle acceptance remain pending on the Reference system.
 
-To enable remote deletion, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.delete`. The service fails closed if either key has unexpected permissions.
+To enable remote deletion and queued asset replacement, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.copy` and `asset.delete`. The service fails closed if either key has unexpected permissions.
 
 Start the filesystem as a systemd user service:
 
@@ -181,7 +188,7 @@ Development builds also provide an explicit Restore command:
 immich-on-demand restore --asset 12345678-1234-4234-8234-123456789abc
 ```
 
-Restore requires `--enable-remote-delete` and a mutation key with exactly `user.read`, `asset.read`, `asset.view`, `asset.download`, `asset.upload`, and `asset.delete`. The service accepts only a canonical asset UUID for a known, trashed asset owned by the mutation user. Immediately before the restore request, the client fetches the current server features and requires literal `trash: true`.
+Restore requires `--enable-remote-delete` and a mutation key with exactly `user.read`, `asset.read`, `asset.view`, `asset.download`, `asset.upload`, `asset.copy`, and `asset.delete`. The service accepts only a canonical asset UUID for a known, trashed asset owned by the mutation user. Immediately before the restore request, the client fetches the current server features and requires literal `trash: true`.
 
 A successful response must report that Immich restored exactly one asset. The service then exposes the existing catalog row and schedules a refresh. The Library name and inode do not change. Restore is never a filesystem side effect.
 
@@ -222,6 +229,7 @@ The released version 1.0 Arch recipe does not install this desktop entry, the Na
 - Save settings and replacement keys through the GUI, then restart the user service and verify the new configuration.
 - Pin one recorded Test asset, verify restart and Eviction behavior, inspect it with `pin-status`, then Unpin it. Do not use a Protected-library asset.
 - Restore only the recorded trashed Test asset. Verify that its Library name and inode remain stable. Never use Restore on a Protected-library asset.
+- Replace only a newly uploaded, recorded Test asset through temp-file rename-over in `All`. Verify the stable name, the new inode, and the old UUID in trash, then Restore the old UUID under its collision name.
 - Run routine incremental refresh and complete-reconciliation checks through the installed target service.
 
 ## Local data and upload recovery
@@ -259,7 +267,7 @@ scripts/check
 
 Version 1.0 is available on GitHub. The package has not been published to the AUR.
 
-The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, trusted offline startup, desktop controls, queued uploads, and rich Views. It also tracks AUR publication, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
+The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, trusted offline startup, desktop controls, queued uploads, rich Views, and Asset replacement. It also tracks AUR publication, broader Preview formats, partial Hydration, multiple Profiles, and more platforms.
 
 ## License
 

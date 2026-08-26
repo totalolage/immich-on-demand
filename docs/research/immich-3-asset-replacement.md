@@ -1,12 +1,12 @@
 # Immich 3.0.3 asset replacement
 
-Status: design recommendation
+Status: implemented in source; Reference-system acceptance pending
 Date: 2026-08-26
 Examined baseline: Immich On-Demand development tree, Immich 3.0.3, pyfuse3 3.5
 
 ## Decision
 
-Treat every write to an existing asset as a queued replacement, not an in-place update. Upload and verify a new managed asset first. Copy only the selected server metadata, trash the old asset with `force: false`, then replace the local namespace entry in one catalog transaction.
+Treat the supported temp-file rename-over pattern as a queued replacement, not an in-place update. Upload and verify a new managed asset first. Copy only the selected server metadata, trash the old asset with `force: false`, then replace the local namespace entry in one catalog transaction. Direct writes and truncation of an existing asset remain `EROFS`.
 
 The mounted name moves to the new asset. The inode does not. A remote asset UUID keeps one catalog inode for its lifetime, so the new Immich UUID receives a new inode across every View. Open handles to the old inode continue to read the old content. This matches rename-over semantics and preserves the one-inode-per-asset rule.
 
@@ -62,12 +62,12 @@ Use the existing `writing`, `pending`, and `attempting` phases. After candidate 
 5. Fetch `/server/features` again and require literal `trash: true`. The server reads this value from current configuration without its config cache. [[feature implementation](https://github.com/immich-app/immich/blob/v3.0.3/server/src/services/server.service.ts#L88-L109)]
 6. Trash only the old UUID with `force: false`.
 7. Confirm that the old UUID is trashed. A missing response does not prove failure.
-8. In one catalog transaction, publish the candidate, move the old mounted name to it, transfer Pin state, and replace every View alias. Mark the old row inactive and assign it a deterministic collision name for a later Restore.
-9. Install the verified queue payload in the content cache under the candidate UUID. Mark the job committed, then remove its recovery files.
+8. In one catalog transaction, publish the candidate, move the old mounted name to it, transfer Pin state, and replace every View alias. Mark the old row trashed and assign it a deterministic collision name for a later Restore.
+9. If the old asset was Pinned, move the live cache Pin to the candidate and hydrate its verified original before completion. Then mark the job committed, remove its recovery files, and dismiss the staged namespace overlay. An unpinned candidate populates the content cache on its first original read. Reusing the queue payload as a cache entry is deferred until that optimization has independent capacity and crash semantics.
 
-The new UUID receives a new inode. The old UUID keeps its old inode and cached content until open handles release it. The catalog name transfer is a narrow exception to immutable mounted names. It applies only to an explicit replacement pair after the old asset is confirmed trashed. If the user restores the old asset, it returns under its recorded collision name instead of displacing the replacement.
+The new UUID receives a new inode. The old UUID keeps its old inode and any cached original. Open handles continue to read the old bytes. The catalog name transfer is a narrow exception to immutable mounted names. It applies only to an explicit replacement pair after the old asset is confirmed trashed. If the user restores the old asset, it returns under its recorded collision name instead of displacing the replacement.
 
-An active replacement suppresses both automatic catalog publication of the candidate and resurrection of the old aliases. The durable manifest is the suppression authority until the catalog transaction commits or the user chooses **Keep Both**. Keep Both publishes the candidate with a collision-safe name and leaves the old asset unchanged. Never offer local Cancel after a candidate may exist remotely.
+An active replacement suppresses both automatic catalog publication of the candidate and resurrection of the old aliases. The durable manifest remains the suppression authority until the catalog transaction commits and the worker removes the job. Local Cancel refuses a job after a candidate may exist remotely. Keep Both is not implemented.
 
 ## Crash and concurrency outcomes
 
@@ -78,7 +78,7 @@ An active replacement suppresses both automatic catalog publication of the candi
 | After candidate verification or album copy | The old asset remains live. The candidate stays suppressed and the `replacing` job replays its checks. |
 | During old trash | A fresh read decides whether the old UUID is live or trashed. The client never guesses from a missing `204`. |
 | After old trash but before catalog publication | The manifest still names both UUIDs. Recovery confirms the server state and repeats the local transaction. |
-| After catalog publication but before cleanup | The committed catalog is authoritative. Startup removes only that committed job's fixed recovery files. |
+| After catalog publication but before cleanup | The committed catalog is authoritative. Recovery completes any required Pinned-original hydration, then commits and removes only that job's fixed recovery files. |
 
 Immich exposes no conditional delete, entity tag, or atomic copy-and-trash route. The delete request contains only IDs and `force`. The copy and delete operations are separate controller calls. [[delete schema](https://github.com/immich-app/immich/blob/v3.0.3/server/src/dtos/asset.dto.ts#L56-L58)] [[copy and delete routes](https://github.com/immich-app/immich/blob/v3.0.3/server/src/controllers/asset.controller.ts#L73-L103)] A remote metadata change can race after the final read. The design cannot claim serializable replacement. It prevents silent byte loss by creating and verifying the new original first, using reversible trash only, retaining both UUIDs in durable state, and never using permanent deletion. If a source record or album set changes before retirement, the job blocks and leaves the old asset live.
 
@@ -86,24 +86,21 @@ Immich exposes no conditional delete, entity tag, or atomic copy-and-trash route
 
 Allow replacement only through the `All` View. Return `EROFS` for writes through Album, People, Favorites, or by Date aliases.
 
-Support both common save forms:
-
-- `open` plus `setattr` or `ftruncate`, writes, `fsync`, and close starts a replacement job for the existing asset. A non-truncating write first hydrates and verifies the whole old original, then applies writes to the durable payload.
-- `create` plus writes, close, and `rename` over an existing All entry converts the source upload job into a replacement job. Serialize rename with upload-attempt admission. If upload already created a candidate, keep that candidate and continue the replacement rather than uploading again.
+Support the path-aware save form: `create` plus writes and `rename` over an existing All entry converts the source upload job into a replacement job. Serialize rename with upload-attempt admission. The worker defers a newly sealed ordinary upload for one second to cover close-then-rename saves. A rename that arrives after admission returns `EBUSY`; an explicit publish syscall is deferred until Reference-system applications need a longer window. A replacement retry with a recorded candidate keeps that candidate instead of uploading again. Direct `open`, `setattr`, or `ftruncate` of an existing asset remains `EROFS`: POSIX hardlinks share one inode and one mode, while pyfuse3 supplies only that shared inode at the open boundary, so it cannot distinguish All from a derived View without abandoning hardlink semantics.
 
 When rename identifies the target before upload admission, send the target name as the remote filename. If the temp asset already exists remotely, its remote `originalFileName` stays unchanged because Immich exposes no filename update. The mounted target name still remains stable.
 
 pyfuse3 passes truncation through `setattr`, not through the `open` flags. Its rename contract says that an existing destination points to the moved source inode while the dereferenced inode remains valid until its lookup count reaches zero. Those rules support a new inode at the stable destination name. [[pyfuse3 open and setattr](https://pyfuse3.readthedocs.io/en/latest/operations.html#pyfuse3.Operations.setattr)] [[pyfuse3 rename](https://pyfuse3.readthedocs.io/en/latest/operations.html#pyfuse3.Operations.rename)]
 
-Keep sealed and replacing payloads visible through a local namespace overlay. At seal, allocate the candidate's future inode and point every old View alias at that provisional inode. Reads use the durable payload while remote work continues. Existing handles to the old inode keep the old bytes. The final catalog transaction binds the provisional inode to the verified candidate UUID. `flush` and `fsync` promise only local durability; final `release` seals the job and cannot report remote completion. The existing Pending status and desktop notification report later failure. [[pyfuse3 flush, fsync, and release](https://pyfuse3.readthedocs.io/en/latest/operations.html#pyfuse3.Operations.release)]
+Keep sealed and replacing payloads visible at the target name in `All` through a local namespace overlay. Reads use the durable payload while remote work continues. Existing handles to the old inode keep the old bytes, and derived Views keep the old aliases until the catalog transaction. The overlay uses a private high inode. This inode is not the candidate's future inode. The catalog assigns the verified candidate a new durable inode when it moves every View alias. `flush` and `fsync` promise only local durability; final `release` seals the job and cannot report remote completion. Pending status reports later failure. [[pyfuse3 flush, fsync, and release](https://pyfuse3.readthedocs.io/en/latest/operations.html#pyfuse3.Operations.release)]
 
-After the catalog swap, invalidate the target entry, the old inode attributes, the new inode attributes, and each affected View directory. Nautilus then sees one name with the new inode. While a job is pending or blocked, the target uses the existing upload-state emblem and replacement actions expose Retry and Keep Both. Menu construction remains local and nonblocking.
+After the catalog swap, the completion callback invalidates each candidate alias entry and dismisses the `All` overlay. Nautilus then sees the stable name with the candidate's permanent inode. A blocked replacement remains visible through the existing upload status and Retry controls. Keep Both is not part of 1.4.
 
 ## Acceptance boundary
 
-Automated tests must cover in-place truncate, partial overwrite, temp-file rename-over, repeated flush, explicit `fsync`, final release, and open handles that outlive the namespace swap. Crash tests stop after every manifest write, upload response, marker verification, copy response, trash response, catalog commit, cache install, and cleanup step.
+Automated tests cover rejected in-place mutation, open and sealed temp-file rename-over, durable manifest recovery, upload verification, album-copy replay, guarded trash, atomic catalog publication, stable open handles, and completion cleanup. Source-level crash recovery covers a candidate upload and a catalog publication that completed before queue cleanup.
 
-Server-contract tests must cover unchanged bytes, a matching-marker retry, a duplicate with a different marker, a trashed duplicate, album-copy replay, source metadata change, album membership change, a lost `204`, trash disabled, a foreign source, an external-library source, and Restore after replacement. Every blocked case keeps the old asset live unless the server already confirmed trash.
+Reference-system acceptance must cover unchanged bytes, a matching-marker retry, a duplicate with a different marker, album-copy replay, source metadata change, album membership change, a lost `204`, trash disabled, Restore after replacement, and restart during replacement. Every blocked case must keep the old asset live unless Immich already confirms trash.
 
 Run live acceptance only on newly uploaded, recorded Test assets. Record the old UUID, the candidate UUID, the old original SHA-1, the mounted name, and both inodes. Prove that:
 

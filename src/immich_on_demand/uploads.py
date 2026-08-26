@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 from .model import safe_filename
 
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 _MANIFEST_LIMIT = 4096
 _MANIFEST = "manifest.json"
 _MANIFEST_TEMP = "manifest.json.tmp"
@@ -45,6 +45,7 @@ class UploadState(StrEnum):
     WRITING = "writing"
     PENDING = "pending"
     ATTEMPTING = "attempting"
+    REPLACING = "replacing"
     COMMITTED = "committed"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
@@ -60,6 +61,11 @@ class UploadErrorCode(StrEnum):
     PROFILE_MISMATCH = "profile-mismatch"
     PAYLOAD_INVALID = "payload-invalid"
     LOCAL_STATE_FAILED = "local-state-failed"
+
+
+class UploadOperation(StrEnum):
+    ORDINARY = "ordinary"
+    REPLACEMENT = "replacement"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +95,19 @@ class UploadStatus:
     next_attempt_ns: int | None
     error: UploadErrorCode | None
     candidate_asset_id: str | None
+    candidate_verified: bool
+    operation: UploadOperation
+    old_asset_id: str | None
+    old_inode: int | None
+    old_name: str | None
+    source_owner_id: str | None
+    source_library_id: str | None
+    source_checksum: str | None
+    source_updated_at: str | None
+    source_created_ns: int | None
+    source_is_favorite: bool | None
+    source_visibility: str | None
+    source_album_ids: tuple[str, ...] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +128,41 @@ class _Manifest:
     next_attempt_ns: int | None
     error: str | None
     candidate_asset_id: str | None
+    candidate_verified: bool
+    operation: str
+    old_asset_id: str | None
+    old_inode: int | None
+    old_name: str | None
+    source_owner_id: str | None
+    source_library_id: str | None
+    source_checksum: str | None
+    source_updated_at: str | None
+    source_created_ns: int | None
+    source_is_favorite: bool | None
+    source_visibility: str | None
+    source_album_ids: list[str] | None
+
+
+_V1_MANIFEST_FIELDS = frozenset(
+    {
+        "format_version",
+        "id",
+        "server_origin",
+        "owner_id",
+        "requested_name",
+        "state",
+        "revision",
+        "size",
+        "sha1",
+        "created_ns",
+        "modified_ns",
+        "sealed_ns",
+        "attempt_count",
+        "next_attempt_ns",
+        "error",
+        "candidate_asset_id",
+    }
+)
 
 
 def _canonical_uuid(value: str, label: str) -> str:
@@ -146,6 +200,17 @@ def _canonical_origin(value: str) -> str:
     if ":" in host:
         host = f"[{host}]"
     return f"https://{host}{f':{port}' if port not in {None, 443} else ''}"
+
+
+def _replacement_text(value: object, label: str, maximum_bytes: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > maximum_bytes
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"replacement {label} is invalid")
+    return value
 
 
 def _open_flags(flags: int) -> int:
@@ -307,6 +372,19 @@ class UploadQueue:
                 next_attempt_ns=None,
                 error=None,
                 candidate_asset_id=None,
+                candidate_verified=False,
+                operation=UploadOperation.ORDINARY.value,
+                old_asset_id=None,
+                old_inode=None,
+                old_name=None,
+                source_owner_id=None,
+                source_library_id=None,
+                source_checksum=None,
+                source_updated_at=None,
+                source_created_ns=None,
+                source_is_favorite=None,
+                source_visibility=None,
+                source_album_ids=None,
             )
             self._write_manifest(job_descriptor, manifest)
             os.fsync(self._root_descriptor)
@@ -393,6 +471,63 @@ class UploadQueue:
             return self._status(updated)
 
     @_serialized
+    def mark_replacement(
+        self,
+        job_id: str,
+        *,
+        revision: int,
+        old_asset_id: str,
+        old_inode: int,
+        old_name: str,
+        source_owner_id: str,
+        source_library_id: str | None,
+        source_checksum: str,
+        source_updated_at: str,
+        source_created_ns: int,
+        source_is_favorite: bool,
+        source_visibility: str,
+        source_album_ids: tuple[str, ...],
+    ) -> UploadStatus:
+        job_id = self._require_known(job_id)
+        if type(revision) is not int or revision < 1:
+            raise ValueError("upload revision must be positive")
+        if not isinstance(source_album_ids, tuple):
+            raise TypeError("replacement album IDs must be a tuple")
+        with self._job(job_id) as job_descriptor:
+            manifest = self._read_manifest(job_descriptor, job_id)
+            if manifest.revision != revision:
+                raise UploadStateError("upload changed before replacement")
+            if (
+                manifest.operation != UploadOperation.ORDINARY.value
+                or manifest.state
+                not in {UploadState.WRITING.value, UploadState.PENDING.value}
+            ):
+                raise UploadStateError("upload cannot become a replacement")
+            updated = replace(
+                manifest,
+                revision=(
+                    manifest.revision
+                    if manifest.state == UploadState.WRITING.value
+                    else manifest.revision + 1
+                ),
+                requested_name=old_name,
+                operation=UploadOperation.REPLACEMENT.value,
+                old_asset_id=old_asset_id,
+                old_inode=old_inode,
+                old_name=old_name,
+                source_owner_id=source_owner_id,
+                source_library_id=source_library_id,
+                source_checksum=source_checksum,
+                source_updated_at=source_updated_at,
+                source_created_ns=source_created_ns,
+                source_is_favorite=source_is_favorite,
+                source_visibility=source_visibility,
+                source_album_ids=list(source_album_ids),
+            )
+            self._write_manifest(job_descriptor, updated)
+            return self._status(updated)
+
+    @_serialized
     def block_writing(
         self, draft: WritableUpload, error: UploadErrorCode
     ) -> UploadStatus:
@@ -451,7 +586,12 @@ class UploadQueue:
             raise ValueError("upload queue time must be nonnegative")
         for job in self.list():
             if (
-                job.state in {UploadState.PENDING, UploadState.ATTEMPTING}
+                job.state
+                in {
+                    UploadState.PENDING,
+                    UploadState.ATTEMPTING,
+                    UploadState.REPLACING,
+                }
                 and (
                     job.next_attempt_ns is None
                     or job.next_attempt_ns <= now_ns
@@ -465,10 +605,34 @@ class UploadQueue:
         os.close(descriptor)
         return status
 
-    def open_attempt(self, job_id: str) -> tuple[UploadStatus, int]:
-        return self._begin_attempt(job_id)
+    def open_attempt(
+        self, job_id: str, *, revision: int | None = None
+    ) -> tuple[UploadStatus, int]:
+        return self._begin_attempt(job_id, revision=revision)
 
-    def _begin_attempt(self, job_id: str) -> tuple[UploadStatus, int]:
+    @_serialized
+    def open_local(self, job_id: str) -> int:
+        job_id = self._require_known(job_id)
+        with self._job(job_id) as job_descriptor:
+            manifest = self._read_manifest(job_descriptor, job_id)
+            if manifest.state not in {
+                UploadState.PENDING.value,
+                UploadState.ATTEMPTING.value,
+                UploadState.REPLACING.value,
+                UploadState.BLOCKED.value,
+            }:
+                raise UploadStateError("upload payload is not locally readable")
+            descriptor = self._open_payload(job_descriptor)
+        try:
+            self._verify_sealed_payload(descriptor, manifest)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _begin_attempt(
+        self, job_id: str, *, revision: int | None = None
+    ) -> tuple[UploadStatus, int]:
         descriptor = -1
         provisional: _Manifest | None = None
         try:
@@ -476,6 +640,8 @@ class UploadQueue:
                 job_id = self._require_known(job_id)
                 with self._job(job_id) as job_descriptor:
                     manifest = self._read_manifest(job_descriptor, job_id)
+                    if revision is not None and manifest.revision != revision:
+                        raise UploadStateError("upload changed before attempt")
                     if manifest.state not in {
                         UploadState.PENDING.value,
                         UploadState.ATTEMPTING.value,
@@ -547,6 +713,31 @@ class UploadQueue:
             return self._status(updated)
 
     @_serialized
+    def begin_replacing(self, job_id: str) -> UploadStatus:
+        job_id = self._require_known(job_id)
+        with self._job(job_id) as job_descriptor:
+            manifest = self._read_manifest(job_descriptor, job_id)
+            if manifest.operation != UploadOperation.REPLACEMENT.value:
+                raise UploadStateError("upload is not a replacement")
+            if manifest.state == UploadState.REPLACING.value:
+                return self._status(manifest)
+            if (
+                manifest.state != UploadState.ATTEMPTING.value
+                or manifest.candidate_asset_id is None
+            ):
+                raise UploadStateError("replacement has no verified candidate")
+            updated = replace(
+                manifest,
+                state=UploadState.REPLACING.value,
+                revision=manifest.revision + 1,
+                next_attempt_ns=None,
+                error=None,
+                candidate_verified=True,
+            )
+            self._write_manifest(job_descriptor, updated)
+            return self._status(updated)
+
+    @_serialized
     def retry(
         self,
         job_id: str,
@@ -576,6 +767,7 @@ class UploadQueue:
             if manifest.state not in {
                 UploadState.PENDING.value,
                 UploadState.ATTEMPTING.value,
+                UploadState.REPLACING.value,
                 UploadState.COMMITTED.value,
                 UploadState.BLOCKED.value,
             }:
@@ -584,11 +776,15 @@ class UploadQueue:
                 raise UploadStateError(
                     "incomplete upload recovery cannot be retried"
                 )
-            state = (
-                UploadState.ATTEMPTING.value
-                if manifest.candidate_asset_id is not None
-                else UploadState.PENDING.value
-            )
+            if (
+                manifest.operation == UploadOperation.REPLACEMENT.value
+                and manifest.candidate_verified
+            ):
+                state = UploadState.REPLACING.value
+            elif manifest.candidate_asset_id is not None:
+                state = UploadState.ATTEMPTING.value
+            else:
+                state = UploadState.PENDING.value
             updated = replace(
                 manifest,
                 state=state,
@@ -609,6 +805,7 @@ class UploadQueue:
             if manifest.state not in {
                 UploadState.PENDING.value,
                 UploadState.ATTEMPTING.value,
+                UploadState.REPLACING.value,
                 UploadState.COMMITTED.value,
                 UploadState.BLOCKED.value,
             }:
@@ -629,14 +826,20 @@ class UploadQueue:
         with self._job(job_id) as job_descriptor:
             manifest = self._read_manifest(job_descriptor, job_id)
             if (
-                manifest.state != UploadState.ATTEMPTING.value
-                or manifest.candidate_asset_id is None
+                manifest.operation == UploadOperation.REPLACEMENT.value
+                and manifest.state != UploadState.REPLACING.value
             ):
+                raise UploadStateError("replacement has not entered replacing")
+            if manifest.candidate_asset_id is None or manifest.state not in {
+                UploadState.ATTEMPTING.value,
+                UploadState.REPLACING.value,
+            }:
                 raise UploadStateError("upload has no verified candidate")
             updated = replace(
                 manifest,
                 state=UploadState.COMMITTED.value,
                 revision=manifest.revision + 1,
+                next_attempt_ns=None,
                 error=None,
             )
             self._write_manifest(job_descriptor, updated)
@@ -705,7 +908,13 @@ class UploadQueue:
         if (
             manifest.state != UploadState.WRITING.value
             or manifest.revision != draft.revision
-            or manifest.requested_name != draft.requested_name
+            or (
+                manifest.requested_name != draft.requested_name
+                and not (
+                    manifest.operation == UploadOperation.REPLACEMENT.value
+                    and manifest.requested_name == manifest.old_name
+                )
+            )
             or live.st_dev != stored.st_dev
             or live.st_ino != stored.st_ino
         ):
@@ -740,6 +949,23 @@ class UploadQueue:
             next_attempt_ns=manifest.next_attempt_ns,
             error=UploadErrorCode(manifest.error) if manifest.error is not None else None,
             candidate_asset_id=manifest.candidate_asset_id,
+            candidate_verified=manifest.candidate_verified,
+            operation=UploadOperation(manifest.operation),
+            old_asset_id=manifest.old_asset_id,
+            old_inode=manifest.old_inode,
+            old_name=manifest.old_name,
+            source_owner_id=manifest.source_owner_id,
+            source_library_id=manifest.source_library_id,
+            source_checksum=manifest.source_checksum,
+            source_updated_at=manifest.source_updated_at,
+            source_created_ns=manifest.source_created_ns,
+            source_is_favorite=manifest.source_is_favorite,
+            source_visibility=manifest.source_visibility,
+            source_album_ids=(
+                tuple(manifest.source_album_ids)
+                if manifest.source_album_ids is not None
+                else None
+            ),
         )
 
     def _open_job(self, job_id: str) -> int:
@@ -898,6 +1124,29 @@ class UploadQueue:
         finally:
             os.close(descriptor)
         value = _strict_json(data)
+        if (
+            isinstance(value, dict)
+            and type(value.get("format_version")) is int
+            and value.get("format_version") == 1
+            and set(value) == _V1_MANIFEST_FIELDS
+        ):
+            value = {
+                **value,
+                "format_version": _FORMAT_VERSION,
+                "candidate_verified": False,
+                "operation": UploadOperation.ORDINARY.value,
+                "old_asset_id": None,
+                "old_inode": None,
+                "old_name": None,
+                "source_owner_id": None,
+                "source_library_id": None,
+                "source_checksum": None,
+                "source_updated_at": None,
+                "source_created_ns": None,
+                "source_is_favorite": None,
+                "source_visibility": None,
+                "source_album_ids": None,
+            }
         if not isinstance(value, dict) or set(value) != set(_Manifest.__dataclass_fields__):
             raise UploadQueueError("upload queue contains invalid state")
         try:
@@ -941,7 +1190,10 @@ class UploadQueue:
         os.fsync(job_descriptor)
 
     def _validate_manifest(self, manifest: _Manifest, job_id: str) -> None:
-        if type(manifest.format_version) is not int or manifest.format_version != 1:
+        if (
+            type(manifest.format_version) is not int
+            or manifest.format_version != _FORMAT_VERSION
+        ):
             raise ValueError("invalid format")
         if _canonical_uuid(manifest.id, "upload job") != job_id:
             raise ValueError("wrong job")
@@ -956,6 +1208,73 @@ class UploadQueue:
         ):
             raise ValueError("unsafe name")
         state = UploadState(manifest.state)
+        operation = UploadOperation(manifest.operation)
+        if type(manifest.candidate_verified) is not bool:
+            raise ValueError("candidate verification state is invalid")
+        if manifest.candidate_verified and (
+            operation is not UploadOperation.REPLACEMENT
+            or manifest.candidate_asset_id is None
+        ):
+            raise ValueError("candidate verification state is invalid")
+        source_fields = (
+            manifest.old_asset_id,
+            manifest.old_inode,
+            manifest.old_name,
+            manifest.source_owner_id,
+            manifest.source_library_id,
+            manifest.source_checksum,
+            manifest.source_updated_at,
+            manifest.source_created_ns,
+            manifest.source_is_favorite,
+            manifest.source_visibility,
+            manifest.source_album_ids,
+        )
+        if operation is UploadOperation.ORDINARY:
+            if any(value is not None for value in source_fields):
+                raise ValueError("ordinary upload has replacement metadata")
+        else:
+            if not isinstance(manifest.old_asset_id, str):
+                raise ValueError("replacement source asset is invalid")
+            _canonical_uuid(manifest.old_asset_id, "replacement source asset")
+            if type(manifest.old_inode) is not int or manifest.old_inode < 1:
+                raise ValueError("replacement source inode is invalid")
+            if (
+                not isinstance(manifest.old_name, str)
+                or safe_filename(manifest.old_name, _ZERO_UUID)
+                != manifest.old_name
+                or len(manifest.old_name.encode("utf-8")) > 255
+            ):
+                raise ValueError("replacement source name is unsafe")
+            if not isinstance(manifest.source_owner_id, str):
+                raise ValueError("replacement source owner is invalid")
+            _canonical_uuid(manifest.source_owner_id, "replacement source owner")
+            if manifest.source_owner_id != manifest.owner_id:
+                raise ValueError("replacement source owner does not match upload")
+            if manifest.source_library_id is not None:
+                _canonical_uuid(
+                    manifest.source_library_id,
+                    "replacement source library",
+                )
+            _replacement_text(manifest.source_checksum, "source checksum", 1024)
+            _replacement_text(manifest.source_updated_at, "source updated time", 128)
+            if type(manifest.source_created_ns) is not int or manifest.source_created_ns < 0:
+                raise ValueError("replacement source creation time is invalid")
+            if type(manifest.source_is_favorite) is not bool:
+                raise ValueError("replacement favorite state is invalid")
+            _replacement_text(manifest.source_visibility, "source visibility", 128)
+            if not isinstance(manifest.source_album_ids, list):
+                raise ValueError("replacement album IDs must be a list")
+            albums = [
+                _canonical_uuid(album_id, "replacement album")
+                for album_id in manifest.source_album_ids
+            ]
+            if albums != sorted(set(albums)):
+                raise ValueError("replacement album IDs must be sorted and unique")
+        if (
+            state is UploadState.REPLACING
+            and operation is not UploadOperation.REPLACEMENT
+        ):
+            raise ValueError("ordinary upload cannot be replacing")
         if type(manifest.revision) is not int or manifest.revision < 1:
             raise ValueError("invalid revision")
         for value in (
@@ -992,6 +1311,7 @@ class UploadQueue:
                 or manifest.next_attempt_ns is not None
                 or manifest.error is not None
                 or manifest.candidate_asset_id is not None
+                or manifest.candidate_verified
             ):
                 raise ValueError("writing upload is already sealed")
         elif state is UploadState.PENDING:
@@ -999,14 +1319,23 @@ class UploadQueue:
                 any(value is None for value in sealed)
                 or manifest.next_attempt_ns is None
                 or manifest.candidate_asset_id is not None
+                or manifest.candidate_verified
             ):
                 raise ValueError("pending upload state is invalid")
         elif state is UploadState.ATTEMPTING:
             if any(value is None for value in sealed) or (
                 manifest.candidate_asset_id is not None
                 and manifest.attempt_count < 1
-            ):
+            ) or manifest.candidate_verified:
                 raise ValueError("attempting upload state is invalid")
+        elif state is UploadState.REPLACING:
+            if (
+                any(value is None for value in sealed)
+                or manifest.attempt_count < 1
+                or manifest.candidate_asset_id is None
+                or not manifest.candidate_verified
+            ):
+                raise ValueError("replacing upload state is invalid")
         elif state is UploadState.COMMITTED:
             if (
                 any(value is None for value in sealed)
@@ -1014,6 +1343,10 @@ class UploadQueue:
                 or manifest.next_attempt_ns is not None
                 or manifest.error is not None
                 or manifest.candidate_asset_id is None
+                or (
+                    operation is UploadOperation.REPLACEMENT
+                    and not manifest.candidate_verified
+                )
             ):
                 raise ValueError("committed upload state is invalid")
         elif state is UploadState.BLOCKED:
@@ -1037,6 +1370,7 @@ class UploadQueue:
             manifest.error is not None
             or manifest.next_attempt_ns is not None
             or manifest.candidate_asset_id is not None
+            or manifest.candidate_verified
             or not (
                 all(value is None for value in sealed)
                 or all(value is not None for value in sealed)

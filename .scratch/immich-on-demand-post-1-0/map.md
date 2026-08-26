@@ -2,7 +2,7 @@
 
 ## Destination
 
-Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, queued uploads, the first desktop controls, and rich Views are implemented but await target acceptance. Later releases may add broader media support, Asset replacement, multiple Profiles, and more platforms.
+Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, queued uploads, the first desktop controls, rich Views, and Asset replacement are implemented but await target acceptance. Later releases may add broader media support, multiple Profiles, and more platforms.
 
 ## Rules
 
@@ -16,7 +16,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 
 ### 1.0.x: distribute and refine
 
-- [Publish the Arch package to the AUR](issues/01-publish-the-arch-package-to-the-aur.md)
+- [Publish the Arch package to the AUR](issues/01-publish-the-arch-package-to-the-aur.md) remains blocked while the AUR does not accept account signups. The released recipe remains version 1.0.0.
 - [Follow Nautilus sort changes without restart](issues/02-follow-nautilus-sort-changes.md) is resolved.
 - [Bounded incremental refresh](issues/03-add-incremental-refresh.md) is implemented. Target package and service acceptance remain.
 
@@ -29,7 +29,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 ### 1.2: work through outages
 
 - [Start from trusted cached state while Immich is offline](issues/07-start-offline.md) is implemented. Target acceptance remains.
-- [Queue and retry uploads](issues/08-queue-and-retry-uploads.md) is implemented. Crash and target-system acceptance remain.
+- [Queue and retry uploads](issues/08-queue-and-retry-uploads.md) is implemented. Crash and Reference-system acceptance remain.
 
 ### 1.3: add rich library Views
 
@@ -38,7 +38,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 
 ### 1.4: expand mutation and media behavior
 
-- [Add Asset replacement](issues/11-add-asset-replacement.md)
+- [Asset replacement](issues/11-add-asset-replacement.md) is implemented. Reference-system acceptance with project-owned Test assets remains.
 - [Add RAW, HEIF, and Live Photo Previews](issues/12-broaden-preview-support.md)
 - [Evaluate partial Hydration](issues/13-evaluate-partial-hydration.md)
 

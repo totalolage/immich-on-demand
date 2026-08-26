@@ -40,13 +40,21 @@ from immich_on_demand.service import (
     _catalog_file_from_uri,
     _periodic_refresh,
     _pin_worker,
+    _next_upload_delay,
+    _replacement_refresh_policy,
     _upload_matches,
     _process_upload,
     _restore_worker,
     run_service,
 )
 from immich_on_demand.settings import Settings
-from immich_on_demand.uploads import UploadErrorCode, UploadQueue, UploadState
+from immich_on_demand.uploads import (
+    UploadErrorCode,
+    UploadOperation,
+    UploadQueue,
+    UploadQueueError,
+    UploadState,
+)
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
@@ -147,6 +155,7 @@ class ServiceFakes:
         self.promoted = trio.Event()
         self.upload_retries: list[str] = []
         self.upload_cancellations: list[tuple[str, str, int]] = []
+        self.upload_finishes: list[str] = []
         self.aliases = (Path("All") / "new.jpg",)
         outer = self
 
@@ -325,6 +334,9 @@ class ServiceFakes:
             ) -> None:
                 outer.events.append("filesystem:uploads")
 
+            async def upload_finished(self, job_id: str) -> None:
+                outer.upload_finishes.append(job_id)
+
         class Queue:
             def __init__(self, path: Path, *, minimum_free_bytes: int) -> None:
                 self.jobs: list[object] = []
@@ -383,7 +395,14 @@ class ServiceFakes:
         catalog_lock: object,
         *,
         trusted_profile: TrustedProfile | None = None,
+        preserve_assets: tuple[Asset, ...] = (),
+        exclude_asset_ids: frozenset[str] = frozenset(),
+        exclude_asset_signatures: frozenset[tuple[str, int, str]] = frozenset(),
+        suppression: object = None,
     ) -> CatalogStats:
+        if suppression is not None:
+            preserve_assets, exclude_asset_ids, exclude_asset_signatures = suppression()  # type: ignore[operator]
+        del preserve_assets, exclude_asset_ids, exclude_asset_signatures
         self.catalog_locks.append(catalog_lock)
         self.events.append("refresh")
         if self.events.count("refresh") == 2:
@@ -402,7 +421,11 @@ class ServiceFakes:
         catalog_lock: object,
         *,
         refresh_seconds: int,
+        preserve_asset_ids: frozenset[str] = frozenset(),
+        exclude_asset_ids: frozenset[str] = frozenset(),
+        exclude_asset_signatures: frozenset[tuple[str, int, str]] = frozenset(),
     ) -> CatalogStats:
+        del preserve_asset_ids, exclude_asset_ids, exclude_asset_signatures
         self.catalog_locks.append(catalog_lock)
         self.events.append(f"incremental:{refresh_seconds}")
         self.incremental_done.set()
@@ -473,7 +496,7 @@ class ServiceFakes:
             self.events.append("control-close")
 
     async def upload_worker(self, *args: object) -> None:
-        self.on_uploaded = args[-1]
+        self.on_uploaded = args[-2]
         await trio.sleep_forever()
 
     def fuse_init(self, filesystem: object, mountpoint: str, options: set[str]) -> None:
@@ -602,6 +625,189 @@ class ServiceTest(unittest.TestCase):
         ):
             self.assertFalse(_upload_matches(job, unsafe, PINNED_ID))  # type: ignore[arg-type]
 
+    def test_queue_block_failure_does_not_escape_upload_processing(self) -> None:
+        class Queue:
+            def block(self, *_args: object) -> None:
+                raise UploadQueueError("private queue detail")
+
+        job = SimpleNamespace(
+            id=PINNED_ID,
+            server_origin="https://wrong.example.test",
+        )
+
+        async def scenario() -> None:
+            await _process_upload(
+                Queue(),  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                trio.Lock(),
+                object(),  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                Settings("https://photos.example.test", Path("/mount")),
+                job,  # type: ignore[arg-type]
+                lambda _entry: trio.lowlevel.checkpoint(),
+            )
+
+        with self.assertLogs(
+            "immich_on_demand.service", level="WARNING"
+        ) as logs:
+            trio.run(scenario)
+        self.assertNotIn("private queue detail", "\n".join(logs.output))
+
+    def test_stale_ordinary_snapshot_cannot_admit_a_replacement(self) -> None:
+        class Mutation:
+            calls = 0
+
+            async def upload(self, *_args: object, **_kwargs: object) -> None:
+                self.calls += 1
+                raise AssertionError("stale upload reached the network")
+
+        class Mounted:
+            mutation_enabled = True
+
+            def __init__(self, mutation: Mutation) -> None:
+                self.mutation = mutation
+
+            def upload_access(self):
+                return self.mutation, ServerSession(
+                    OWNER_ID, "3.0.3", frozenset({".jpg"}), True
+                )
+
+        async def scenario(root: Path) -> None:
+            mutation = Mutation()
+            with UploadQueue(root / "uploads") as queue:
+                draft = queue.begin(
+                    "editor-save.tmp", "https://photos.example.test", OWNER_ID
+                )
+                queue.write(draft, 0, b"replacement")
+                stale = queue.seal(draft)
+                os.close(draft.descriptor)
+                marked = queue.mark_replacement(
+                    stale.id,
+                    revision=stale.revision,
+                    old_asset_id=ASSET_ID,
+                    old_inode=2,
+                    old_name="photo.jpg",
+                    source_owner_id=OWNER_ID,
+                    source_library_id=None,
+                    source_checksum="abc=",
+                    source_updated_at="2026-08-25T12:00:00Z",
+                    source_created_ns=1,
+                    source_is_favorite=False,
+                    source_visibility="timeline",
+                    source_album_ids=(),
+                )
+
+                await _process_upload(
+                    queue,
+                    object(),  # type: ignore[arg-type]
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    Settings("https://photos.example.test", root / "mount"),
+                    stale,
+                    lambda _entry: trio.lowlevel.checkpoint(),
+                )
+
+                self.assertEqual(mutation.calls, 0)
+                self.assertEqual(queue.status(stale.id), marked)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("immich_on_demand.service.LOGGER.warning"):
+                trio.run(scenario, Path(directory))
+
+    def test_active_replacement_suppresses_an_unrecorded_remote_candidate(self) -> None:
+        content = b"replacement original"
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                source_asset = replace(upload_entry().asset, size=12)
+                catalog.begin_refresh()
+                catalog.stage([source_asset])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                source = catalog.by_id(source_asset.id)
+                assert source is not None
+                job = SimpleNamespace(
+                    operation=UploadOperation.REPLACEMENT,
+                    old_asset_id=source.asset.id,
+                    old_inode=source.inode,
+                    candidate_asset_id=None,
+                    size=len(content),
+                    sha1=hashlib.sha1(content, usedforsecurity=False).hexdigest(),
+                    owner_id=OWNER_ID,
+                )
+
+                preserved, excluded, signatures = _replacement_refresh_policy(
+                    catalog, (job,)  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(preserved, (source.asset,))
+                self.assertEqual(excluded, frozenset())
+                self.assertEqual(
+                    signatures,
+                    frozenset(
+                        {
+                            (
+                                OWNER_ID,
+                                len(content),
+                                base64.b64encode(
+                                    hashlib.sha1(
+                                        content, usedforsecurity=False
+                                    ).digest()
+                                ).decode(),
+                            )
+                        }
+                    ),
+                )
+
+    def test_failed_duplicate_preserves_existing_asset_and_unsealed_job_is_inert(
+        self,
+    ) -> None:
+        content = b"replacement original"
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                source_asset = replace(upload_entry().asset, size=12)
+                duplicate = replace(
+                    source_asset,
+                    id=OTHER_UPLOAD_ID,
+                    original_name="duplicate.jpg",
+                )
+                catalog.begin_refresh()
+                catalog.stage([source_asset, duplicate])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                source = catalog.by_id(source_asset.id)
+                existing = catalog.by_id(duplicate.id)
+                assert source is not None and existing is not None
+                conflict = SimpleNamespace(
+                    operation=UploadOperation.REPLACEMENT,
+                    old_asset_id=source.asset.id,
+                    old_inode=source.inode,
+                    old_name=source.name,
+                    candidate_asset_id=existing.asset.id,
+                    size=len(content),
+                    sha1=hashlib.sha1(content, usedforsecurity=False).hexdigest(),
+                    owner_id=OWNER_ID,
+                    state=UploadState.BLOCKED,
+                    error=UploadErrorCode.CANDIDATE_MISMATCH,
+                )
+
+                preserved, excluded, signatures = _replacement_refresh_policy(
+                    catalog, (conflict,)  # type: ignore[arg-type]
+                )
+                self.assertEqual(set(preserved), {source.asset, existing.asset})
+                self.assertEqual(excluded, frozenset())
+                self.assertEqual(signatures, frozenset())
+
+                unsealed = SimpleNamespace(
+                    operation=UploadOperation.REPLACEMENT,
+                    size=None,
+                    sha1=None,
+                )
+                self.assertEqual(
+                    _replacement_refresh_policy(
+                        catalog, (unsealed,)  # type: ignore[arg-type]
+                    ),
+                    ((), frozenset(), frozenset()),
+                )
+
     def test_pending_upload_resumes_candidate_verification_without_reposting(self) -> None:
         content = b"queued original"
         checksum = base64.b64encode(
@@ -670,6 +876,7 @@ class ServiceTest(unittest.TestCase):
             mutation = Mutation()
             read_client = ReadClient()
             callbacks: list[CatalogAsset] = []
+            finished: list[str] = []
             with (
                 Catalog(root / "state" / "catalog.db") as catalog,
                 UploadQueue(root / "data" / "uploads") as queue,
@@ -681,6 +888,10 @@ class ServiceTest(unittest.TestCase):
 
                 async def published(entry: CatalogAsset) -> None:
                     callbacks.append(entry)
+
+                async def completed(job_id: str) -> None:
+                    await trio.lowlevel.checkpoint()
+                    finished.append(job_id)
 
                 class ReadOnly:
                     mutation_enabled = False
@@ -694,9 +905,11 @@ class ServiceTest(unittest.TestCase):
                     Settings("https://photos.example.test", root / "mount"),
                     job,
                     published,
+                    completed,
                 )
                 self.assertEqual(queue.status(job.id), job)
                 self.assertEqual(mutation.calls, [])
+                self.assertEqual(finished, [])
 
                 await _process_upload(
                     queue,
@@ -707,6 +920,7 @@ class ServiceTest(unittest.TestCase):
                     Settings("https://photos.example.test", root / "mount"),
                     job,
                     published,
+                    completed,
                 )
 
                 waiting = queue.status(job.id)
@@ -715,6 +929,7 @@ class ServiceTest(unittest.TestCase):
                 self.assertEqual(waiting.candidate_asset_id, ASSET_ID)
                 self.assertEqual(waiting.error, UploadErrorCode.UPLOAD_UNAVAILABLE)
                 self.assertIsNone(catalog.by_id(ASSET_ID))
+                self.assertEqual(finished, [])
 
                 waiting = queue.retry(job.id, at_ns=0)
                 await _process_upload(
@@ -726,6 +941,7 @@ class ServiceTest(unittest.TestCase):
                     Settings("https://photos.example.test", root / "mount"),
                     waiting,
                     published,
+                    completed,
                 )
 
                 self.assertIsNone(queue.status(job.id))
@@ -733,6 +949,7 @@ class ServiceTest(unittest.TestCase):
                 assert entry is not None
                 self.assertEqual((entry.name, entry.asset), ("photo.jpg", uploaded))
                 self.assertEqual(callbacks, [entry])
+                self.assertEqual(finished, [job.id])
                 self.assertEqual(
                     [call[1:] for call in mutation.calls],
                     [("photo.jpg", frozenset({".jpg"}), job.id)],
@@ -754,13 +971,673 @@ class ServiceTest(unittest.TestCase):
                     Settings("https://photos.example.test", root / "mount"),
                     broken,
                     published,
+                    completed,
                 )
                 blocked = queue.status(broken.id)
                 assert blocked is not None
                 self.assertEqual(blocked.state, UploadState.BLOCKED)
                 self.assertEqual(blocked.error, UploadErrorCode.LOCAL_STATE_FAILED)
+                self.assertEqual(finished, [job.id])
 
         job = None  # type: ignore[assignment]
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_replacement_revalidates_copies_trashes_and_publishes_once(self) -> None:
+        old_content = b"old original"
+        replacement_content = b"replacement original"
+        old_checksum = base64.b64encode(
+            hashlib.sha1(old_content, usedforsecurity=False).digest()
+        ).decode()
+        replacement_checksum = base64.b64encode(
+            hashlib.sha1(replacement_content, usedforsecurity=False).digest()
+        ).decode()
+        old = replace(
+            upload_entry().asset,
+            original_name="photo.jpg",
+            size=len(old_content),
+            created_ns=1_000_000_000,
+            checksum=old_checksum,
+        )
+        candidate = replace(
+            old,
+            id=OTHER_UPLOAD_ID,
+            original_name="candidate.jpg",
+            size=len(replacement_content),
+            modified_ns=3,
+            updated_at="2026-08-26T00:01:00Z",
+            checksum=replacement_checksum,
+        )
+
+        class ReadClient:
+            def __init__(self) -> None:
+                self.old = old
+                self.calls: list[tuple[str, str]] = []
+                self.source_drift = True
+                self.old_album_reads = 0
+
+            async def asset(self, asset_id: str) -> Asset:
+                self.calls.append(("asset", asset_id))
+                if asset_id == candidate.id:
+                    return candidate
+                if self.source_drift:
+                    self.source_drift = False
+                    return replace(
+                        self.old, updated_at="2026-08-26T00:02:00Z"
+                    )
+                return self.old
+
+            async def asset_metadata(self, asset_id: str) -> str:
+                self.calls.append(("metadata", asset_id))
+                return job.id
+
+            async def albums(self, *, asset_id: str | None = None) -> list[object]:
+                assert asset_id is not None
+                self.calls.append(("albums", asset_id))
+                if asset_id == old.id:
+                    self.old_album_reads += 1
+                    if self.old_album_reads == 2:
+                        return [SimpleNamespace(id=PINNED_ID)]
+                return []
+
+        class Mutation:
+            def __init__(self, read_client: ReadClient) -> None:
+                self.read_client = read_client
+                self.upload_sources: list[Asset | None] = []
+                self.copies: list[tuple[str, str]] = []
+                self.trashed: list[str] = []
+
+            async def upload(
+                self,
+                descriptor: int,
+                name: str,
+                media_types: frozenset[str],
+                upload_id: str,
+                *,
+                replacement_source: Asset | None = None,
+            ) -> UploadResult:
+                self.upload_sources.append(replacement_source)
+                return UploadResult(candidate.id, True)
+
+            async def copy_albums(self, source: str, target: str) -> None:
+                self.copies.append((source, target))
+
+            async def trash(self, asset_id: str) -> None:
+                self.trashed.append(asset_id)
+                if len(self.trashed) > 1:
+                    self.read_client.old = replace(
+                        self.read_client.old,
+                        is_trashed=True,
+                        updated_at="2026-08-26T00:03:00Z",
+                    )
+                raise ImmichResponseError("lost trash response")
+
+        class Mounted:
+            mutation_enabled = True
+
+            def __init__(self, mutation: Mutation) -> None:
+                self.mutation = mutation
+
+            def upload_access(self):
+                return self.mutation, ServerSession(
+                    OWNER_ID, "3.0.3", frozenset({".jpg"}), True
+                )
+
+        async def scenario(root: Path) -> None:
+            nonlocal job
+            callbacks: list[CatalogAsset] = []
+            finished: list[str] = []
+            read_client = ReadClient()
+            mutation = Mutation(read_client)
+            with (
+                Catalog(root / "state" / "catalog.db") as catalog,
+                UploadQueue(root / "data" / "uploads") as queue,
+            ):
+                catalog.begin_refresh()
+                catalog.stage([old])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                source = catalog.by_id(old.id)
+                assert source is not None
+
+                draft = queue.begin(
+                    source.name, "https://photos.example.test", OWNER_ID
+                )
+                queue.write(draft, 0, replacement_content)
+                job = queue.seal(draft)
+                os.close(draft.descriptor)
+                job = queue.mark_replacement(
+                    job.id,
+                    revision=job.revision,
+                    old_asset_id=old.id,
+                    old_inode=source.inode,
+                    old_name=source.name,
+                    source_owner_id=old.owner_id,
+                    source_library_id=old.library_id,
+                    source_checksum=old.checksum,
+                    source_updated_at=old.updated_at,
+                    source_created_ns=old.created_ns,
+                    source_is_favorite=old.is_favorite,
+                    source_visibility=old.visibility,
+                    source_album_ids=(),
+                )
+
+                async def published(entry: CatalogAsset) -> None:
+                    callbacks.append(entry)
+
+                def completed(job_id: str) -> None:
+                    finished.append(job_id)
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    job,
+                    published,
+                    completed,
+                )
+
+                blocked = queue.status(job.id)
+                assert blocked is not None
+                self.assertEqual(blocked.state, UploadState.BLOCKED)
+                self.assertEqual(
+                    blocked.error, UploadErrorCode.CANDIDATE_MISMATCH
+                )
+                self.assertIsNone(catalog.by_id(candidate.id))
+                self.assertEqual(callbacks, [])
+                self.assertEqual(mutation.upload_sources, [old])
+                self.assertEqual(mutation.copies, [])
+                self.assertEqual(mutation.trashed, [])
+
+                retrying = queue.retry(
+                    job.id, at_ns=0, revision=blocked.revision
+                )
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    retrying,
+                    published,
+                    completed,
+                )
+
+                blocked = queue.status(job.id)
+                assert blocked is not None
+                self.assertEqual(blocked.state, UploadState.BLOCKED)
+                self.assertEqual(
+                    blocked.error, UploadErrorCode.CANDIDATE_MISMATCH
+                )
+                self.assertEqual(mutation.upload_sources, [old])
+                self.assertEqual(mutation.copies, [])
+                self.assertEqual(mutation.trashed, [])
+
+                retrying = queue.retry(
+                    job.id, at_ns=0, revision=blocked.revision
+                )
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    retrying,
+                    published,
+                    completed,
+                )
+
+                retrying = queue.status(job.id)
+                assert retrying is not None
+                self.assertEqual(retrying.state, UploadState.REPLACING)
+                self.assertEqual(
+                    retrying.error, UploadErrorCode.AMBIGUOUS_RESPONSE
+                )
+                self.assertIsNotNone(_next_upload_delay(queue))
+                self.assertEqual(mutation.upload_sources, [old])
+                self.assertEqual(mutation.copies, [(old.id, candidate.id)])
+                self.assertEqual(mutation.trashed, [old.id])
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    retrying,
+                    published,
+                    completed,
+                )
+
+                self.assertIsNone(queue.status(job.id))
+                published_candidate = catalog.by_id(candidate.id)
+                retired = catalog.by_id(old.id)
+                assert published_candidate is not None
+                assert retired is not None
+                self.assertEqual(callbacks, [published_candidate])
+                self.assertEqual(published_candidate.name, source.name)
+                self.assertNotEqual(published_candidate.inode, source.inode)
+                self.assertTrue(retired.asset.is_trashed)
+                self.assertEqual(mutation.upload_sources, [old])
+                self.assertEqual(
+                    mutation.copies,
+                    [(old.id, candidate.id), (old.id, candidate.id)],
+                )
+                self.assertEqual(mutation.trashed, [old.id, old.id])
+                self.assertEqual(finished, [job.id])
+
+                network_calls = (
+                    tuple(read_client.calls),
+                    tuple(mutation.upload_sources),
+                    tuple(mutation.copies),
+                    tuple(mutation.trashed),
+                )
+                draft = queue.begin(
+                    published_candidate.name,
+                    "https://photos.example.test",
+                    OWNER_ID,
+                )
+                queue.write(draft, 0, replacement_content)
+                unchanged = queue.seal(draft)
+                os.close(draft.descriptor)
+                unchanged = queue.mark_replacement(
+                    unchanged.id,
+                    revision=unchanged.revision,
+                    old_asset_id=candidate.id,
+                    old_inode=published_candidate.inode,
+                    old_name=published_candidate.name,
+                    source_owner_id=candidate.owner_id,
+                    source_library_id=candidate.library_id,
+                    source_checksum=candidate.checksum,
+                    source_updated_at=candidate.updated_at,
+                    source_created_ns=candidate.created_ns,
+                    source_is_favorite=candidate.is_favorite,
+                    source_visibility=candidate.visibility,
+                    source_album_ids=(),
+                )
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    unchanged,
+                    published,
+                    completed,
+                )
+                self.assertIsNone(queue.status(unchanged.id))
+                self.assertEqual(
+                    (
+                        tuple(read_client.calls),
+                        tuple(mutation.upload_sources),
+                        tuple(mutation.copies),
+                        tuple(mutation.trashed),
+                    ),
+                    network_calls,
+                )
+                self.assertEqual(callbacks[-1], published_candidate)
+                self.assertEqual(finished, [job.id, unchanged.id])
+
+                draft = queue.begin(
+                    published_candidate.name,
+                    "https://photos.example.test",
+                    OWNER_ID,
+                )
+                queue.write(draft, 0, b"drifted replacement")
+                drifted = queue.seal(draft)
+                os.close(draft.descriptor)
+                drifted = queue.mark_replacement(
+                    drifted.id,
+                    revision=drifted.revision,
+                    old_asset_id=candidate.id,
+                    old_inode=published_candidate.inode,
+                    old_name=published_candidate.name,
+                    source_owner_id=candidate.owner_id,
+                    source_library_id=candidate.library_id,
+                    source_checksum=candidate.checksum,
+                    source_updated_at="2026-08-26T00:02:00Z",
+                    source_created_ns=candidate.created_ns,
+                    source_is_favorite=candidate.is_favorite,
+                    source_visibility=candidate.visibility,
+                    source_album_ids=(),
+                )
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    drifted,
+                    published,
+                    completed,
+                )
+                blocked = queue.status(drifted.id)
+                assert blocked is not None
+                self.assertEqual(blocked.state, UploadState.BLOCKED)
+                self.assertEqual(
+                    blocked.error, UploadErrorCode.CANDIDATE_MISMATCH
+                )
+                self.assertEqual(
+                    (
+                        tuple(read_client.calls),
+                        tuple(mutation.upload_sources),
+                        tuple(mutation.copies),
+                        tuple(mutation.trashed),
+                    ),
+                    network_calls,
+                )
+
+        job = None  # type: ignore[assignment]
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_replacement_recovers_after_catalog_publication_without_network(self) -> None:
+        old_content = b"old original"
+        content = b"replacement original"
+        checksum = base64.b64encode(
+            hashlib.sha1(content, usedforsecurity=False).digest()
+        ).decode()
+        old = replace(
+            upload_entry().asset,
+            original_name="photo.jpg",
+            size=len(old_content),
+            created_ns=1_000_000_000,
+            checksum=base64.b64encode(
+                hashlib.sha1(old_content, usedforsecurity=False).digest()
+            ).decode(),
+        )
+        candidate = replace(
+            old,
+            id=OTHER_UPLOAD_ID,
+            original_name="candidate.jpg",
+            size=len(content),
+            checksum=checksum,
+            updated_at="2026-08-26T00:01:00Z",
+        )
+
+        class Mutation:
+            def __getattr__(self, name: str):
+                raise AssertionError(f"unexpected mutation call: {name}")
+
+        class Mounted:
+            mutation_enabled = True
+
+            def upload_access(self):
+                return Mutation(), ServerSession(
+                    OWNER_ID, "3.0.3", frozenset({".jpg"}), True
+                )
+
+        async def scenario(root: Path) -> None:
+            published: list[CatalogAsset] = []
+            finished: list[str] = []
+            with (
+                Catalog(root / "state" / "catalog.db") as catalog,
+                UploadQueue(root / "data" / "uploads") as queue,
+            ):
+                catalog.begin_refresh()
+                catalog.stage([old])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                source = catalog.by_id(old.id)
+                assert source is not None
+
+                draft = queue.begin(source.name, "https://photos.example.test", OWNER_ID)
+                queue.write(draft, 0, content)
+                job = queue.seal(draft)
+                os.close(draft.descriptor)
+                job = queue.mark_replacement(
+                    job.id,
+                    revision=job.revision,
+                    old_asset_id=old.id,
+                    old_inode=source.inode,
+                    old_name=source.name,
+                    source_owner_id=old.owner_id,
+                    source_library_id=old.library_id,
+                    source_checksum=old.checksum,
+                    source_updated_at=old.updated_at,
+                    source_created_ns=old.created_ns,
+                    source_is_favorite=old.is_favorite,
+                    source_visibility=old.visibility,
+                    source_album_ids=(),
+                )
+                job, descriptor = queue.open_attempt(job.id)
+                os.close(descriptor)
+                job = queue.record_candidate(job.id, candidate.id)
+                job = queue.begin_replacing(job.id)
+                committed = catalog.publish_replacement(
+                    old_asset_id=old.id,
+                    candidate=candidate,
+                )
+
+                async def on_uploaded(entry: CatalogAsset) -> None:
+                    published.append(entry)
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    job,
+                    on_uploaded,
+                    finished.append,
+                )
+
+                self.assertIsNone(queue.status(job.id))
+                self.assertEqual(published, [committed])
+                self.assertEqual(finished, [job.id])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_pinned_replacement_keeps_its_job_until_cache_transfer_succeeds(
+        self,
+    ) -> None:
+        old_content = b"old original"
+        content = b"replacement original"
+        old = replace(
+            upload_entry().asset,
+            original_name="photo.jpg",
+            size=len(old_content),
+            created_ns=1_000_000_000,
+            checksum=base64.b64encode(
+                hashlib.sha1(old_content, usedforsecurity=False).digest()
+            ).decode(),
+        )
+        candidate = replace(
+            old,
+            id=OTHER_UPLOAD_ID,
+            original_name="candidate.jpg",
+            size=len(content),
+            checksum=base64.b64encode(
+                hashlib.sha1(content, usedforsecurity=False).digest()
+            ).decode(),
+            updated_at="2026-08-26T00:01:00Z",
+        )
+
+        class Mutation:
+            def __getattr__(self, name: str):
+                raise AssertionError(f"unexpected mutation call: {name}")
+
+        class Mounted:
+            mutation_enabled = True
+
+            def upload_access(self):
+                return Mutation(), ServerSession(
+                    OWNER_ID, "3.0.3", frozenset({".jpg"}), True
+                )
+
+        class Cache:
+            def __init__(self) -> None:
+                self.fail = True
+                self.calls: list[tuple[str, str, bool, UploadState, bool]] = []
+                self.queue: UploadQueue | None = None
+                self.job_id = ""
+
+            async def transfer_pin(
+                self,
+                source_asset_id: str,
+                replacement: Asset,
+                *,
+                pinned: bool,
+            ) -> None:
+                assert self.queue is not None
+                status = self.queue.status(self.job_id)
+                assert status is not None
+                self.calls.append(
+                    (
+                        source_asset_id,
+                        replacement.id,
+                        pinned,
+                        status.state,
+                        status.payload_path.exists(),
+                    )
+                )
+                if self.fail:
+                    raise OSError("cache storage unavailable")
+
+        async def scenario(root: Path) -> None:
+            published: list[CatalogAsset] = []
+            finished: list[str] = []
+            cache = Cache()
+            with (
+                Catalog(root / "state" / "catalog.db") as catalog,
+                UploadQueue(root / "data" / "uploads") as queue,
+            ):
+                cache.queue = queue
+                catalog.begin_refresh()
+                catalog.stage([old])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                source = catalog.by_id(old.id)
+                assert source is not None
+                catalog.pin(old.id)
+
+                draft = queue.begin(
+                    source.name, "https://photos.example.test", OWNER_ID
+                )
+                queue.write(draft, 0, content)
+                job = queue.seal(draft)
+                os.close(draft.descriptor)
+                job = queue.mark_replacement(
+                    job.id,
+                    revision=job.revision,
+                    old_asset_id=old.id,
+                    old_inode=source.inode,
+                    old_name=source.name,
+                    source_owner_id=old.owner_id,
+                    source_library_id=old.library_id,
+                    source_checksum=old.checksum,
+                    source_updated_at=old.updated_at,
+                    source_created_ns=old.created_ns,
+                    source_is_favorite=old.is_favorite,
+                    source_visibility=old.visibility,
+                    source_album_ids=(),
+                )
+                job, descriptor = queue.open_attempt(job.id)
+                os.close(descriptor)
+                job = queue.record_candidate(job.id, candidate.id)
+                job = queue.begin_replacing(job.id)
+                committed = catalog.publish_replacement(
+                    old_asset_id=old.id,
+                    candidate=candidate,
+                )
+                cache.job_id = job.id
+
+                async def on_uploaded(entry: CatalogAsset) -> None:
+                    published.append(entry)
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    job,
+                    on_uploaded,
+                    finished.append,
+                    content_cache=cache,  # type: ignore[arg-type]
+                )
+
+                blocked = queue.status(job.id)
+                assert blocked is not None
+                self.assertEqual(blocked.state, UploadState.BLOCKED)
+                self.assertEqual(blocked.error, UploadErrorCode.LOCAL_STATE_FAILED)
+                self.assertTrue(blocked.payload_path.exists())
+                self.assertEqual(catalog.by_id(candidate.id), committed)
+                self.assertEqual(catalog.pinned_ids(), frozenset({candidate.id}))
+                self.assertEqual(finished, [])
+
+                cache.fail = False
+                retrying = queue.retry(job.id, at_ns=0, revision=blocked.revision)
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    retrying,
+                    on_uploaded,
+                    finished.append,
+                    content_cache=cache,  # type: ignore[arg-type]
+                )
+
+                self.assertIsNone(queue.status(job.id))
+                self.assertEqual(
+                    cache.calls,
+                    [
+                        (old.id, candidate.id, True, UploadState.REPLACING, True),
+                        (old.id, candidate.id, True, UploadState.REPLACING, True),
+                    ],
+                )
+                self.assertEqual(finished, [job.id])
+                self.assertEqual(published, [committed, committed])
+
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
@@ -1423,6 +2300,7 @@ class ServiceTest(unittest.TestCase):
                             size=1,
                             error=None,
                             revision=2,
+                            operation=UploadOperation.ORDINARY,
                         ),
                         SimpleNamespace(
                             id=ASSET_ID,
@@ -1433,6 +2311,7 @@ class ServiceTest(unittest.TestCase):
                             size=2,
                             error=UploadErrorCode.UPLOAD_UNAVAILABLE,
                             revision=3,
+                            operation=UploadOperation.ORDINARY,
                         ),
                         SimpleNamespace(
                             id=OTHER_UPLOAD_ID,
@@ -1443,6 +2322,7 @@ class ServiceTest(unittest.TestCase):
                             size=3,
                             error=None,
                             revision=4,
+                            operation=UploadOperation.ORDINARY,
                         ),
                     ]
                     self.assertEqual((await status({}))["pending_uploads"], 2)  # type: ignore[index,operator]
@@ -1479,6 +2359,7 @@ class ServiceTest(unittest.TestCase):
                         fakes.upload_cancellations,
                         [(OTHER_UPLOAD_ID, "cancel.jpg", 4)],
                     )
+                    self.assertEqual(fakes.upload_finishes, [OTHER_UPLOAD_ID])
                     with trio.fail_after(0.1):
                         self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
                         self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]

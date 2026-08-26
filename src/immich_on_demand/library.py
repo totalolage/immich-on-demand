@@ -40,6 +40,10 @@ class Library:
     def mutation_enabled(self) -> bool:
         return self._mutation_client is not None and self._mutation_session is not None
 
+    @property
+    def replacement_enabled(self) -> bool:
+        return self.mutation_enabled and self._settings.remote_delete
+
     def enable_mutations(
         self, mutation_client: ImmichClient, mutation_session: ServerSession
     ) -> None:

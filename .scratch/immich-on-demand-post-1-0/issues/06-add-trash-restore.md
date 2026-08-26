@@ -18,7 +18,7 @@ Expose the existing Immich restore operation through the service and CLI, then a
 
 ## Answer
 
-The CLI exposes `immich-on-demand restore --asset UUID`. Restore requires the `--enable-remote-delete` opt-in. At startup, the service requires the mutation key to have exactly `user.read`, `asset.read`, `asset.view`, `asset.download`, `asset.upload`, and `asset.delete`. The service accepts only a canonical UUID for a known, trashed asset owned by the mutation user.
+The CLI exposes `immich-on-demand restore --asset UUID`. Restore requires the `--enable-remote-delete` opt-in. At startup, the service requires the mutation key to have exactly `user.read`, `asset.read`, `asset.view`, `asset.download`, `asset.upload`, `asset.copy`, and `asset.delete`. The service accepts only a canonical UUID for a known, trashed asset owned by the mutation user.
 
 Before every Restore, the Immich client fetches the current server features and requires literal `trash: true`. It sends one asset UUID to `POST /trash/restore/assets` and accepts only an integer response count of one. Generic client and control errors do not include response bodies or credentials.
 
@@ -28,4 +28,4 @@ The settings GUI provides a transient asset UUID field and a Restore button. It 
 
 ## Remaining acceptance
 
-Run the installed CLI and GUI against only the recorded trashed Test asset. Verify that the restored asset returns with its previous Library name and inode. Never Restore a Protected-library asset. The missing-permission, wrong-owner, disabled-trash, unknown-asset, response-schema, and control-error cases have automated coverage but have not completed target-system acceptance.
+Run the installed CLI and GUI against only the recorded trashed Test asset. Verify that the restored asset returns with its previous Library name and inode. Never Restore a Protected-library asset. The missing-permission, wrong-owner, disabled-trash, unknown-asset, response-schema, and control-error cases have automated coverage but have not completed Reference-system acceptance.

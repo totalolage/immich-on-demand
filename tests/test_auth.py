@@ -25,7 +25,7 @@ class AuthTest(unittest.TestCase):
         self.assertEqual(UPLOAD_PERMISSIONS, core | {"asset.upload"})
         self.assertEqual(
             MUTATION_PERMISSIONS,
-            core | {"asset.upload", "asset.delete"},
+            core | {"asset.upload", "asset.copy", "asset.delete"},
         )
 
     def test_api_key_permissions_follow_the_profile_policy(self) -> None:
