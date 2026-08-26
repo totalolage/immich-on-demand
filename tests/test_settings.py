@@ -86,7 +86,13 @@ class SettingsTest(unittest.TestCase):
         attributes = self._attributes("home")
         collection = _SecretCollection(
             [
-                _SecretItem("exact", attributes),
+                _SecretItem(
+                    "secret-tool",
+                    {
+                        **attributes,
+                        "xdg:schema": "org.freedesktop.Secret.Generic",
+                    },
+                ),
                 _SecretItem("superset", {**attributes, "extra": "value"}),
                 _SecretItem("other", self._attributes("work")),
             ]
@@ -137,7 +143,15 @@ class SettingsTest(unittest.TestCase):
             return_value=collection,
         ):
             self.assertFalse(has_nondefault_profile_api_keys())
-            collection.items.append(_SecretItem("work", self._attributes("work")))
+            collection.items.append(
+                _SecretItem(
+                    "work",
+                    {
+                        **self._attributes("work"),
+                        "xdg:schema": "org.freedesktop.Secret.Generic",
+                    },
+                )
+            )
             self.assertTrue(has_nondefault_profile_api_keys())
 
     def test_copy_legacy_api_keys_to_default_creates_compared_destinations(self) -> None:
@@ -179,6 +193,34 @@ class SettingsTest(unittest.TestCase):
             ],
         )
         self.assertTrue(all(not item.deleted for item in legacy_items))
+
+    def test_copy_legacy_api_key_accepts_secret_tool_schema(self) -> None:
+        source = _SecretItem(
+            "read-secret",
+            {
+                **self._legacy_attributes("read-only"),
+                "xdg:schema": "org.freedesktop.Secret.Generic",
+            },
+        )
+        collection = _SecretCollection([source])
+
+        with patch(
+            "immich_on_demand.settings._secret_collection",
+            return_value=collection,
+        ):
+            copy_legacy_api_keys_to_default(self._settings())
+
+        self.assertEqual(
+            collection.created,
+            [
+                (
+                    "Immich On-Demand default read-only API key",
+                    self._attributes("default"),
+                    b"read-secret",
+                    False,
+                )
+            ],
+        )
 
     def test_copy_legacy_api_keys_preflights_an_orphan_mutation_destination(self) -> None:
         read = _SecretItem("read-secret", self._legacy_attributes("read-only"))
@@ -324,9 +366,22 @@ class SettingsTest(unittest.TestCase):
 
     def test_load_api_key_uses_only_the_exact_profile_item(self) -> None:
         attributes = self._attributes("home")
-        exact = _SecretItem("home-secret", attributes)
+        exact = _SecretItem(
+            "home-secret",
+            {
+                **attributes,
+                "xdg:schema": "org.freedesktop.Secret.Generic",
+            },
+        )
         collection = _SecretCollection(
-            [_SecretItem("wrong-secret", {**attributes, "extra": "value"}), exact]
+            [
+                _SecretItem("wrong-secret", {**attributes, "extra": "value"}),
+                _SecretItem(
+                    "wrong-schema",
+                    {**attributes, "xdg:schema": "unexpected"},
+                ),
+                exact,
+            ]
         )
 
         with patch(

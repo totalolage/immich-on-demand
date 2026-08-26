@@ -12,6 +12,7 @@ from .profiles import APP_ID
 
 
 _CONFIG_NAME = "config.json"
+_SECRET_TOOL_SCHEMA = "org.freedesktop.Secret.Generic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,11 +237,25 @@ def save(settings: Settings, path: Path) -> Path:
     return path
 
 
+def _recognized_attributes(
+    attributes: dict[str, str],
+) -> dict[str, str] | None:
+    if "xdg:schema" not in attributes:
+        return attributes
+    if attributes["xdg:schema"] != _SECRET_TOOL_SCHEMA:
+        return None
+    return {
+        name: value
+        for name, value in attributes.items()
+        if name != "xdg:schema"
+    }
+
+
 def _exact_items(collection, attributes: dict[str, str]) -> list[object]:
     return [
         item
         for item in collection.search_items(attributes)
-        if item.get_attributes() == attributes
+        if _recognized_attributes(item.get_attributes()) == attributes
     ]
 
 
@@ -257,9 +272,10 @@ def has_profile_api_keys(profile_id: str) -> bool:
     try:
         collection = _secret_collection()
         for item in collection.search_items(query):
-            attributes = item.get_attributes()
+            attributes = _recognized_attributes(item.get_attributes())
             if (
-                set(attributes) == expected_names
+                attributes is not None
+                and set(attributes) == expected_names
                 and attributes["application"] == APP_ID
                 and attributes["profile"] == profile_id
             ):
@@ -276,12 +292,16 @@ def has_nondefault_profile_api_keys() -> bool:
     expected_names = {"application", "profile", "server", "purpose"}
     try:
         collection = _secret_collection()
-        return any(
-            set(attributes := item.get_attributes()) == expected_names
-            and attributes["application"] == APP_ID
-            and attributes["profile"] != "default"
-            for item in collection.search_items(query)
-        )
+        for item in collection.search_items(query):
+            attributes = _recognized_attributes(item.get_attributes())
+            if (
+                attributes is not None
+                and set(attributes) == expected_names
+                and attributes["application"] == APP_ID
+                and attributes["profile"] != "default"
+            ):
+                return True
+        return False
     except Exception as error:
         raise RuntimeError(
             "could not inspect Profile API keys in Secret Service"
