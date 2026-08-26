@@ -18,13 +18,16 @@ from immich_on_demand.immich import (
     ImmichResponseError,
     ImmichRetryableError,
     ImmichUnavailableError,
+    READ_PERMISSIONS,
 )
+from immich_on_demand.model import Album, Person
 
 
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 OTHER_ID = "22345678-1234-4234-8234-123456789abc"
 UPLOAD_ID = "32345678-1234-4234-8234-123456789abc"
+ALBUM_ID = "42345678-1234-4234-8234-123456789abc"
 
 
 def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
@@ -40,12 +43,277 @@ def asset(asset_id: str = ASSET_ID) -> dict[str, object]:
         "visibility": "timeline",
         "isTrashed": False,
         "isOffline": False,
+        "isFavorite": False,
+        "localDateTime": "2026-08-25T10:00:00",
         "libraryId": None,
         "exifInfo": {"fileSizeInByte": 123},
     }
 
 
+def album(
+    album_id: str = ALBUM_ID,
+    *,
+    name: object = "Holiday",
+    updated_at: object = "2026-08-25T12:00:00Z",
+    asset_count: object = 2,
+    album_users: object = (),
+) -> dict[str, object]:
+    return {
+        "id": album_id,
+        "albumName": name,
+        "updatedAt": updated_at,
+        "assetCount": asset_count,
+        "albumUsers": list(album_users) if isinstance(album_users, tuple) else album_users,
+    }
+
+
+def person(
+    person_id: str = ALBUM_ID,
+    *,
+    name: object = "Filip",
+    is_hidden: object = False,
+    updated_at: object = "2026-08-25T12:00:00Z",
+) -> dict[str, object]:
+    return {
+        "id": person_id,
+        "name": name,
+        "isHidden": is_hidden,
+        "updatedAt": updated_at,
+    }
+
+
 class ImmichClientTest(unittest.TestCase):
+    def test_people_validates_paginates_and_sorts_the_inventory(self) -> None:
+        requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            self.assertEqual((request.method, request.url.path), ("GET", "/api/people"))
+            self.assertEqual(
+                request.url.query,
+                f"page={requests}&size=1000&withHidden=false".encode(),
+            )
+            if requests == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "total": 2,
+                        "hidden": 0,
+                        "people": [person(ALBUM_ID, name="Zoo")],
+                        "hasNextPage": True,
+                    },
+                )
+            without_timestamp = person(ASSET_ID, name="Alpha")
+            del without_timestamp["updatedAt"]
+            return httpx.Response(
+                200,
+                json={"total": 2, "hidden": 0, "people": [without_timestamp]},
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                self.assertEqual(
+                    await client.people(),
+                    [
+                        Person(ASSET_ID, "Alpha", False, None),
+                        Person(ALBUM_ID, "Zoo", False, "2026-08-25T12:00:00Z"),
+                    ],
+                )
+
+        trio.run(scenario)
+        self.assertEqual(requests, 2)
+
+    def test_people_rejects_invalid_objects_and_empty_continuations(self) -> None:
+        valid_page = {"total": 1, "hidden": 0, "people": [person()]}
+        cases: tuple[object, ...] = (
+            [],
+            {**valid_page, "extra": True},
+            {"hidden": 0, "people": []},
+            {"total": True, "hidden": 0, "people": []},
+            {"total": -1, "hidden": 0, "people": []},
+            {"total": 0, "hidden": True, "people": []},
+            {"total": 0, "hidden": -1, "people": []},
+            {"total": 0, "hidden": 0, "people": {}},
+            {"total": 1, "hidden": 0, "people": ["not-an-object"]},
+            {"total": 1, "hidden": 0, "people": [person(ALBUM_ID.upper())]},
+            {"total": 2, "hidden": 0, "people": [person(), person()]},
+            {"total": 1, "hidden": 0, "people": [person(name=True)]},
+            {"total": 1, "hidden": 0, "people": [person(is_hidden=True)]},
+            {"total": 1, "hidden": 0, "people": [person(is_hidden=0)]},
+            {"total": 1, "hidden": 0, "people": [person(updated_at=None)]},
+            {
+                "total": 1,
+                "hidden": 0,
+                "people": [person(updated_at="2026-08-25T12:00:00")],
+            },
+            {**valid_page, "hasNextPage": 1},
+            {**valid_page, "hasNextPage": "true"},
+            {"total": 0, "hidden": 0, "people": [], "hasNextPage": True},
+        )
+
+        async def scenario(response: object) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(200, json=response)
+                ),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichResponseError, "^Immich returned invalid people$"
+                ):
+                    await client.people()
+
+        for response in cases:
+            with self.subTest(response=response):
+                trio.run(scenario, response)
+
+    def test_people_rejects_duplicate_ids_across_pages(self) -> None:
+        requests = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "total": 1,
+                    "hidden": 0,
+                    "people": [person()],
+                    "hasNextPage": requests == 1,
+                },
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichResponseError, "^Immich returned invalid people$"
+                ):
+                    await client.people()
+
+        trio.run(scenario)
+        self.assertEqual(requests, 2)
+
+    def test_albums_validates_and_sorts_the_complete_inventory(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual((request.method, request.url.path), ("GET", "/api/albums"))
+            self.assertEqual(request.url.query, b"")
+            return httpx.Response(
+                200,
+                json=[
+                    album(ALBUM_ID, name="Zoo", asset_count=0),
+                    album(ASSET_ID, name="Alpha", album_users=[{"role": "owner"}]),
+                ],
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                self.assertEqual(
+                    await client.albums(),
+                    [
+                        Album(ASSET_ID, "Alpha", "2026-08-25T12:00:00Z", 2),
+                        Album(ALBUM_ID, "Zoo", "2026-08-25T12:00:00Z", 0),
+                    ],
+                )
+
+        trio.run(scenario)
+
+    def test_albums_rejects_malformed_or_duplicate_records(self) -> None:
+        cases: tuple[object, ...] = (
+            {},
+            ["not-an-object"],
+            [album(ALBUM_ID.upper())],
+            [album(), album()],
+            [album(name=True)],
+            [album(updated_at=True)],
+            [album(updated_at="2026-08-25T12:00:00")],
+            [album(asset_count=True)],
+            [album(asset_count=-1)],
+            [album(asset_count=2.0)],
+            [album(album_users={})],
+        )
+
+        async def scenario(response: object) -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(200, json=response)
+                ),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichResponseError, "^Immich returned invalid albums$"
+                ):
+                    await client.albums()
+
+        for response in cases:
+            with self.subTest(response=response):
+                trio.run(scenario, response)
+
+    def test_asset_pages_emits_exact_relation_filters(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(
+                json.loads(request.content),
+                {
+                    "page": 1,
+                    "size": 1000,
+                    "order": "asc",
+                    "withExif": True,
+                    "withDeleted": True,
+                    "withStacked": True,
+                    "albumIds": [ALBUM_ID],
+                    "withPeople": True,
+                },
+            )
+            item = asset()
+            item["people"] = [{"id": OTHER_ID}, {"id": ASSET_ID}]
+            return httpx.Response(
+                200,
+                json={"assets": {"items": [item], "count": 1, "nextPage": None}},
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                pages = [
+                    page
+                    async for page in client.asset_pages(
+                        OWNER_ID,
+                        album_id=ALBUM_ID,
+                        with_people=True,
+                    )
+                ]
+                self.assertEqual(pages[0][0].person_ids, (ASSET_ID, OTHER_ID))
+
+        trio.run(scenario)
+
+    def test_asset_pages_requires_people_when_requested(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"assets": {"items": [asset()], "count": 1, "nextPage": None}},
+            )
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                async with aclosing(client.asset_pages(OWNER_ID, with_people=True)) as pages:
+                    with self.assertRaisesRegex(
+                        ImmichResponseError, "invalid asset people"
+                    ):
+                        await anext(pages)
+
+        trio.run(scenario)
+
     def test_classifies_only_no_response_network_failures_as_unavailable(self) -> None:
         async def scenario(error: Exception) -> None:
             def handler(request: httpx.Request) -> httpx.Response:
@@ -101,6 +369,8 @@ class ImmichClientTest(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)
             self.assertEqual(body["updatedAfter"], "2026-08-25T12:00:00.123Z")
+            self.assertNotIn("albumIds", body)
+            self.assertNotIn("withPeople", body)
             return httpx.Response(
                 200,
                 json={"assets": {"items": [], "count": 0, "nextPage": None}},
@@ -119,6 +389,37 @@ class ImmichClientTest(unittest.TestCase):
                 )
 
         trio.run(scenario)
+
+    def test_asset_pages_rejects_invalid_relation_options_before_network(self) -> None:
+        requests = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            raise AssertionError("invalid relation options made a request")
+
+        async def scenario(option: str, value: object) -> None:
+            async with ImmichClient(
+                "https://photos.example.test", "secret", transport=httpx.MockTransport(handler)
+            ) as client:
+                with self.assertRaises(ValueError):
+                    pages = (
+                        client.asset_pages(OWNER_ID, album_id=value)  # type: ignore[arg-type]
+                        if option == "album_id"
+                        else client.asset_pages(OWNER_ID, with_people=value)  # type: ignore[arg-type]
+                    )
+                    await anext(pages)
+
+        for option, value in (
+            ("album_id", True),
+            ("album_id", "not-a-uuid"),
+            ("album_id", ALBUM_ID.upper()),
+            ("with_people", 1),
+            ("with_people", "true"),
+        ):
+            with self.subTest(option=option, value=value):
+                trio.run(scenario, option, value)
+        self.assertEqual(requests, 0)
 
     def test_rejects_non_object_asset_items(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -378,9 +679,7 @@ class ImmichClientTest(unittest.TestCase):
         base = {
             "/.well-known/immich": {"api": {"endpoint": "/api"}},
             "/api/server/version": {"major": 3, "minor": 0, "patch": 3},
-            "/api/api-keys/me": {
-                "permissions": ["user.read", "asset.read", "asset.view", "asset.download"]
-            },
+            "/api/api-keys/me": {"permissions": sorted(READ_PERMISSIONS)},
             "/api/users/me": {"id": OWNER_ID},
             "/api/server/media-types": {"image": [".jpg"], "video": [], "sidecar": []},
             "/api/server/features": {"trash": True},
@@ -389,15 +688,7 @@ class ImmichClientTest(unittest.TestCase):
             ("/api/server/version", {"major": "3", "minor": 0, "patch": 3}, "version"),
             (
                 "/api/api-keys/me",
-                {
-                    "permissions": [
-                        "user.read",
-                        "asset.read",
-                        "asset.view",
-                        "asset.download",
-                        7,
-                    ]
-                },
+                {"permissions": [*sorted(READ_PERMISSIONS), 7]},
                 "permissions",
             ),
             ("/api/users/me", {"id": 123}, "user"),
@@ -437,7 +728,7 @@ class ImmichClientTest(unittest.TestCase):
             if path == "/api/api-keys/me":
                 return httpx.Response(
                     200,
-                    json={"permissions": ["user.read", "asset.read", "asset.view", "asset.download"]},
+                    json={"permissions": sorted(READ_PERMISSIONS)},
                 )
             if path == "/api/users/me":
                 return httpx.Response(200, json={"id": OWNER_ID})
@@ -474,7 +765,7 @@ class ImmichClientTest(unittest.TestCase):
         trio.run(scenario)
         self.assertEqual(seen_pages, [1, 2])
 
-    def test_rejects_extra_permissions_for_read_only_key(self) -> None:
+    def test_read_validation_requires_album_and_person_permissions(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             responses = {
                 "/.well-known/immich": {"api": {"endpoint": "/api"}},
@@ -485,8 +776,32 @@ class ImmichClientTest(unittest.TestCase):
                         "asset.read",
                         "asset.view",
                         "asset.download",
-                        "asset.delete",
                     ]
+                },
+            }
+            return httpx.Response(200, json=responses[request.url.path])
+
+        async def scenario() -> None:
+            async with ImmichClient(
+                "https://photos.example.test",
+                "secret",
+                transport=httpx.MockTransport(handler),
+            ) as client:
+                with self.assertRaisesRegex(
+                    ImmichError,
+                    "^API key is missing permissions: album.read, person.read$",
+                ):
+                    await client.validate()
+
+        trio.run(scenario)
+
+    def test_rejects_extra_permissions_for_read_only_key(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            responses = {
+                "/.well-known/immich": {"api": {"endpoint": "/api"}},
+                "/api/server/version": {"major": 3, "minor": 0, "patch": 3},
+                "/api/api-keys/me": {
+                    "permissions": [*sorted(READ_PERMISSIONS), "asset.delete"]
                 },
             }
             return httpx.Response(200, json=responses[request.url.path])

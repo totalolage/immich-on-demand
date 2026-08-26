@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 import hmac
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import sqlite3
 import stat
@@ -12,14 +13,27 @@ from typing import Iterable
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from .model import Asset, collision_name, safe_filename
+from .model import Album, Asset, Person, collision_name, safe_filename
 
 
 ROOT_INODE = 1
+_NAMESPACE_FORMAT = 1
+_FIXED_DIRECTORIES = (
+    ("view:all", "All", True),
+    ("view:albums", "Albums", False),
+    ("view:favorites", "Favorites", False),
+    ("view:people", "People", False),
+    ("view:date", "by Date", False),
+)
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
-_TRUSTED_READ_PERMISSIONS = frozenset(
+_CORE_READ_PERMISSIONS = frozenset(
     {"asset.download", "asset.read", "asset.view", "user.read"}
 )
+_RICH_READ_PERMISSIONS = _CORE_READ_PERMISSIONS | {"album.read", "person.read"}
+_READ_PERMISSION_POLICIES = {
+    1: _CORE_READ_PERMISSIONS,
+    2: _RICH_READ_PERMISSIONS,
+}
 
 
 def _canonical_origin(value: str) -> str:
@@ -47,7 +61,7 @@ def _canonical_origin(value: str) -> str:
     return f"https://{host}{f':{port}' if port not in {None, 443} else ''}"
 
 
-def _permissions(value: frozenset[str]) -> frozenset[str]:
+def _permissions(value: frozenset[str], format_version: int) -> frozenset[str]:
     if type(value) is not frozenset or not value or any(
         not isinstance(permission, str)
         or not permission
@@ -59,7 +73,7 @@ def _permissions(value: frozenset[str]) -> frozenset[str]:
         for permission in value
     ):
         raise ValueError("trusted profile read permissions must be nonempty strings")
-    if value != _TRUSTED_READ_PERMISSIONS:
+    if value != _READ_PERMISSION_POLICIES[format_version]:
         raise ValueError("trusted profile read permissions must match the exact read policy")
     return value
 
@@ -146,6 +160,30 @@ class CatalogAsset:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogDirectory:
+    inode: int
+    nlink: int
+    mutation_root: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogFile:
+    asset: Asset
+    inode: int
+    name: str
+    nlink: int
+
+
+CatalogNode = CatalogDirectory | CatalogFile
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogDirent:
+    name: str
+    node: CatalogNode
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogStats:
     total: int
     visible: int
@@ -165,8 +203,11 @@ class TrustedProfile:
     format_version: int = 1
 
     def __post_init__(self) -> None:
-        if type(self.format_version) is not int or self.format_version != 1:
-            raise ValueError("trusted profile format version must be 1")
+        if (
+            type(self.format_version) is not int
+            or self.format_version not in _READ_PERMISSION_POLICIES
+        ):
+            raise ValueError("trusted profile format version must be 1 or 2")
         object.__setattr__(
             self, "server_origin", _canonical_origin(self.server_origin)
         )
@@ -179,7 +220,7 @@ class TrustedProfile:
         object.__setattr__(self, "owner_id", owner_id)
         if self.server_version != "3.0.3":
             raise ValueError("trusted profile server version must be 3.0.3")
-        _permissions(self.read_permissions)
+        _permissions(self.read_permissions, self.format_version)
         _fingerprint(self.read_key_sha256)
 
 
@@ -234,7 +275,9 @@ class Catalog:
                 visibility TEXT NOT NULL,
                 is_trashed INTEGER NOT NULL,
                 is_offline INTEGER NOT NULL,
-                library_id TEXT
+                library_id TEXT,
+                local_date TEXT,
+                is_favorite INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS assets_visible_name
                 ON assets(is_trashed, is_offline, visibility, name);
@@ -251,7 +294,9 @@ class Catalog:
                 visibility TEXT NOT NULL,
                 is_trashed INTEGER NOT NULL,
                 is_offline INTEGER NOT NULL,
-                library_id TEXT
+                library_id TEXT,
+                local_date TEXT,
+                is_favorite INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -269,12 +314,74 @@ class Catalog:
                 read_permissions TEXT NOT NULL,
                 read_key_sha256 TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS namespace_directories (
+                identity TEXT PRIMARY KEY,
+                inode INTEGER NOT NULL UNIQUE,
+                parent_inode INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                mutation_root INTEGER NOT NULL CHECK (mutation_root IN (0, 1)),
+                UNIQUE(parent_inode, name)
+            );
+            CREATE TABLE IF NOT EXISTS namespace_links (
+                directory_inode INTEGER NOT NULL REFERENCES namespace_directories(inode),
+                asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                PRIMARY KEY(directory_inode, asset_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS namespace_links_asset
+                ON namespace_links(asset_id);
+            CREATE TABLE IF NOT EXISTS namespace_memberships (
+                directory_inode INTEGER NOT NULL REFERENCES namespace_directories(inode),
+                asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                PRIMARY KEY(directory_inode, asset_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS namespace_memberships_asset
+                ON namespace_memberships(asset_id);
             INSERT OR IGNORE INTO metadata(key, value) VALUES ('next_inode', 2);
             INSERT OR IGNORE INTO metadata(key, value) VALUES ('high_water_ms', 0);
             INSERT OR IGNORE INTO metadata(key, value) VALUES ('full_refresh_pages', 0);
             """
         )
-        self._connection.commit()
+        self._ensure_column("assets", "local_date", "TEXT")
+        self._ensure_column(
+            "assets", "is_favorite", "INTEGER NOT NULL DEFAULT 0"
+        )
+        self._ensure_column("incoming_assets", "local_date", "TEXT")
+        self._ensure_column(
+            "incoming_assets", "is_favorite", "INTEGER NOT NULL DEFAULT 0"
+        )
+        version = self._connection.execute(
+            "SELECT value FROM metadata WHERE key = 'namespace_format'"
+        ).fetchone()
+        if version is None:
+            with self._connection:
+                self._ensure_fixed_directories()
+                self._replace_namespace()
+                self._connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES ('namespace_format', ?)",
+                    (_NAMESPACE_FORMAT,),
+                )
+        elif type(version[0]) is not int or version[0] != _NAMESPACE_FORMAT:
+            raise ValueError("catalog namespace format is unsupported")
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in columns:
+            self._connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            )
+
+    def _ensure_fixed_directories(self) -> None:
+        for identity, name, mutation_root in _FIXED_DIRECTORIES:
+            self._ensure_directory(
+                identity,
+                ROOT_INODE,
+                name,
+                mutation_root=mutation_root,
+            )
 
     def begin_refresh(self) -> None:
         self._connection.execute("DELETE FROM incoming_assets")
@@ -283,7 +390,11 @@ class Catalog:
     def stage(self, assets: Iterable[Asset]) -> None:
         self._connection.executemany(
             """
-            INSERT OR REPLACE INTO incoming_assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO incoming_assets (
+                id, owner_id, original_name, mime_type, size, created_ns,
+                modified_ns, updated_at, checksum, visibility, is_trashed,
+                is_offline, library_id, local_date, is_favorite
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -300,6 +411,8 @@ class Catalog:
                     asset.is_trashed,
                     asset.is_offline,
                     asset.library_id,
+                    asset.local_date,
+                    int(asset.is_favorite),
                 )
                 for asset in assets
             ),
@@ -314,6 +427,18 @@ class Catalog:
         trusted_profile: TrustedProfile | None = None,
     ) -> CatalogStats:
         self._validate_refresh_state(high_water_ms, page_count)
+        if trusted_profile is not None and (
+            type(trusted_profile) is not TrustedProfile
+            or trusted_profile.format_version != 1
+        ):
+            raise ValueError("asset refresh can publish only a version 1 profile")
+        current_profile = self.trusted_profile()
+        if (
+            trusted_profile is not None
+            and current_profile is not None
+            and current_profile.format_version > trusted_profile.format_version
+        ):
+            raise ValueError("trusted profile downgrade is not allowed")
         return self._finish_staged(
             delete_missing=True,
             high_water_ms=high_water_ms,
@@ -366,6 +491,7 @@ class Catalog:
             rows = self._connection.execute(
                 "SELECT * FROM incoming_assets ORDER BY created_ns, id"
             ).fetchall()
+            changed_ids = [row["id"] for row in rows]
             for row in rows:
                 identity = existing.get(row["id"])
                 if identity:
@@ -377,11 +503,30 @@ class Catalog:
                     used_names.add(name)
                 self._connection.execute(
                     """
-                    INSERT OR REPLACE INTO assets
-                    SELECT id, ?, ?, owner_id, original_name, mime_type, size, created_ns,
-                           modified_ns, updated_at, checksum, visibility, is_trashed,
-                           is_offline, library_id
+                    INSERT INTO assets (
+                        id, inode, name, owner_id, original_name, mime_type, size,
+                        created_ns, modified_ns, updated_at, checksum, visibility,
+                        is_trashed, is_offline, library_id, local_date, is_favorite
+                    )
+                    SELECT id, ?, ?, owner_id, original_name, mime_type, size,
+                           created_ns, modified_ns, updated_at, checksum, visibility,
+                           is_trashed, is_offline, library_id, local_date, is_favorite
                       FROM incoming_assets WHERE id = ?
+                    ON CONFLICT(id) DO UPDATE SET
+                        owner_id = excluded.owner_id,
+                        original_name = excluded.original_name,
+                        mime_type = excluded.mime_type,
+                        size = excluded.size,
+                        created_ns = excluded.created_ns,
+                        modified_ns = excluded.modified_ns,
+                        updated_at = excluded.updated_at,
+                        checksum = excluded.checksum,
+                        visibility = excluded.visibility,
+                        is_trashed = excluded.is_trashed,
+                        is_offline = excluded.is_offline,
+                        library_id = excluded.library_id,
+                        local_date = excluded.local_date,
+                        is_favorite = excluded.is_favorite
                     """,
                     (inode, name, row["id"]),
                 )
@@ -403,25 +548,519 @@ class Catalog:
                     (high_water_ms,),
                 )
             if trusted_profile is not None:
-                self._connection.execute(
-                    """
-                    INSERT OR REPLACE INTO trusted_profile VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        1,
-                        trusted_profile.format_version,
-                        trusted_profile.server_origin,
-                        trusted_profile.owner_id,
-                        trusted_profile.server_version,
-                        json.dumps(
-                            sorted(trusted_profile.read_permissions),
-                            separators=(",", ":"),
-                        ),
-                        trusted_profile.read_key_sha256,
-                    ),
-                )
+                self._store_trusted_profile(trusted_profile)
+            if delete_missing:
+                self._replace_namespace()
+            else:
+                for asset_id in changed_ids:
+                    self._project_asset(asset_id)
+                self._refresh_date_activity()
             self._connection.execute("DELETE FROM incoming_assets")
         return self.stats()
+
+    def _store_trusted_profile(self, profile: TrustedProfile) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO trusted_profile VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                profile.format_version,
+                profile.server_origin,
+                profile.owner_id,
+                profile.server_version,
+                json.dumps(
+                    sorted(profile.read_permissions),
+                    separators=(",", ":"),
+                ),
+                profile.read_key_sha256,
+            ),
+        )
+
+    def _next_inode(self) -> int:
+        inode = self._connection.execute(
+            "SELECT value FROM metadata WHERE key = 'next_inode'"
+        ).fetchone()[0]
+        self._connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'next_inode'", (inode + 1,)
+        )
+        return inode
+
+    def _ensure_directory(
+        self,
+        identity: str,
+        parent_inode: int,
+        name: str,
+        *,
+        mutation_root: bool = False,
+    ) -> int:
+        row = self._connection.execute(
+            "SELECT * FROM namespace_directories WHERE identity = ?", (identity,)
+        ).fetchone()
+        if row is not None:
+            if (
+                row["parent_inode"] != parent_inode
+                or row["name"] != name
+                or bool(row["mutation_root"]) != mutation_root
+            ):
+                raise ValueError("catalog namespace directory identity changed")
+            self._connection.execute(
+                "UPDATE namespace_directories SET active = 1 WHERE identity = ?",
+                (identity,),
+            )
+            return row["inode"]
+        inode = self._next_inode()
+        self._connection.execute(
+            "INSERT INTO namespace_directories VALUES (?, ?, ?, ?, 1, ?)",
+            (identity, inode, parent_inode, name, int(mutation_root)),
+        )
+        return inode
+
+    @staticmethod
+    def _canonical_id(value: object, description: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{description} must be a canonical UUID")
+        try:
+            canonical = str(UUID(value))
+        except ValueError as error:
+            raise ValueError(f"{description} must be a canonical UUID") from error
+        if value != canonical:
+            raise ValueError(f"{description} must be a canonical UUID")
+        return value
+
+    def _activate_collection_directory(
+        self,
+        identity: str,
+        stable_id: str,
+        parent_inode: int,
+        label: str,
+        used_names: set[str],
+    ) -> int:
+        existing = self._connection.execute(
+            "SELECT * FROM namespace_directories WHERE identity = ?", (identity,)
+        ).fetchone()
+        if existing is not None:
+            return self._ensure_directory(
+                identity,
+                parent_inode,
+                existing["name"],
+            )
+        requested = (
+            collision_name("Unnamed", stable_id)
+            if label == ""
+            else safe_filename(label.replace("/", "_"), stable_id)
+        )
+        name = _available_name(requested, stable_id, used_names)
+        used_names.add(name)
+        return self._ensure_directory(identity, parent_inode, name)
+
+    def replace_album_people(
+        self,
+        *,
+        albums: Iterable[Album],
+        album_memberships: Iterable[tuple[str, str]],
+        people: Iterable[Person],
+        person_memberships: Iterable[tuple[str, str]],
+        trusted_profile: TrustedProfile | None = None,
+    ) -> None:
+        album_values = tuple(albums)
+        people_values = tuple(people)
+        album_ids: set[str] = set()
+        person_ids: set[str] = set()
+        for value in album_values:
+            if type(value) is not Album or not isinstance(value.name, str):
+                raise ValueError("albums must contain valid Album values")
+            album_id = self._canonical_id(value.id, "album id")
+            if album_id in album_ids:
+                raise ValueError("album ids must be unique")
+            album_ids.add(album_id)
+        for value in people_values:
+            if (
+                type(value) is not Person
+                or not isinstance(value.name, str)
+                or type(value.is_hidden) is not bool
+                or value.is_hidden
+            ):
+                raise ValueError("people must contain visible Person values")
+            person_id = self._canonical_id(value.id, "person id")
+            if person_id in person_ids:
+                raise ValueError("person ids must be unique")
+            person_ids.add(person_id)
+
+        def memberships(
+            values: Iterable[tuple[str, str]],
+            collection_ids: set[str],
+            description: str,
+        ) -> tuple[tuple[str, str], ...]:
+            result: set[tuple[str, str]] = set()
+            for value in values:
+                if type(value) is not tuple or len(value) != 2:
+                    raise ValueError(f"{description} memberships must be pairs")
+                collection_id = self._canonical_id(
+                    value[0], f"{description} membership collection id"
+                )
+                asset_id = self._canonical_id(
+                    value[1], f"{description} membership asset id"
+                )
+                if collection_id not in collection_ids:
+                    raise ValueError(
+                        f"{description} membership references an unknown collection"
+                    )
+                pair = (collection_id, asset_id)
+                if pair in result:
+                    raise ValueError(f"{description} memberships must be unique")
+                result.add(pair)
+            return tuple(sorted(result))
+
+        album_pairs = memberships(album_memberships, album_ids, "album")
+        person_pairs = memberships(person_memberships, person_ids, "person")
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            profile = (
+                trusted_profile
+                if trusted_profile is not None
+                else self.trusted_profile()
+            )
+            if type(profile) is not TrustedProfile or profile.format_version != 2:
+                raise ValueError("rich collection replacement requires a version 2 profile")
+            for asset_id in sorted(
+                {pair[1] for pair in album_pairs} | {pair[1] for pair in person_pairs}
+            ):
+                if self._connection.execute(
+                    """
+                    SELECT 1 FROM assets
+                     WHERE id = ? AND owner_id = ? AND size IS NOT NULL
+                       AND is_trashed = 0 AND is_offline = 0
+                       AND visibility != 'hidden'
+                    """,
+                    (asset_id, profile.owner_id),
+                ).fetchone() is None:
+                    raise ValueError(
+                        "collection membership requires a current visible owned asset"
+                    )
+
+            self._connection.execute(
+                """
+                UPDATE namespace_directories SET active = 0
+                 WHERE identity LIKE 'album:%' OR identity LIKE 'person:%'
+                """
+            )
+            self._connection.execute("DELETE FROM namespace_memberships")
+            album_parent = self._directory_inode("view:albums")
+            people_parent = self._directory_inode("view:people")
+            album_names = {
+                row["name"]
+                for row in self._connection.execute(
+                    "SELECT name FROM namespace_directories WHERE parent_inode = ?",
+                    (album_parent,),
+                )
+            }
+            people_names = {
+                row["name"]
+                for row in self._connection.execute(
+                    "SELECT name FROM namespace_directories WHERE parent_inode = ?",
+                    (people_parent,),
+                )
+            }
+            album_directories = {
+                value.id: self._activate_collection_directory(
+                    f"album:{value.id}",
+                    value.id,
+                    album_parent,
+                    value.name,
+                    album_names,
+                )
+                for value in sorted(album_values, key=lambda item: item.id)
+            }
+            person_directories = {
+                value.id: self._activate_collection_directory(
+                    f"person:{value.id}",
+                    value.id,
+                    people_parent,
+                    value.name,
+                    people_names,
+                )
+                for value in sorted(people_values, key=lambda item: item.id)
+            }
+            self._connection.executemany(
+                "INSERT INTO namespace_memberships VALUES (?, ?)",
+                (
+                    (album_directories[collection_id], asset_id)
+                    for collection_id, asset_id in album_pairs
+                ),
+            )
+            self._connection.executemany(
+                "INSERT INTO namespace_memberships VALUES (?, ?)",
+                (
+                    (person_directories[collection_id], asset_id)
+                    for collection_id, asset_id in person_pairs
+                ),
+            )
+            self._replace_namespace()
+            if trusted_profile is not None:
+                self._store_trusted_profile(profile)
+
+    @staticmethod
+    def _date_parts(value: object) -> tuple[str, str, str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("catalog asset local date is invalid")
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError("catalog asset local date is invalid") from error
+        if parsed.isoformat() != value:
+            raise ValueError("catalog asset local date is invalid")
+        return f"{parsed.year:04d}", f"{parsed.month:02d}", f"{parsed.day:02d}"
+
+    def _directory_inode(self, identity: str) -> int:
+        row = self._connection.execute(
+            "SELECT inode FROM namespace_directories WHERE identity = ?", (identity,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("catalog namespace is incomplete")
+        return row["inode"]
+
+    def _project_asset(self, asset_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM namespace_links WHERE asset_id = ?", (asset_id,)
+        )
+        row = self._connection.execute(
+            """
+            SELECT * FROM assets
+             WHERE id = ? AND size IS NOT NULL AND is_trashed = 0
+               AND is_offline = 0 AND visibility != 'hidden'
+            """,
+            (asset_id,),
+        ).fetchone()
+        if row is None:
+            return
+        if type(row["is_favorite"]) is not int or row["is_favorite"] not in {0, 1}:
+            raise ValueError("catalog asset favorite state is invalid")
+        directory_inodes = [self._directory_inode("view:all")]
+        if row["is_favorite"]:
+            directory_inodes.append(self._directory_inode("view:favorites"))
+        parts = self._date_parts(row["local_date"])
+        if parts is not None:
+            year, month, day = parts
+            parent = self._directory_inode("view:date")
+            parent = self._ensure_directory(f"date:{year}", parent, year)
+            parent = self._ensure_directory(
+                f"date:{year}-{month}", parent, month
+            )
+            directory_inodes.append(
+                self._ensure_directory(
+                    f"date:{year}-{month}-{day}", parent, day
+                )
+            )
+        directory_inodes.extend(
+            row["directory_inode"]
+            for row in self._connection.execute(
+                """
+                SELECT memberships.directory_inode
+                  FROM namespace_memberships AS memberships
+                  JOIN namespace_directories AS directories
+                    ON directories.inode = memberships.directory_inode
+                 WHERE memberships.asset_id = ? AND directories.active = 1
+                 ORDER BY memberships.directory_inode
+                """,
+                (asset_id,),
+            )
+        )
+        self._connection.executemany(
+            "INSERT INTO namespace_links VALUES (?, ?)",
+            ((inode, asset_id) for inode in directory_inodes),
+        )
+
+    def _replace_namespace(self) -> None:
+        self._connection.execute("DELETE FROM namespace_links")
+        self._connection.execute(
+            "UPDATE namespace_directories SET active = 0 WHERE identity LIKE 'date:%'"
+        )
+        asset_ids = [
+            row["id"]
+            for row in self._connection.execute(
+                """
+                SELECT id FROM assets
+                 WHERE size IS NOT NULL AND is_trashed = 0 AND is_offline = 0
+                   AND visibility != 'hidden'
+                 ORDER BY id
+                """
+            )
+        ]
+        for asset_id in asset_ids:
+            self._project_asset(asset_id)
+        self._refresh_date_activity()
+
+    def _refresh_date_activity(self) -> None:
+        rows = self._connection.execute(
+            "SELECT inode, parent_inode FROM namespace_directories WHERE identity LIKE 'date:%'"
+        ).fetchall()
+        parents = {row["inode"]: row["parent_inode"] for row in rows}
+        active = {
+            row["directory_inode"]
+            for row in self._connection.execute(
+                """
+                SELECT DISTINCT links.directory_inode
+                  FROM namespace_links AS links
+                  JOIN namespace_directories AS directories
+                    ON directories.inode = links.directory_inode
+                 WHERE directories.identity LIKE 'date:%'
+                """
+            )
+        }
+        pending = list(active)
+        while pending:
+            parent = parents.get(pending.pop())
+            if parent in parents and parent not in active:
+                active.add(parent)
+                pending.append(parent)
+        self._connection.execute(
+            "UPDATE namespace_directories SET active = 0 WHERE identity LIKE 'date:%'"
+        )
+        self._connection.executemany(
+            "UPDATE namespace_directories SET active = 1 WHERE inode = ?",
+            ((inode,) for inode in sorted(active)),
+        )
+
+    def node(self, inode: int) -> CatalogNode | None:
+        if type(inode) is not int or inode < ROOT_INODE:
+            return None
+        if inode == ROOT_INODE:
+            children = self._connection.execute(
+                "SELECT count(*) FROM namespace_directories WHERE parent_inode = ? AND active = 1",
+                (ROOT_INODE,),
+            ).fetchone()[0]
+            return CatalogDirectory(ROOT_INODE, 2 + children, False)
+        directory = self._connection.execute(
+            "SELECT * FROM namespace_directories WHERE inode = ? AND active = 1",
+            (inode,),
+        ).fetchone()
+        if directory is not None:
+            children = self._connection.execute(
+                "SELECT count(*) FROM namespace_directories WHERE parent_inode = ? AND active = 1",
+                (inode,),
+            ).fetchone()[0]
+            return CatalogDirectory(
+                inode, 2 + children, bool(directory["mutation_root"])
+            )
+        row = self._connection.execute(
+            """
+            SELECT assets.*, count(namespace_links.directory_inode) AS nlink
+              FROM assets JOIN namespace_links ON namespace_links.asset_id = assets.id
+             WHERE assets.inode = ?
+             GROUP BY assets.id
+            """,
+            (inode,),
+        ).fetchone()
+        return self._catalog_file(row) if row is not None else None
+
+    def lookup(self, parent_inode: int, name: str) -> CatalogNode | None:
+        parent = self.node(parent_inode)
+        if parent is None:
+            return None
+        if isinstance(parent, CatalogFile):
+            raise NotADirectoryError(parent_inode)
+        if name == ".":
+            return parent
+        if name == "..":
+            if parent_inode == ROOT_INODE:
+                return parent
+            row = self._connection.execute(
+                "SELECT parent_inode FROM namespace_directories WHERE inode = ? AND active = 1",
+                (parent_inode,),
+            ).fetchone()
+            return self.node(row["parent_inode"]) if row is not None else None
+        row = self._connection.execute(
+            """
+            SELECT inode FROM namespace_directories
+             WHERE parent_inode = ? AND name = ? AND active = 1
+            """,
+            (parent_inode, name),
+        ).fetchone()
+        if row is not None:
+            return self.node(row["inode"])
+        row = self._connection.execute(
+            """
+            SELECT assets.*, (
+                SELECT count(*) FROM namespace_links AS aliases
+                 WHERE aliases.asset_id = assets.id
+            ) AS nlink
+              FROM namespace_links AS child
+              JOIN assets ON assets.id = child.asset_id
+             WHERE child.directory_inode = ? AND assets.name = ?
+            """,
+            (parent_inode, name),
+        ).fetchone()
+        return self._catalog_file(row) if row is not None else None
+
+    def children(self, directory_inode: int) -> tuple[CatalogDirent, ...]:
+        parent = self.node(directory_inode)
+        if parent is None:
+            raise FileNotFoundError(directory_inode)
+        if isinstance(parent, CatalogFile):
+            raise NotADirectoryError(directory_inode)
+        result = [
+            CatalogDirent(row["name"], self.node(row["inode"]))
+            for row in self._connection.execute(
+                """
+                SELECT name, inode FROM namespace_directories
+                 WHERE parent_inode = ? AND active = 1
+                """,
+                (directory_inode,),
+            )
+        ]
+        result.extend(
+            CatalogDirent(row["name"], self._catalog_file(row))
+            for row in self._connection.execute(
+                """
+                SELECT assets.*, (
+                    SELECT count(*) FROM namespace_links AS aliases
+                     WHERE aliases.asset_id = assets.id
+                ) AS nlink
+                  FROM namespace_links AS child
+                  JOIN assets ON assets.id = child.asset_id
+                 WHERE child.directory_inode = ?
+                """,
+                (directory_inode,),
+            )
+        )
+        if any(entry.node is None for entry in result):
+            raise ValueError("catalog namespace contains an invalid child")
+        return tuple(sorted(result, key=lambda entry: entry.name))
+
+    def aliases(self, asset_id: str) -> tuple[PurePosixPath, ...]:
+        UUID(asset_id)
+        # ponytail: fixed Views nest at most four directories; raise this with a
+        # deliberately deeper View rather than letting corrupt cycles recurse.
+        rows = self._connection.execute(
+            """
+            WITH RECURSIVE directory_paths(parent_inode, path, asset_name, depth) AS (
+                SELECT directories.parent_inode, directories.name, assets.name, 1
+                  FROM namespace_links
+                  JOIN namespace_directories AS directories
+                    ON directories.inode = namespace_links.directory_inode
+                  JOIN assets ON assets.id = namespace_links.asset_id
+                 WHERE namespace_links.asset_id = ? AND directories.active = 1
+                UNION ALL
+                SELECT parent.parent_inode,
+                       parent.name || '/' || directory_paths.path,
+                       directory_paths.asset_name,
+                       directory_paths.depth + 1
+                  FROM namespace_directories AS parent
+                  JOIN directory_paths
+                    ON parent.inode = directory_paths.parent_inode
+                 WHERE parent.active = 1 AND directory_paths.depth < 4
+            )
+            SELECT path || '/' || asset_name AS path
+              FROM directory_paths
+             WHERE parent_inode = ?
+             ORDER BY path
+            """,
+            (asset_id, ROOT_INODE),
+        ).fetchall()
+        return tuple(PurePosixPath(row["path"]) for row in rows)
 
     def trusted_profile(self) -> TrustedProfile | None:
         rows = self._connection.execute("SELECT * FROM trusted_profile").fetchall()
@@ -497,6 +1136,7 @@ class Catalog:
                 expected.server_version,
                 expected.read_permissions,
             )
+            namespace_valid = self._namespace_is_valid()
             valid = (
                 len(quick_check) == 1
                 and len(quick_check[0]) == 1
@@ -506,11 +1146,188 @@ class Catalog:
                 and wrong_owner is None
                 and fingerprint_matches
                 and profile_matches
+                and namespace_valid
             )
         except Exception:
             raise ValueError(failure) from None
         if not valid:
             raise ValueError(failure) from None
+
+    def _namespace_is_valid(self) -> bool:
+        version = self._connection.execute(
+            "SELECT value FROM metadata WHERE key = 'namespace_format'"
+        ).fetchone()
+        if version is None or version[0] != _NAMESPACE_FORMAT:
+            return False
+        fixed = self._connection.execute(
+            """
+            SELECT identity, parent_inode, name, active, mutation_root
+              FROM namespace_directories
+             WHERE identity LIKE 'view:%'
+             ORDER BY identity
+            """
+        ).fetchall()
+        expected_fixed = sorted(
+            (identity, ROOT_INODE, name, 1, int(mutation_root))
+            for identity, name, mutation_root in _FIXED_DIRECTORIES
+        )
+        if [tuple(row) for row in fixed] != expected_fixed:
+            return False
+        if self._connection.execute(
+            """
+            SELECT 1 FROM namespace_links AS links
+              LEFT JOIN namespace_directories AS directories
+                ON directories.inode = links.directory_inode
+              LEFT JOIN assets ON assets.id = links.asset_id
+             WHERE directories.inode IS NULL OR directories.active != 1
+                OR assets.id IS NULL OR assets.size IS NULL OR assets.is_trashed != 0
+                OR assets.is_offline != 0 OR assets.visibility = 'hidden'
+                OR (directories.identity NOT IN ('view:all', 'view:favorites')
+                    AND directories.identity NOT LIKE 'date:%-%-%'
+                    AND directories.identity NOT LIKE 'album:%'
+                    AND directories.identity NOT LIKE 'person:%')
+             LIMIT 1
+            """
+        ).fetchone():
+            return False
+        if self._connection.execute(
+            """
+            SELECT 1 FROM namespace_memberships AS memberships
+              LEFT JOIN namespace_directories AS directories
+                ON directories.inode = memberships.directory_inode
+              LEFT JOIN assets ON assets.id = memberships.asset_id
+             WHERE directories.inode IS NULL OR directories.active != 1
+                OR directories.mutation_root != 0 OR assets.id IS NULL
+                OR (directories.identity NOT LIKE 'album:%'
+                    AND directories.identity NOT LIKE 'person:%')
+             LIMIT 1
+            """
+        ).fetchone():
+            return False
+        for row in self._connection.execute("SELECT * FROM assets"):
+            visible = (
+                row["size"] is not None
+                and row["is_trashed"] == 0
+                and row["is_offline"] == 0
+                and row["visibility"] != "hidden"
+            )
+            identities = {
+                item["identity"]
+                for item in self._connection.execute(
+                    """
+                    SELECT directories.identity
+                      FROM namespace_links AS links
+                     JOIN namespace_directories AS directories
+                        ON directories.inode = links.directory_inode
+                     WHERE links.asset_id = ?
+                    """,
+                    (row["id"],),
+                )
+            }
+            expected: set[str] = set()
+            if visible:
+                expected.add("view:all")
+                if row["is_favorite"] == 1:
+                    expected.add("view:favorites")
+                elif row["is_favorite"] != 0:
+                    return False
+                parts = self._date_parts(row["local_date"])
+                if parts is not None:
+                    expected.add(f"date:{'-'.join(parts)}")
+                expected.update(
+                    item["identity"]
+                    for item in self._connection.execute(
+                        """
+                        SELECT directories.identity
+                          FROM namespace_memberships AS memberships
+                          JOIN namespace_directories AS directories
+                            ON directories.inode = memberships.directory_inode
+                         WHERE memberships.asset_id = ?
+                        """,
+                        (row["id"],),
+                    )
+                )
+            if identities != expected:
+                return False
+        all_directories = self._connection.execute(
+            "SELECT * FROM namespace_directories"
+        ).fetchall()
+        if any(
+            not row["identity"].startswith(
+                ("view:", "date:", "album:", "person:")
+            )
+            for row in all_directories
+        ):
+            return False
+        by_identity = {row["identity"]: row for row in all_directories}
+        for kind, parent_identity in (
+            ("album", "view:albums"),
+            ("person", "view:people"),
+        ):
+            parent = by_identity[parent_identity]
+            for row in all_directories:
+                prefix = f"{kind}:"
+                if not row["identity"].startswith(prefix):
+                    continue
+                stable_id = row["identity"].removeprefix(prefix)
+                try:
+                    canonical_id = str(UUID(stable_id))
+                except (TypeError, ValueError):
+                    return False
+                if (
+                    stable_id != canonical_id
+                    or row["parent_inode"] != parent["inode"]
+                    or type(row["active"]) is not int
+                    or row["active"] not in {0, 1}
+                    or row["mutation_root"] != 0
+                    or not isinstance(row["name"], str)
+                    or safe_filename(row["name"], stable_id) != row["name"]
+                ):
+                    return False
+        date_rows = [
+            row for row in all_directories if row["identity"].startswith("date:")
+        ]
+        for row in date_rows:
+            parts = row["identity"].removeprefix("date:").split("-")
+            if len(parts) not in {1, 2, 3}:
+                return False
+            try:
+                year = int(parts[0])
+                month = int(parts[1]) if len(parts) >= 2 else 1
+                day = int(parts[2]) if len(parts) == 3 else 1
+                date(year, month, day)
+            except (TypeError, ValueError):
+                return False
+            if any(
+                len(part) != width or not part.isascii() or not part.isdigit()
+                for part, width in zip(parts, (4, 2, 2)[: len(parts)], strict=True)
+            ):
+                return False
+            parent_identity = (
+                "view:date"
+                if len(parts) == 1
+                else f"date:{'-'.join(parts[:-1])}"
+            )
+            parent = by_identity.get(parent_identity)
+            if (
+                parent is None
+                or row["parent_inode"] != parent["inode"]
+                or row["name"] != parts[-1]
+                or row["mutation_root"] != 0
+            ):
+                return False
+            has_live_child = self._connection.execute(
+                "SELECT 1 FROM namespace_directories WHERE parent_inode = ? AND active = 1 LIMIT 1",
+                (row["inode"],),
+            ).fetchone()
+            has_link = self._connection.execute(
+                "SELECT 1 FROM namespace_links WHERE directory_inode = ? LIMIT 1",
+                (row["inode"],),
+            ).fetchone()
+            should_be_active = has_live_child is not None or has_link is not None
+            if bool(row["active"]) != should_be_active:
+                return False
+        return True
 
     def refresh_state(self) -> tuple[int, int]:
         values = {
@@ -575,10 +1392,6 @@ class Catalog:
         ).fetchone()
         return self._catalog_asset(row) if row else None
 
-    def by_name(self, name: str) -> CatalogAsset | None:
-        row = self._connection.execute("SELECT * FROM assets WHERE name = ?", (name,)).fetchone()
-        return self._catalog_asset(row) if row else None
-
     def add_uploaded(self, asset: Asset, requested_name: str) -> CatalogAsset:
         with self._connection:
             row = self._connection.execute(
@@ -600,7 +1413,26 @@ class Catalog:
                 name = _available_name(requested_name, asset.id, used_names)
             self._connection.execute(
                 """
-                INSERT OR REPLACE INTO assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO assets (
+                    id, inode, name, owner_id, original_name, mime_type, size,
+                    created_ns, modified_ns, updated_at, checksum, visibility,
+                    is_trashed, is_offline, library_id, local_date, is_favorite
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    owner_id = excluded.owner_id,
+                    original_name = excluded.original_name,
+                    mime_type = excluded.mime_type,
+                    size = excluded.size,
+                    created_ns = excluded.created_ns,
+                    modified_ns = excluded.modified_ns,
+                    updated_at = excluded.updated_at,
+                    checksum = excluded.checksum,
+                    visibility = excluded.visibility,
+                    is_trashed = excluded.is_trashed,
+                    is_offline = excluded.is_offline,
+                    library_id = excluded.library_id,
+                    local_date = excluded.local_date,
+                    is_favorite = excluded.is_favorite
                 """,
                 (
                     asset.id,
@@ -618,8 +1450,12 @@ class Catalog:
                     asset.is_trashed,
                     asset.is_offline,
                     asset.library_id,
+                    asset.local_date,
+                    int(asset.is_favorite),
                 ),
             )
+            self._project_asset(asset.id)
+            self._refresh_date_activity()
             inserted = self._connection.execute(
                 "SELECT * FROM assets WHERE id = ?", (asset.id,)
             ).fetchone()
@@ -633,6 +1469,8 @@ class Catalog:
             )
             if updated.rowcount != 1:
                 raise KeyError(asset_id)
+            self._project_asset(asset_id)
+            self._refresh_date_activity()
 
     def mark_restored(self, asset_id: str) -> None:
         with self._connection:
@@ -641,6 +1479,8 @@ class Catalog:
             )
             if updated.rowcount != 1:
                 raise KeyError(asset_id)
+            self._project_asset(asset_id)
+            self._refresh_date_activity()
 
     @staticmethod
     def _catalog_asset(row: sqlite3.Row) -> CatalogAsset:
@@ -658,5 +1498,12 @@ class Catalog:
             is_trashed=bool(row["is_trashed"]),
             is_offline=bool(row["is_offline"]),
             library_id=row["library_id"],
+            local_date=row["local_date"],
+            is_favorite=bool(row["is_favorite"]),
         )
         return CatalogAsset(asset, row["inode"], row["name"])
+
+    @classmethod
+    def _catalog_file(cls, row: sqlite3.Row) -> CatalogFile:
+        entry = cls._catalog_asset(row)
+        return CatalogFile(entry.asset, entry.inode, entry.name, int(row["nlink"]))

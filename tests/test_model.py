@@ -1,9 +1,12 @@
 import signal
 import unittest
+from dataclasses import FrozenInstanceError
 from uuid import UUID
 
 from immich_on_demand.model import (
+    Album,
     Asset,
+    Person,
     collision_name,
     safe_filename,
     timestamp_nanoseconds,
@@ -12,6 +15,7 @@ from immich_on_demand.model import (
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
+OTHER_ID = "22345678-1234-4234-8234-123456789abc"
 
 
 def api_asset() -> dict[str, object]:
@@ -27,6 +31,8 @@ def api_asset() -> dict[str, object]:
         "visibility": "timeline",
         "isTrashed": False,
         "isOffline": False,
+        "isFavorite": True,
+        "localDateTime": "2026-08-25T23:59:58.123",
         "libraryId": None,
         "exifInfo": {"fileSizeInByte": 123},
     }
@@ -37,6 +43,23 @@ def raise_timeout(*_: object) -> None:
 
 
 class ModelTest(unittest.TestCase):
+    def test_album_and_person_are_immutable_value_records(self) -> None:
+        album = Album(ASSET_ID, "Holiday", "2026-08-25T12:00:00Z", 3)
+        person = Person(OWNER_ID, "Filip", False, None)
+
+        self.assertEqual(
+            (album.id, album.name, album.updated_at, album.asset_count),
+            (ASSET_ID, "Holiday", "2026-08-25T12:00:00Z", 3),
+        )
+        self.assertEqual(
+            (person.id, person.name, person.is_hidden, person.updated_at),
+            (OWNER_ID, "Filip", False, None),
+        )
+        self.assertFalse(hasattr(album, "__dict__"))
+        self.assertFalse(hasattr(person, "__dict__"))
+        with self.assertRaises(FrozenInstanceError):
+            album.name = "Changed"  # type: ignore[misc]
+
     def test_timestamp_conversion_preserves_exact_milliseconds(self) -> None:
         self.assertEqual(
             timestamp_nanoseconds("2026-08-25T12:00:00.123Z"),
@@ -102,7 +125,88 @@ class ModelTest(unittest.TestCase):
 
         self.assertEqual(UUID(asset.id), UUID(ASSET_ID))
         self.assertEqual(asset.size, 123)
+        self.assertEqual(asset.local_date, "2026-08-25")
+        self.assertTrue(asset.is_favorite)
+        self.assertEqual(asset.person_ids, ())
         self.assertTrue(asset.visible)
+
+    def test_parses_sorted_unique_person_ids_when_people_are_present(self) -> None:
+        value = api_asset()
+        value["people"] = [
+            {"id": OTHER_ID},
+            {"id": ASSET_ID},
+            {"id": OTHER_ID},
+        ]
+
+        self.assertEqual(Asset.from_api(value).person_ids, (ASSET_ID, OTHER_ID))
+
+    def test_rejects_malformed_or_noncanonical_asset_people(self) -> None:
+        cases: tuple[object, ...] = (
+            None,
+            {},
+            ["not-an-object"],
+            [{}],
+            [{"id": True}],
+            [{"id": "not-a-uuid"}],
+            [{"id": ASSET_ID.upper()}],
+        )
+        for people in cases:
+            with self.subTest(people=people):
+                value = api_asset()
+                value["people"] = people
+                with self.assertRaises(ValueError):
+                    Asset.from_api(value)
+
+    def test_requires_exact_favorite_and_local_datetime_fields(self) -> None:
+        cases = (
+            ("isFavorite", None),
+            ("isFavorite", 0),
+            ("isFavorite", "true"),
+            ("localDateTime", None),
+            ("localDateTime", 123),
+        )
+        for field, malformed in cases:
+            with self.subTest(field=field, malformed=malformed):
+                value = api_asset()
+                if malformed is None:
+                    del value[field]
+                else:
+                    value[field] = malformed
+                with self.assertRaises(ValueError):
+                    Asset.from_api(value)
+
+    def test_rejects_malformed_local_datetime(self) -> None:
+        for malformed in (
+            "not-a-timestamp",
+            "2026-02-30T12:00:00",
+            "2026-08-25",
+        ):
+            with self.subTest(local_date_time=malformed):
+                value = api_asset()
+                value["localDateTime"] = malformed
+                with self.assertRaises(ValueError):
+                    Asset.from_api(value)
+
+    def test_hand_built_asset_defaults_view_metadata_to_unknown_and_false(self) -> None:
+        value = Asset(
+            ASSET_ID,
+            OWNER_ID,
+            "photo.jpg",
+            "image/jpeg",
+            123,
+            1,
+            2,
+            "2026-08-25T12:00:00Z",
+            "abc=",
+            "timeline",
+            False,
+            False,
+            None,
+        )
+
+        self.assertIsNone(value.local_date)
+        self.assertFalse(value.is_favorite)
+        self.assertEqual(value.person_ids, ())
 
     def test_rejects_malformed_asset_fields_without_coercion(self) -> None:
         cases = (
@@ -160,6 +264,8 @@ class ModelTest(unittest.TestCase):
             "visibility": "timeline",
             "isTrashed": False,
             "isOffline": False,
+            "isFavorite": False,
+            "localDateTime": "2026-08-25T10:00:00",
             "libraryId": None,
             "exifInfo": None,
         }

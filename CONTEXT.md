@@ -9,19 +9,31 @@ The initial supported environment: Arch Linux, Niri, Nautilus 50, FUSE 3, and Im
 _Avoid_: Target system, every Linux desktop
 
 **1.0 release**:
-The first complete personal release for the Reference system, available for others to install. It previews common media, downloads originals on demand, and uploads new files created in the Flat library.
+The first complete personal release for the Reference system, available for others to install. It previews common media, downloads originals on demand, and uploads new files created in the mounted Library.
 _Avoid_: MVP, prototype, read-only release
 
 **Flat library**:
 The single mounted directory containing one entry for every visible Immich asset. Version 1.0 has no album, person, favorite, or date-based views.
 _Avoid_: Timeline, virtual views
 
+**Library root**:
+The mounted top directory that contains the Flat library in version 1.0 and the top-level Views from version 1.3.
+_Avoid_: Library, mountpoint
+
 **View**:
 A directory hierarchy that presents a selected set of assets. When one asset appears in several Views, every entry refers to the same file identity and original bytes.
 _Avoid_: Copy, duplicate library
 
+**All View**:
+The View that contains one entry for every visible asset. It is the only View that accepts Upload or Remote deletion through filesystem operations.
+_Avoid_: Flat library, Inbox
+
+**View alias**:
+One mounted path to an asset inside a View. Every View alias for an asset shares its inode, Hydration, Pin, Preview source, and mutation identity.
+_Avoid_: Copy, duplicate asset
+
 **Library name**:
-The stable filename assigned to one asset in the Flat library. The first deterministic occurrence keeps its sanitized original filename; a collision adds the complete asset ID before the extension.
+The stable filename assigned to one asset and reused by every View alias. The first deterministic occurrence keeps its sanitized original filename. A collision adds the complete asset ID before the extension.
 _Avoid_: Original filename, server path
 
 **Hydration**:
@@ -33,11 +45,11 @@ Removing a hydrated original from the local cache while preserving its Library e
 _Avoid_: Delete, trash
 
 **Upload**:
-Creating a new Immich asset from a new file written to the Flat library. Upload never replaces an existing asset.
+Creating a new Immich asset from a new file written to the version 1.0 Flat library or the version 1.3 All View. Upload never replaces an existing asset.
 _Avoid_: Update, overwrite, synchronization
 
 **Pending upload**:
-A complete private local file whose close finished but whose Immich creation has not been confirmed. It stays outside the Flat library until a retry succeeds. The user can retry it idempotently or explicitly cancel its local bytes.
+A complete private local file whose close finished but whose Immich creation has not been confirmed. It stays outside the mounted namespace until a retry succeeds. The user can retry it idempotently or explicitly cancel its local bytes.
 _Avoid_: Staged file, cached original, upload recovery
 
 **Upload recovery**:

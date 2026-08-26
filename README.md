@@ -1,20 +1,33 @@
 # Immich On-Demand
 
-Immich On-Demand mounts one user's Immich library as a flat Linux directory. Directory listings use a local metadata catalog. Nautilus uses Immich-generated previews, and an application downloads an original only when it reads the file.
+Immich On-Demand mounts one user's Immich library as a Linux filesystem. Directory listings use a local metadata catalog. Nautilus uses Immich-generated previews, and an application downloads an original only when it reads the file.
 
-Released version 1.0 targets Arch Linux, Niri, Nautilus 50, FUSE 3, and Immich 3.0.3. The current source tree is version 1.2.0.dev0 and contains unaccepted post-1.0 work. Other systems are not tested.
+Released version 1.0 exposes a flat directory and targets Arch Linux, Niri, Nautilus 50, FUSE 3, and Immich 3.0.3. The current source tree is version 1.3.0.dev0. It implements rich Views, but read-only acceptance on the Reference system remains pending. Other systems are not tested.
 
 ## Filesystem contract
 
-The mount contains one file for each visible asset. The first asset with a given safe basename keeps that name. Later collisions include the complete asset UUID before the extension.
+The released 1.0 mount contains one file for each visible asset. The first asset with a given safe basename keeps that name. Later collisions include the complete asset UUID before the extension.
+
+The 1.3 development mount has this root namespace:
+
+```text
+/
+├── All/
+├── Albums/<album>/
+├── People/<person>/
+├── by Date/YYYY/MM/DD/
+└── Favorites/
+```
+
+`All` contains every visible asset. An asset can also appear in several Albums, People, one date directory, and Favorites. Every alias has the same inode and reports the number of visible aliases as its hardlink count. Aliases share original-byte cache, Pin, and mutation state.
 
 Existing assets are immutable. Applications can list, read, and copy them through ordinary read-only opens. A read-only remote open with `O_NOATIME` returns `EOPNOTSUPP` before it can download the original. Applications cannot overwrite, truncate, rename, link, or change their metadata.
 
-Creating a new file stages private local bytes. Flush and `fsync` make those bytes locally durable but do not contact Immich. The last close seals a Pending upload and removes its temporary name from the mount. One service-owned worker uploads it, verifies the returned asset, publishes the Library entry, and then removes the private copy. Temporary outages retry with bounded backoff; blocked jobs remain available for explicit Retry or confirmed Cancel. FUSE cannot report upload completion from release, so a successful close means only that the local Pending copy is durable.
+Released 1.0 accepts create and unlink at the mount root. Development 1.3 accepts them only in `All`; every other View is read-only. Creating a new file stages private local bytes. Flush and `fsync` make those bytes locally durable but do not contact Immich. The last close seals a Pending upload and removes its temporary name from the mount. One service-owned worker uploads it, verifies the returned asset, publishes the Library entry, and then removes the private copy. Temporary outages retry with bounded backoff; blocked jobs remain available for explicit Retry or confirmed Cancel. FUSE cannot report upload completion from release, so a successful close means only that the local Pending copy is durable.
 
 By default, unlink is disabled. If you enable remote deletion, unlink moves an owned asset to Immich trash. The client refuses deletion when the server has disabled trash, and it never requests permanent deletion. Cache eviction is a separate local operation and never changes Immich.
 
-Previews are supported for JPEG, PNG, GIF, MP4, MOV, and M4V assets. The missing-preview queue follows the sort saved for this folder by Nautilus and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Other previews, albums, people, favorites, date views, and hardlinks between views are future work.
+Previews are supported for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Development 1.3 installs a Preview for every alias but groups work by asset, so all aliases use at most one server Preview fetch. Its missing-preview queue follows the Nautilus sort saved for `All` and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Other Preview formats remain future work.
 
 ## Build and install the Arch package
 
@@ -31,12 +44,16 @@ makepkg -si
 
 ## Store API keys in Secret Service
 
-Create a read-only API key in Immich with exactly these permissions:
+For the current 1.3 development tree, create a read-only API key in Immich with exactly these permissions:
 
 - `user.read`
 - `asset.read`
 - `asset.view`
 - `asset.download`
+- `album.read`
+- `person.read`
+
+Released 1.0 requires only the first four core permissions.
 
 Store the key under the canonical server origin. The following command reads the value without echoing it or placing it in shell history:
 
@@ -48,7 +65,7 @@ printf '%s' "$IMMICH_KEY" | secret-tool store \
 unset IMMICH_KEY
 ```
 
-To upload files, create a separate mutation key with these five permissions:
+To upload files, create a separate mutation key with exactly these five permissions:
 
 - `user.read`
 - `asset.read`
@@ -59,6 +76,8 @@ To upload files, create a separate mutation key with these five permissions:
 If you enable remote deletion, also grant the mutation key:
 
 - `asset.delete`
+
+Do not grant `album.read` or `person.read` to the mutation key. Album and People access belongs only to the read-only key.
 
 Store it with the `mutation` purpose:
 
@@ -95,9 +114,13 @@ The released 1.0 service requires Immich to be online at startup. If Immich beco
 
 The development tree can start from trusted cached state after one successful online run. If Immich is unreachable, it mounts a safe, nonempty catalog in degraded mode. Cached originals remain readable, but uncached reads, Preview downloads, automatic Eviction, and every remote mutation stay disabled. The service retries validation and a stable full refresh in the background before it resumes network access. TLS, authentication, schema, identity, version, scope, and local trust failures still prevent the mount.
 
-In the development tree, routine background refreshes request only assets updated within an overlapping time window. These refreshes never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete sweeps before removing rows.
+Trusted Profile format v1 remains valid for offline startup after namespace migration. The service writes format v2 only after an online refresh validates and publishes both Album and People relations with the rich six-scope read key.
 
-The incremental refresh implementation has automated coverage and a read-only Immich 3.0.3 server check. The updated service has not completed its package and lifecycle checks on the target Arch system.
+In the development tree, routine background refreshes request only assets updated within an overlapping time window. These refreshes never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete asset sweeps before removing rows.
+
+Album and People relations refresh as one pair after a complete asset sweep. The catalog publishes the pair only after both server inventories validate. Incremental asset refreshes update View aliases from current asset facts but never infer Album or People relation removal.
+
+The 1.3 implementation has automated coverage. Read-only acceptance of its rich Views and package lifecycle on the Reference system remains pending.
 
 To enable remote deletion, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.delete`. The service fails closed if either key has unexpected permissions.
 
@@ -192,7 +215,7 @@ The GUI Restore control accepts one asset UUID. The UUID is transient and is not
 
 Inside the configured mount, Nautilus adds folder actions for Refresh, Settings, and Manage Pending Uploads. A one-file selection can Pin, Unpin, retry a failed pinned download, or Evict its local copy. Emblems report cached, pinned, and busy state. The extension returns no actions or emblems outside the configured mount.
 
-The released version 1.0 Arch recipe does not install this desktop entry, the Nautilus loader, or the emblem icons. The following development-package checks remain open on the target system:
+The released version 1.0 Arch recipe does not install this desktop entry, the Nautilus loader, or the emblem icons. The following development-package checks remain open on the Reference system:
 
 - Build, install, upgrade, restart, and uninstall a package that contains the desktop files.
 - Load the extension in Nautilus 50 and verify mount scoping, menus, emblem changes, and failure behavior.
@@ -236,9 +259,7 @@ scripts/check
 
 Version 1.0 is available on GitHub. The package has not been published to the AUR.
 
-Albums, people, dates, and other views are also deferred. A future version may expose paths such as `{Albums,People,All,by Date}/asset.ext` and hardlink repeated views of the same asset.
-
-The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, trusted offline startup, desktop controls, and queued uploads. It also tracks AUR publication, rich Views, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
+The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, trusted offline startup, desktop controls, queued uploads, and rich Views. It also tracks AUR publication, broader Preview formats, Asset replacement, partial Hydration, multiple Profiles, and more platforms.
 
 ## License
 

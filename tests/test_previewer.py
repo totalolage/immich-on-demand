@@ -1,7 +1,7 @@
 from functools import partial
 from inspect import signature
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 from threading import Event
 import unittest
@@ -59,6 +59,24 @@ def preview_bytes() -> bytes:
     return output.getvalue()
 
 
+class PreviewCatalog:
+    def __init__(
+        self,
+        entries: list[CatalogAsset],
+        aliases: dict[str, tuple[PurePosixPath, ...]] | None = None,
+    ) -> None:
+        self._entries = entries
+        self._aliases = aliases or {
+            item.asset.id: (PurePosixPath(item.name),) for item in entries
+        }
+
+    def list_visible(self) -> list[CatalogAsset]:
+        return self._entries
+
+    def aliases(self, asset_id: str) -> tuple[PurePosixPath, ...]:
+        return self._aliases[asset_id]
+
+
 class PreviewerTest(unittest.TestCase):
     def test_reads_nautilus_sort_metadata_as_strings(self) -> None:
         info = Mock()
@@ -78,6 +96,93 @@ class PreviewerTest(unittest.TestCase):
     def test_preview_size_is_fixed_by_the_previewer(self) -> None:
         self.assertNotIn("size", signature(populate_previews).parameters)
 
+    def test_fetches_once_and_installs_for_every_catalog_alias(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                item = entry(1)
+                aliases = (
+                    PurePosixPath("All") / item.name,
+                    PurePosixPath("Albums", "Summer") / item.name,
+                    PurePosixPath("Favorites") / item.name,
+                )
+                catalog = PreviewCatalog([item], {item.asset.id: aliases})
+                fetched: list[str] = []
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        fetched.append(asset_id)
+                        return preview_bytes(), "image/jpeg"
+
+                with patch(
+                    "immich_on_demand.previewer._read_nautilus_sort",
+                    return_value=None,
+                ) as read_sort:
+                    stats = await populate_previews(
+                        catalog,  # type: ignore[arg-type]
+                        Client(),  # type: ignore[arg-type]
+                        root / "mount",
+                        cache_home=root / "cache",
+                        concurrency=1,
+                    )
+
+                self.assertEqual(fetched, [item.asset.id])
+                self.assertEqual(stats, PreviewStats(1, 1, 0, 0))
+                read_sort.assert_called_with(root / "mount" / "All")
+                for alias in aliases:
+                    source = root / "mount" / alias
+                    self.assertTrue(thumbnail_cache_path(source, root / "cache").exists())
+                    self.assertTrue(failed_thumbnail_path(source, root / "cache").exists())
+
+        trio.run(scenario)
+
+    def test_offline_reconciles_every_alias_without_sort_or_network(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                item = entry(1)
+                aliases = (
+                    PurePosixPath("All") / item.name,
+                    PurePosixPath("Favorites") / item.name,
+                )
+                catalog = PreviewCatalog([item], {item.asset.id: aliases})
+                stale_source = root / "mount" / aliases[1]
+                stale = install_thumbnail(
+                    preview_bytes(),
+                    stale_source,
+                    3,
+                    124,
+                    cache_home=root / "cache",
+                    size="xx-large",
+                )
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        raise AssertionError("offline preview fetched")
+
+                with patch(
+                    "immich_on_demand.previewer._read_nautilus_sort",
+                    side_effect=AssertionError("offline preview read Nautilus sort"),
+                ):
+                    stats = await populate_previews(
+                        catalog,  # type: ignore[arg-type]
+                        Client(),  # type: ignore[arg-type]
+                        root / "mount",
+                        cache_home=root / "cache",
+                        downloads_enabled=False,
+                    )
+
+                self.assertEqual(stats, PreviewStats(1, 0, 1, 0))
+                self.assertFalse(stale.exists())
+                for alias in aliases:
+                    self.assertTrue(
+                        failed_thumbnail_path(
+                            root / "mount" / alias, root / "cache"
+                        ).exists()
+                    )
+
+        trio.run(scenario)
+
     def test_signals_ready_after_suppression_and_before_fetch_completion(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
@@ -92,7 +197,7 @@ class PreviewerTest(unittest.TestCase):
                     await nursery.start(
                         partial(
                             populate_previews,
-                            [item],
+                            PreviewCatalog([item]),  # type: ignore[arg-type]
                             Client(),  # type: ignore[arg-type]
                             root / "mount",
                             cache_home=root / "cache",
@@ -145,7 +250,7 @@ class PreviewerTest(unittest.TestCase):
                     ),
                 ):
                     stats = await populate_previews(
-                        entries,
+                        PreviewCatalog(entries),  # type: ignore[arg-type]
                         Client(),  # type: ignore[arg-type]
                         root / "mount",
                         cache_home=root / "cache",
@@ -186,7 +291,10 @@ class PreviewerTest(unittest.TestCase):
 
                 client = Client()
                 stats = await populate_previews(
-                    entries, client, root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
+                    PreviewCatalog(entries),  # type: ignore[arg-type]
+                    client,  # type: ignore[arg-type]
+                    root / "mount",
+                    cache_home=root / "cache",
                 )
 
                 self.assertEqual(client.calls, 1)
@@ -228,7 +336,7 @@ class PreviewerTest(unittest.TestCase):
                         await nursery.start(
                             partial(
                                 populate_previews,
-                                entries,
+                                PreviewCatalog(entries),  # type: ignore[arg-type]
                                 Client(),  # type: ignore[arg-type]
                                 root / "mount",
                                 cache_home=root / "cache",
@@ -266,7 +374,7 @@ class PreviewerTest(unittest.TestCase):
                     return_value=("name", False),
                 ):
                     await populate_previews(
-                        entries,
+                        PreviewCatalog(entries),  # type: ignore[arg-type]
                         Client(),  # type: ignore[arg-type]
                         root / "mount",
                         cache_home=root / "cache",
@@ -302,7 +410,7 @@ class PreviewerTest(unittest.TestCase):
                     patch("immich_on_demand.previewer.SORT_POLL_SECONDS", 0),
                 ):
                     await populate_previews(
-                        entries,
+                        PreviewCatalog(entries),  # type: ignore[arg-type]
                         Client(),  # type: ignore[arg-type]
                         root / "mount",
                         cache_home=root / "cache",
@@ -341,7 +449,10 @@ class PreviewerTest(unittest.TestCase):
                         raise AssertionError("unsupported asset fetched")
 
                 stats = await populate_previews(
-                    [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
+                    PreviewCatalog([item]),  # type: ignore[arg-type]
+                    Client(),  # type: ignore[arg-type]
+                    root / "mount",
+                    cache_home=root / "cache",
                 )
                 self.assertEqual(stats, PreviewStats(1, 0, 0, 1))
                 self.assertFalse(competing.exists())
@@ -374,7 +485,10 @@ class PreviewerTest(unittest.TestCase):
 
                 self_outer = self
                 stats = await populate_previews(
-                    [item], Client(), root / "mount", cache_home=root / "cache"  # type: ignore[arg-type]
+                    PreviewCatalog([item]),  # type: ignore[arg-type]
+                    Client(),  # type: ignore[arg-type]
+                    root / "mount",
+                    cache_home=root / "cache",
                 )
                 success = thumbnail_cache_path(source, root / "cache")
                 self.assertEqual(stats.installed, 1)
@@ -419,7 +533,7 @@ class PreviewerTest(unittest.TestCase):
                     side_effect=AssertionError("current preview rewrote failure cache"),
                 ):
                     stats = await populate_previews(
-                        [item],
+                        PreviewCatalog([item]),  # type: ignore[arg-type]
                         Client(),  # type: ignore[arg-type]
                         root / "mount",
                         cache_home=root / "cache",
@@ -457,7 +571,7 @@ class PreviewerTest(unittest.TestCase):
                     await nursery.start(
                         partial(
                             populate_previews,
-                            [item],
+                            PreviewCatalog([item]),  # type: ignore[arg-type]
                             Client(),  # type: ignore[arg-type]
                             root / "mount",
                             cache_home=root / "cache",
@@ -492,7 +606,7 @@ class PreviewerTest(unittest.TestCase):
 
                 client = Client()
                 stats = await populate_previews(
-                    entries,
+                    PreviewCatalog(entries),  # type: ignore[arg-type]
                     client,  # type: ignore[arg-type]
                     root / "mount",
                     cache_home=root / "cache",

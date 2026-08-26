@@ -12,7 +12,7 @@ import time
 import pyfuse3
 import trio
 
-from .catalog import CatalogAsset
+from .catalog import Catalog, CatalogAsset, CatalogDirectory, CatalogFile
 from .library import Library, LibraryError
 from .model import safe_filename
 from .uploads import UploadErrorCode, UploadQueue, WritableUpload
@@ -25,6 +25,7 @@ _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 @dataclass(slots=True)
 class _StagedFile:
     inode: int
+    parent_inode: int
     name: str
     draft: WritableUpload
     open_handles: int = 1
@@ -53,11 +54,12 @@ PendingCallback = Callable[[], None]
 
 
 class ImmichFilesystem(pyfuse3.Operations):
-    """Flat pyfuse3 adapter over a Library."""
+    """pyfuse3 adapter over the catalog namespace and Library content."""
 
     def __init__(
         self,
         library: Library,
+        catalog: Catalog,
         upload_queue: UploadQueue,
         server_origin: str,
         owner_id: str,
@@ -66,6 +68,7 @@ class ImmichFilesystem(pyfuse3.Operations):
     ) -> None:
         super().__init__()
         self.library = library
+        self.catalog = catalog
         self.upload_queue = upload_queue
         self.server_origin = server_origin
         self.owner_id = owner_id
@@ -114,15 +117,26 @@ class ImmichFilesystem(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EINVAL)
         return name
 
-    def _remote(self, identity: str | int) -> CatalogAsset:
-        entry = self.library.lookup(identity)
-        if entry is None or not entry.asset.visible:
+    def _node(self, inode: int) -> CatalogDirectory | CatalogFile:
+        try:
+            node = self.catalog.node(inode)
+        except Exception as error:
+            raise pyfuse3.FUSEError(errno.EIO) from error
+        if node is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        return entry
+        return node
+
+    def _remote(self, inode: int) -> CatalogFile:
+        node = self._node(inode)
+        if isinstance(node, CatalogDirectory):
+            raise pyfuse3.FUSEError(errno.EISDIR)
+        return node
+
+    @staticmethod
+    def _library_entry(node: CatalogFile) -> CatalogAsset:
+        return CatalogAsset(node.asset, node.inode, node.name)
 
     def _attributes(self, inode: int) -> pyfuse3.EntryAttributes:
-        if inode == pyfuse3.ROOT_INODE:
-            return self._stat(inode, stat.S_IFDIR | 0o700, 0, self._started_ns, self._started_ns, 2)
         staged = self._staged_inodes.get(inode)
         if staged is not None:
             if staged.closed:
@@ -136,15 +150,29 @@ class ImmichFilesystem(pyfuse3.Operations):
                 value.st_ctime_ns,
                 1,
             )
-        entry = self._remote(inode)
-        assert entry.asset.size is not None
+        return self._node_attributes(self._node(inode))
+
+    def _node_attributes(
+        self, node: CatalogDirectory | CatalogFile
+    ) -> pyfuse3.EntryAttributes:
+        if isinstance(node, CatalogDirectory):
+            permissions = 0o700 if node.mutation_root else 0o500
+            return self._stat(
+                node.inode,
+                stat.S_IFDIR | permissions,
+                0,
+                self._started_ns,
+                self._started_ns,
+                node.nlink,
+            )
+        assert node.asset.size is not None
         return self._stat(
-            entry.inode,
+            node.inode,
             stat.S_IFREG | 0o400,
-            entry.asset.size,
-            entry.asset.modified_ns,
-            entry.asset.created_ns,
-            1,
+            node.asset.size,
+            node.asset.modified_ns,
+            node.asset.created_ns,
+            node.nlink,
         )
 
     @staticmethod
@@ -176,27 +204,41 @@ class ImmichFilesystem(pyfuse3.Operations):
     async def lookup(
         self, parent_inode: int, name: bytes, ctx: pyfuse3.RequestContext
     ) -> pyfuse3.EntryAttributes:
-        if parent_inode != pyfuse3.ROOT_INODE:
+        parent = self._node(parent_inode)
+        if isinstance(parent, CatalogFile):
             raise pyfuse3.FUSEError(errno.ENOTDIR)
-        if name in {b".", b".."}:
-            return self._attributes(pyfuse3.ROOT_INODE)
-        decoded = self._name(name)
-        staged = self._staged_names.get(decoded)
-        return self._attributes(staged.inode if staged is not None else self._remote(decoded).inode)
+        decoded = name.decode("ascii") if name in {b".", b".."} else self._name(name)
+        staged = self._staged_names.get(decoded) if parent.mutation_root else None
+        if staged is not None:
+            return self._attributes(staged.inode)
+        try:
+            node = self.catalog.lookup(parent_inode, decoded)
+        except Exception as error:
+            raise pyfuse3.FUSEError(errno.EIO) from error
+        if node is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        return self._node_attributes(node)
 
     async def opendir(self, inode: int, ctx: pyfuse3.RequestContext) -> int:
-        if inode != pyfuse3.ROOT_INODE:
-            self._remote(inode)
+        node = self._node(inode)
+        if isinstance(node, CatalogFile):
             raise pyfuse3.FUSEError(errno.ENOTDIR)
-        staged_names = set(self._staged_names)
-        entries = [(item.name, item.inode) for item in self._staged_names.values()]
-        entries.extend(
-            (entry.name, entry.inode) for entry in self.library.list() if entry.name not in staged_names
-        )
+        try:
+            children = self.catalog.children(inode)
+        except Exception as error:
+            raise pyfuse3.FUSEError(errno.EIO) from error
+        entries = [
+            (entry.name.encode("utf-8"), self._node_attributes(entry.node))
+            for entry in children
+        ]
+        if node.mutation_root:
+            entries.extend(
+                (staged.name.encode("utf-8"), self._attributes(staged.inode))
+                for staged in self._staged_names.values()
+            )
         handle = self._handle()
         self._directories[handle] = tuple(
-            (name.encode("utf-8"), self._attributes(entry_inode))
-            for name, entry_inode in sorted(entries)
+            sorted(entries, key=lambda entry: entry[0])
         )
         return handle
 
@@ -221,7 +263,7 @@ class ImmichFilesystem(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EISDIR)
         staged = self._staged_inodes.get(inode)
         if staged is None:
-            entry = self._remote(inode)
+            entry = self._library_entry(self._remote(inode))
             return self._open_remote(entry, flags)
 
         readable, writable = self._access(flags)
@@ -313,7 +355,7 @@ class ImmichFilesystem(pyfuse3.Operations):
         try:
             await trio.to_thread.run_sync(
                 pyfuse3.invalidate_entry,
-                pyfuse3.ROOT_INODE,
+                staged.parent_inode,
                 staged.name.encode("utf-8"),
                 staged.inode,
             )
@@ -338,9 +380,11 @@ class ImmichFilesystem(pyfuse3.Operations):
         flags: int,
         ctx: pyfuse3.RequestContext,
     ) -> tuple[pyfuse3.FileInfo, pyfuse3.EntryAttributes]:
-        if parent_inode != pyfuse3.ROOT_INODE:
-            self._remote(parent_inode)
+        parent = self._node(parent_inode)
+        if isinstance(parent, CatalogFile):
             raise pyfuse3.FUSEError(errno.ENOTDIR)
+        if not parent.mutation_root:
+            raise pyfuse3.FUSEError(errno.EROFS)
         if not self.library.mutation_enabled:
             raise pyfuse3.FUSEError(errno.EROFS)
         decoded = self._name(name)
@@ -351,11 +395,11 @@ class ImmichFilesystem(pyfuse3.Operations):
             )
         except Exception as error:
             raise pyfuse3.FUSEError(errno.EIO) from error
-        if (
-            decoded in self._staged_names
-            or queued_name
-            or self.library.lookup(decoded) is not None
-        ):
+        try:
+            existing = self.catalog.lookup(parent_inode, decoded)
+        except Exception as error:
+            raise pyfuse3.FUSEError(errno.EIO) from error
+        if decoded in self._staged_names or queued_name or existing is not None:
             raise pyfuse3.FUSEError(errno.EEXIST)
         try:
             draft = await trio.to_thread.run_sync(
@@ -370,7 +414,7 @@ class ImmichFilesystem(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EIO) from error
         inode = self._next_staged_inode
         self._next_staged_inode += 1
-        staged = _StagedFile(inode, decoded, draft)
+        staged = _StagedFile(inode, parent_inode, decoded, draft)
         handle = self._handle()
         readable, writable = self._access(flags)
         self._staged_handles[handle] = _StagedHandle(
@@ -465,14 +509,24 @@ class ImmichFilesystem(pyfuse3.Operations):
     async def unlink(
         self, parent_inode: int, name: bytes, ctx: pyfuse3.RequestContext
     ) -> None:
-        if parent_inode != pyfuse3.ROOT_INODE:
+        parent = self._node(parent_inode)
+        if isinstance(parent, CatalogFile):
             raise pyfuse3.FUSEError(errno.ENOTDIR)
+        if not parent.mutation_root:
+            raise pyfuse3.FUSEError(errno.EROFS)
         decoded = self._name(name)
         if decoded in self._staged_names:
             raise pyfuse3.FUSEError(errno.EBUSY)
-        entry = self._remote(decoded)
         try:
-            await self.library.remote_trash(entry)
+            entry = self.catalog.lookup(parent_inode, decoded)
+        except Exception as error:
+            raise pyfuse3.FUSEError(errno.EIO) from error
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if isinstance(entry, CatalogDirectory):
+            raise pyfuse3.FUSEError(errno.EISDIR)
+        try:
+            await self.library.remote_trash(self._library_entry(entry))
         except (LibraryError, PermissionError) as error:
             raise pyfuse3.FUSEError(errno.EPERM) from error
         except Exception as error:

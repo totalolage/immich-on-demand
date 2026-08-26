@@ -48,14 +48,6 @@ class Library:
     def upload_access(self) -> tuple[ImmichClient, ServerSession]:
         return self._mutation_access()
 
-    def lookup(self, identity: str | int) -> CatalogAsset | None:
-        entry = (
-            self._catalog.by_inode(identity)
-            if isinstance(identity, int)
-            else self._catalog.by_name(identity)
-        )
-        return entry if entry is not None and entry.asset.visible else None
-
     async def read(self, entry: CatalogAsset, offset: int, size: int) -> bytes:
         return await self._content_cache.read(entry.asset, offset, size)
 
@@ -81,7 +73,7 @@ class Library:
             await mutation.trash(current.asset.id)
             self._catalog.mark_trashed(current.asset.id)
 
-    async def remote_restore(self, asset_id: str) -> None:
+    async def remote_restore(self, asset_id: str) -> CatalogAsset:
         if not self._settings.remote_delete:
             raise PermissionError("remote deletion is disabled")
         mutation, session = self._mutation_access()
@@ -98,6 +90,10 @@ class Library:
 
             await mutation.restore(current.asset.id)
             self._catalog.mark_restored(current.asset.id)
+            restored = self._catalog.by_id(current.asset.id)
+            if restored is None or restored.asset.is_trashed:
+                raise LibraryError("asset restore was not committed to the catalog")
+            return restored
 
     def _mutation_access(self) -> tuple[ImmichClient, ServerSession]:
         if self._mutation_client is None or self._mutation_session is None:

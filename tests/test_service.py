@@ -14,7 +14,15 @@ from unittest.mock import patch
 
 import trio
 
-from immich_on_demand.catalog import Catalog, CatalogAsset, CatalogStats, TrustedProfile
+from immich_on_demand.catalog import (
+    ROOT_INODE,
+    Catalog,
+    CatalogAsset,
+    CatalogDirectory,
+    CatalogFile,
+    CatalogStats,
+    TrustedProfile,
+)
 from immich_on_demand.control import ControlError, send_request, serve_control
 from immich_on_demand.immich import (
     ImmichPageLimitError,
@@ -29,6 +37,7 @@ from immich_on_demand.model import Asset
 from immich_on_demand.service import (
     FULL_REFRESH_SECONDS,
     _RestoreJob,
+    _catalog_file_from_uri,
     _periodic_refresh,
     _pin_worker,
     _upload_matches,
@@ -93,6 +102,7 @@ class ServiceFakes:
         pin_persist_error: bool = False,
         restore_error: Exception | None = None,
         block_restore: bool = False,
+        block_reconcile: bool = False,
         read_validation_error: Exception | None = None,
         trusted_profile: TrustedProfile | None = None,
     ) -> None:
@@ -106,6 +116,7 @@ class ServiceFakes:
         self.pin_persist_error = pin_persist_error
         self.restore_error = restore_error
         self.block_restore = block_restore
+        self.block_reconcile = block_reconcile
         self.read_validation_error = read_validation_error
         self.trusted_profile_value = trusted_profile
         self.events: list[str] = []
@@ -114,6 +125,10 @@ class ServiceFakes:
         self.cache: ServiceFakes.Cache | None = None
         self.upload_queue: ServiceFakes.Queue | None = None
         self.preview_gate = trio.Event()
+        self.preview_mounts: list[Path] = []
+        self.preview_downloads_enabled: list[bool] = []
+        self.reconcile_started = trio.Event()
+        self.reconcile_gate = trio.Event()
         self.main_started = trio.Event()
         self.stop_main = trio.Event()
         self.terminated = trio.Event()
@@ -132,6 +147,7 @@ class ServiceFakes:
         self.promoted = trio.Event()
         self.upload_retries: list[str] = []
         self.upload_cancellations: list[tuple[str, str, int]] = []
+        self.aliases = (Path("All") / "new.jpg",)
         outer = self
 
         class Client:
@@ -184,6 +200,19 @@ class ServiceFakes:
 
             def by_id(self, asset_id: str) -> CatalogAsset | None:
                 return upload_entry() if asset_id == ASSET_ID else None
+
+            def lookup(self, parent: int, name: str):
+                if parent == ROOT_INODE and name == "All":
+                    return CatalogDirectory(2, 2, True)
+                if parent == ROOT_INODE and name == "Favorites":
+                    return CatalogDirectory(3, 2, False)
+                if parent == 2 and name == "new.jpg":
+                    entry = upload_entry()
+                    return CatalogFile(entry.asset, entry.inode, entry.name, 1)
+                return None
+
+            def aliases(self, asset_id: str):
+                return outer.aliases
 
         class Cache:
             def __init__(
@@ -271,7 +300,7 @@ class ServiceFakes:
             def lookup(self, identity: str | int) -> CatalogAsset | None:
                 return upload_entry() if identity == "new.jpg" else None
 
-            async def remote_restore(self, asset_id: str) -> None:
+            async def remote_restore(self, asset_id: str) -> CatalogAsset:
                 if not self.mutation_enabled:
                     raise PermissionError("mutations are disabled")
                 outer.restore_attempts.append(asset_id)
@@ -281,11 +310,13 @@ class ServiceFakes:
                 if outer.restore_error is not None:
                     raise outer.restore_error
                 outer.restored_ids.append(asset_id)
+                return upload_entry()
 
         class Filesystem:
             def __init__(
                 self,
                 library: object,
+                catalog: object,
                 queue: object,
                 server_origin: str,
                 owner_id: str,
@@ -381,6 +412,23 @@ class ServiceFakes:
             raise ImmichResponseError("invalid search response")
         return CatalogStats(7, 6, 1, 0, 0, 0)
 
+    async def reconcile(
+        self,
+        catalog: object,
+        client: object,
+        session: object,
+        catalog_lock: object,
+        *,
+        trusted_profile: TrustedProfile | None = None,
+    ) -> None:
+        self.catalog_locks.append(catalog_lock)
+        self.events.append("relations")
+        self.reconcile_started.set()
+        if self.block_reconcile:
+            await self.reconcile_gate.wait()
+        if trusted_profile is not None:
+            self.trusted_profile_value = trusted_profile
+
     async def previews(
         self,
         entries: object,
@@ -391,6 +439,8 @@ class ServiceFakes:
         mount_ready: trio.Event | None = None,
         task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
     ) -> object:
+        self.preview_mounts.append(mount)
+        self.preview_downloads_enabled.append(downloads_enabled)
         self.events.append("suppress")
         if self.events.count("suppress") == self.preview_error_call:
             raise OSError("thumbnail cache unavailable")
@@ -456,6 +506,7 @@ class ServiceFakes:
             "load_api_key": self.key,
             "refresh_catalog": self.refresh,
             "refresh_catalog_incremental": self.incremental_refresh,
+            "reconcile_album_people": self.reconcile,
             "populate_previews": self.previews,
             "_upload_worker": self.upload_worker,
             "state_path": lambda: self.root / "state",
@@ -477,6 +528,45 @@ class ServiceFakes:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_mounted_uri_resolves_any_asset_alias_and_rejects_nonfiles(self) -> None:
+        asset = upload_entry().asset
+        file = CatalogFile(asset, 42, "new.jpg", 2)
+        directories = {
+            (ROOT_INODE, "All"): CatalogDirectory(2, 2, True),
+            (ROOT_INODE, "Favorites"): CatalogDirectory(3, 2, False),
+        }
+
+        class Namespace:
+            def lookup(self, parent: int, name: str):
+                if (parent, name) in directories:
+                    return directories[parent, name]
+                if parent in {2, 3} and name == "new.jpg":
+                    return file
+                return None
+
+        mount = Path("/home/person/Immich")
+        namespace = Namespace()
+        for path in (mount / "All" / "new.jpg", mount / "Favorites" / "new.jpg"):
+            self.assertEqual(
+                _catalog_file_from_uri(path.as_uri(), mount, namespace),  # type: ignore[arg-type]
+                file,
+            )
+        self.assertIsNone(
+            _catalog_file_from_uri(
+                (mount / "All" / "missing.jpg").as_uri(), mount, namespace  # type: ignore[arg-type]
+            )
+        )
+        for uri in (
+            mount.as_uri(),
+            (mount / "All").as_uri(),
+            (mount.parent / "outside.jpg").as_uri(),
+            "https://photos.example.test/All/new.jpg",
+            f"{mount.as_uri()}/All/%2e%2e/new.jpg",
+            f"{mount.as_uri()}/All/%ff",
+        ):
+            with self.subTest(uri=uri), self.assertRaises(ValueError):
+                _catalog_file_from_uri(uri, mount, namespace)  # type: ignore[arg-type]
+
     def test_upload_candidate_must_be_visible_in_the_upload_library(self) -> None:
         content = b"queued original"
         uploaded = Asset(
@@ -766,10 +856,12 @@ class ServiceTest(unittest.TestCase):
 
         validation = len(fakes.events) - 1 - fakes.events[::-1].index("validate:read")
         refresh = fakes.events.index("refresh")
+        relations = fakes.events.index("relations")
         downloads = fakes.events.index("downloads-enabled")
         mutations = fakes.events.index("mutations-enabled")
         self.assertLess(validation, refresh)
-        self.assertLess(refresh, downloads)
+        self.assertLess(refresh, relations)
+        self.assertLess(relations, downloads)
         self.assertLess(downloads, mutations)
         self.assertIn("close:mutation", fakes.events)
 
@@ -834,6 +926,7 @@ class ServiceTest(unittest.TestCase):
                         pending,
                         jobs,
                         refreshes,
+                        lambda _entry: trio.lowlevel.checkpoint(),
                     )
                     await notifications.send(True)
                     for job in tuple(jobs.values()):
@@ -843,6 +936,48 @@ class ServiceTest(unittest.TestCase):
 
         with self.assertLogs("immich_on_demand.service", level="WARNING"):
             trio.run(scenario)
+
+    def test_restore_worker_suppresses_aliases_before_completion(self) -> None:
+        async def scenario() -> None:
+            entry = upload_entry()
+            suppression_started = trio.Event()
+            suppression_finished = trio.Event()
+
+            class Library:
+                async def remote_restore(self, asset_id: str) -> CatalogAsset:
+                    self.asserted_id = asset_id
+                    return entry
+
+            async def suppress(restored: CatalogAsset) -> None:
+                self.assertEqual(restored, entry)
+                suppression_started.set()
+                await suppression_finished.wait()
+
+            notifications, received = trio.open_memory_channel[bool](1)
+            refreshes, refreshed = trio.open_memory_channel[bool](1)
+            job = _RestoreJob(ASSET_ID)
+            jobs = {ASSET_ID: job}
+            async with notifications, received, refreshes, refreshed:
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(
+                        _restore_worker,
+                        Library(),
+                        received,
+                        [job],
+                        jobs,
+                        refreshes,
+                        suppress,
+                    )
+                    await notifications.send(True)
+                    await suppression_started.wait()
+                    self.assertFalse(job.done.is_set())
+                    suppression_finished.set()
+                    await job.done.wait()
+                    self.assertFalse(job.failed)
+                    self.assertFalse(refreshed.receive_nowait())
+                    nursery.cancel_scope.cancel()
+
+        trio.run(scenario)
 
     def test_restore_control_schedules_repair_and_sanitizes_failure(self) -> None:
         async def run_case(root: Path, error: Exception | None) -> ServiceFakes:
@@ -1094,7 +1229,7 @@ class ServiceTest(unittest.TestCase):
                     with self.assertRaisesRegex(OSError, "private catalog"):
                         await pin(  # type: ignore[operator]
                             {
-                                "uri": (root / "mount" / "new.jpg").as_uri(),
+                                "uri": (root / "mount" / "All" / "new.jpg").as_uri(),
                                 "pinned": True,
                             }
                         )
@@ -1187,6 +1322,7 @@ class ServiceTest(unittest.TestCase):
                     fakes.stop_main.set()
 
             self.assertEqual(fakes.events.count("refresh"), 2)
+            self.assertEqual(fakes.events.count("relations"), 2)
             self.assertNotIn("incremental:3600", fakes.events)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1214,6 +1350,7 @@ class ServiceTest(unittest.TestCase):
                     fakes.stop_main.set()
 
             self.assertEqual(fakes.events.count("refresh"), 2)
+            self.assertEqual(fakes.events.count("relations"), 2)
             self.assertLess(
                 fakes.events.index("incremental:3600"),
                 len(fakes.events) - 1 - fakes.events[::-1].index("refresh"),
@@ -1239,6 +1376,12 @@ class ServiceTest(unittest.TestCase):
                     nursery.start_soon(run_service, settings)
                     await fakes.main_started.wait()
                     self.assertLess(fakes.events.index("refresh"), fakes.events.index("suppress"))
+                    self.assertLess(
+                        fakes.events.index("refresh"), fakes.events.index("suppress")
+                    )
+                    self.assertLess(
+                        fakes.events.index("suppress"), fakes.events.index("relations")
+                    )
                     self.assertLess(fakes.events.index("suppress"), fakes.events.index("fuse-init"))
                     self.assertLess(fakes.events.index("fuse-init"), fakes.events.index("sort"))
                     self.assertLess(fakes.events.index("evict:11"), fakes.events.index("fuse-init"))
@@ -1345,7 +1488,7 @@ class ServiceTest(unittest.TestCase):
                     )
                     self.assertEqual(
                         await evict(
-                            {"uri": (root / "mount" / "new.jpg").as_uri()}
+                            {"uri": (root / "mount" / "All" / "new.jpg").as_uri()}
                         ),
                         {"evicted": True},
                     )  # type: ignore[operator]
@@ -1354,13 +1497,13 @@ class ServiceTest(unittest.TestCase):
                     for uri in (
                         (root / "outside.jpg").as_uri(),
                         "https://photos.example.test/new.jpg",
-                        (root / "mount" / "folder" / "new.jpg").as_uri(),
+                        (root / "mount" / "All" / "folder" / "new.jpg").as_uri(),
                     ):
                         with self.subTest(uri=uri), self.assertRaises(ValueError):
                             await evict({"uri": uri})  # type: ignore[operator]
 
-                    uri = (root / "mount" / "new.jpg").as_uri()
-                    unknown_uri = (root / "mount" / "unknown.jpg").as_uri()
+                    uri = (root / "mount" / "All" / "new.jpg").as_uri()
+                    unknown_uri = (root / "mount" / "All" / "unknown.jpg").as_uri()
                     self.assertEqual(
                         await describe({"uris": [uri, unknown_uri]}),
                         {
@@ -1467,6 +1610,9 @@ class ServiceTest(unittest.TestCase):
             self.assertIn("fuse-close:True", fakes.events)
             self.assertIn("control-close", fakes.events)
             self.assertIn("cache-policy:11:33", fakes.events)
+            self.assertEqual(fakes.events.count("relations"), 2)
+            assert fakes.trusted_profile_value is not None
+            self.assertEqual(fakes.trusted_profile_value.format_version, 2)
             self.assertTrue(fakes.catalog_locks)
             self.assertTrue(
                 all(lock is fakes.catalog_locks[0] for lock in fakes.catalog_locks)
@@ -1480,9 +1626,64 @@ class ServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_full_refresh_suppresses_new_aliases_before_relation_reconciliation(
+        self,
+    ) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                block_reconcile=True,
+            )
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+
+            with fakes.patches():
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(run_service, settings)
+                    with trio.fail_after(0.1):
+                        await fakes.reconcile_started.wait()
+                    self.assertEqual(fakes.events.count("suppress"), 1)
+                    self.assertEqual(fakes.events.count("offline-suppress"), 1)
+                    self.assertNotIn("sort", fakes.events)
+                    self.assertNotIn("fetch", fakes.events)
+                    self.assertEqual(fakes.preview_mounts, [settings.mount_path])
+                    self.assertEqual(fakes.preview_downloads_enabled, [False])
+
+                    fakes.reconcile_gate.set()
+                    await fakes.main_started.wait()
+                    fakes.stop_main.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_initial_full_refresh_suppression_failure_prevents_startup(self) -> None:
+        async def scenario(root: Path) -> ServiceFakes:
+            fakes = ServiceFakes(
+                root,
+                block_preview=False,
+                preview_error_call=1,
+            )
+            settings = Settings("https://photos.example.test", root / "mount")
+            with fakes.patches(), self.assertRaisesRegex(
+                OSError,
+                "preview suppression failed",
+            ):
+                await run_service(settings)
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory:
+            fakes = trio.run(scenario, Path(directory))
+
+        self.assertNotIn("relations", fakes.events)
+        self.assertNotIn("fuse-init", fakes.events)
+
     def test_runtime_preview_suppression_failure_terminates_the_mount(self) -> None:
         async def scenario(root: Path) -> None:
-            fakes = ServiceFakes(root, block_preview=False, preview_error_call=2)
+            fakes = ServiceFakes(root, block_preview=False, preview_error_call=3)
             settings = Settings(
                 "https://photos.example.test", root / "mount", refresh_seconds=3600
             )
@@ -1511,6 +1712,7 @@ class ServiceTest(unittest.TestCase):
             )
             self.assertEqual(str(failures[0]), "preview suppression failed; mount terminated")
             self.assertIn("preview suppression failed", "\n".join(logs.output))
+            self.assertEqual(fakes.events.count("relations"), 1)
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -1554,7 +1756,7 @@ class ServiceTest(unittest.TestCase):
 
             async def observe_commit() -> None:
                 await fakes.second_refresh.wait()
-                self.assertEqual(fakes.events.count("suppress"), 2)
+                self.assertEqual(fakes.events.count("suppress"), 4)
                 fakes.stop_main.set()
 
             with fakes.patches():
@@ -1578,7 +1780,7 @@ class ServiceTest(unittest.TestCase):
                 Asset(
                     ASSET_ID,
                     OWNER_ID,
-                    "uploaded.jpg",
+                    "new.jpg",
                     "image/jpeg",
                     123,
                     1,
@@ -1591,7 +1793,7 @@ class ServiceTest(unittest.TestCase):
                     None,
                 ),
                 3,
-                "uploaded.jpg",
+                "new.jpg",
             )
             failures: list[RuntimeError] = []
 
@@ -1612,7 +1814,6 @@ class ServiceTest(unittest.TestCase):
                     assert callable(on_uploaded)
                     with self.assertRaises(OSError):
                         await on_uploaded(entry)
-                    fakes.fuse_terminate()
 
             self.assertLess(
                 fakes.events.index("fuse-terminate"),
@@ -1626,12 +1827,16 @@ class ServiceTest(unittest.TestCase):
     def test_upload_suppresses_fallback_before_coalesced_background_refresh(self) -> None:
         async def scenario(root: Path) -> None:
             fakes = ServiceFakes(root)
+            fakes.aliases = (
+                Path("All") / "new.jpg",
+                Path("Favorites") / "new.jpg",
+            )
             settings = Settings("https://photos.example.test", root / "mount", refresh_seconds=3600)
             entry = CatalogAsset(
                 Asset(
                     ASSET_ID,
                     OWNER_ID,
-                    "uploaded.jpg",
+                    "new.jpg",
                     "image/jpeg",
                     123,
                     1,
@@ -1644,9 +1849,10 @@ class ServiceTest(unittest.TestCase):
                     None,
                 ),
                 3,
-                "uploaded.jpg",
+                "new.jpg",
             )
             prepared: list[tuple[Path, int, int, str | None]] = []
+            invalidated: list[tuple[int, bytes]] = []
 
             def prepare(
                 source: Path,
@@ -1659,8 +1865,15 @@ class ServiceTest(unittest.TestCase):
                 fakes.events.append("upload-suppressed")
                 return False
 
-            with fakes.patches(), patch(
-                "immich_on_demand.service.prepare_thumbnail_cache", prepare
+            with (
+                fakes.patches(),
+                patch("immich_on_demand.service.prepare_thumbnail_cache", prepare),
+                patch(
+                    "immich_on_demand.service.pyfuse3.invalidate_entry",
+                    side_effect=lambda parent, name, _inode: invalidated.append(
+                        (parent, name)
+                    ),
+                ),
             ):
                 async with trio.open_nursery() as nursery:
                     nursery.start_soon(run_service, settings)
@@ -1672,9 +1885,15 @@ class ServiceTest(unittest.TestCase):
                     self.assertEqual(
                         prepared,
                         [
-                            (root / "mount" / "uploaded.jpg", 4, 123, None),
-                            (root / "mount" / "uploaded.jpg", 4, 123, None),
+                            (root / "mount" / "All" / "new.jpg", 4, 123, None),
+                            (root / "mount" / "Favorites" / "new.jpg", 4, 123, None),
+                            (root / "mount" / "All" / "new.jpg", 4, 123, None),
+                            (root / "mount" / "Favorites" / "new.jpg", 4, 123, None),
                         ],
+                    )
+                    self.assertEqual(
+                        invalidated,
+                        [(2, b"new.jpg"), (3, b"new.jpg")] * 2,
                     )
                     self.assertEqual(fakes.events.count("refresh"), 1)
 

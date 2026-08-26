@@ -127,7 +127,7 @@ class LibraryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
-    def test_lists_looks_up_and_reads_immutable_assets(self) -> None:
+    def test_lists_and_reads_immutable_assets(self) -> None:
         async def scenario(root: Path) -> None:
             with Catalog(root / "catalog.db") as catalog:
                 entry = catalog.add_uploaded(asset(), "photo.jpg")
@@ -135,8 +135,6 @@ class LibraryTest(unittest.TestCase):
 
                 self.assertFalse(mounted.mutation_enabled)
                 self.assertEqual(mounted.list(), [entry])
-                self.assertEqual(mounted.lookup("photo.jpg"), entry)
-                self.assertEqual(mounted.lookup(entry.inode), entry)
                 self.assertEqual(await mounted.read(entry, 1, 3), b"ell")
                 mounted.acquire(entry)
                 mounted.release(entry)
@@ -148,22 +146,17 @@ class LibraryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
-    def test_lookup_never_exposes_non_visible_catalog_rows(self) -> None:
+    def test_list_never_exposes_non_visible_catalog_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with Catalog(root / "catalog.db") as catalog:
-                entries = (
-                    catalog.add_uploaded(replace(asset(), is_trashed=True), "trashed.jpg"),
-                    catalog.add_uploaded(replace(asset(OTHER_ID), is_offline=True), "offline.jpg"),
-                    catalog.add_uploaded(replace(asset(THIRD_ID), visibility="hidden"), "hidden.jpg"),
-                    catalog.add_uploaded(replace(asset(FOURTH_ID), size=None), "unknown-size.jpg"),
-                )
+                catalog.add_uploaded(replace(asset(), is_trashed=True), "trashed.jpg")
+                catalog.add_uploaded(replace(asset(OTHER_ID), is_offline=True), "offline.jpg")
+                catalog.add_uploaded(replace(asset(THIRD_ID), visibility="hidden"), "hidden.jpg")
+                catalog.add_uploaded(replace(asset(FOURTH_ID), size=None), "unknown-size.jpg")
                 mounted = library(catalog, root)
 
                 self.assertEqual(mounted.list(), [])
-                for entry in entries:
-                    self.assertIsNone(mounted.lookup(entry.name))
-                    self.assertIsNone(mounted.lookup(entry.inode))
 
     def test_remote_trash_requires_every_guard_and_commits_after_success(self) -> None:
         async def scenario(root: Path) -> None:
@@ -273,7 +266,7 @@ class LibraryTest(unittest.TestCase):
                     self.assertTrue(current and current.asset.is_trashed)
 
                 mutation.on_restore = observe_remote_call
-                await library(
+                returned = await library(
                     catalog,
                     root,
                     mutation=mutation,
@@ -288,6 +281,8 @@ class LibraryTest(unittest.TestCase):
                 self.assertEqual(
                     (restored.inode, restored.name), (entry.inode, entry.name)
                 )
+                self.assertEqual(returned, restored)
+                self.assertEqual(catalog.list_visible(), [returned])
 
             with Catalog(root / "restore-failure.db") as catalog:
                 entry = catalog.add_uploaded(

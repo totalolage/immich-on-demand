@@ -1,22 +1,27 @@
 from dataclasses import replace
 import hmac
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sqlite3
 from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from immich_on_demand.catalog import Catalog, TrustedProfile
-from immich_on_demand.model import Asset
+from immich_on_demand.catalog import ROOT_INODE, Catalog, CatalogDirectory, TrustedProfile
+from immich_on_demand.model import Album, Asset, Person
 
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 LITERAL_ID = "17345678-1234-4234-8234-123456789abc"
 OTHER_ID = "22345678-1234-4234-8234-123456789abc"
+ALBUM_ID = "32345678-1234-4234-8234-123456789abc"
+OTHER_ALBUM_ID = "42345678-1234-4234-8234-123456789abc"
+PERSON_ID = "52345678-1234-4234-8234-123456789abc"
+OTHER_PERSON_ID = "62345678-1234-4234-8234-123456789abc"
 OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 READ_SCOPES = frozenset({"asset.download", "asset.read", "asset.view", "user.read"})
+RICH_READ_SCOPES = READ_SCOPES | {"album.read", "person.read"}
 
 
 def trusted_profile(**changes: object) -> TrustedProfile:
@@ -29,6 +34,14 @@ def trusted_profile(**changes: object) -> TrustedProfile:
     }
     values.update(changes)
     return TrustedProfile(**values)  # type: ignore[arg-type]
+
+
+def rich_profile(**changes: object) -> TrustedProfile:
+    return trusted_profile(
+        format_version=2,
+        read_permissions=RICH_READ_SCOPES,
+        **changes,
+    )
 
 
 def asset(asset_id: str = ASSET_ID, name: str = "photo.jpg") -> Asset:
@@ -49,8 +62,964 @@ def asset(asset_id: str = ASSET_ID, name: str = "photo.jpg") -> Asset:
     )
 
 
+def viewed_asset(
+    asset_id: str = ASSET_ID,
+    name: str = "photo.jpg",
+    *,
+    local_date: str | None = "2026-08-25",
+    is_favorite: bool = False,
+) -> Asset:
+    return replace(
+        asset(asset_id, name),
+        local_date=local_date,
+        is_favorite=is_favorite,
+    )
+
+
+def album(
+    album_id: str = ALBUM_ID, name: str = "Trips", *, asset_count: int = 1
+) -> Album:
+    return Album(album_id, name, "2026-08-25T12:00:00Z", asset_count)
+
+
+def person(person_id: str = PERSON_ID, name: str = "Alice") -> Person:
+    return Person(person_id, name, False, None)
+
+
 class CatalogTest(unittest.TestCase):
-    def test_requires_an_exact_complete_offline_profile(self) -> None:
+    def test_namespace_always_exposes_the_five_fixed_views(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                root = catalog.node(1)
+                self.assertEqual((root.inode, root.nlink), (1, 7))
+                self.assertFalse(root.mutation_root)
+
+                entries = catalog.children(1)
+                self.assertEqual(
+                    [entry.name for entry in entries],
+                    ["Albums", "All", "Favorites", "People", "by Date"],
+                )
+                for entry in entries:
+                    self.assertEqual(entry.node, catalog.lookup(1, entry.name))
+                    self.assertEqual(entry.node.nlink, 2)
+                    self.assertEqual(
+                        entry.node.mutation_root, entry.name == "All"
+                    )
+
+                all_directory = catalog.lookup(1, "All")
+                by_date = catalog.lookup(1, "by Date")
+                assert all_directory is not None
+                assert by_date is not None
+                self.assertEqual(catalog.lookup(1, "."), root)
+                self.assertEqual(catalog.lookup(1, ".."), root)
+                self.assertEqual(
+                    catalog.lookup(all_directory.inode, ".."), root
+                )
+                self.assertEqual(
+                    catalog.lookup(by_date.inode, "."), by_date
+                )
+
+    def test_replace_album_people_materializes_populated_and_empty_collections(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                )
+                self.assertIsNone(catalog.trusted_profile())
+
+                self.assertIsNone(
+                    catalog.replace_album_people(
+                        albums=(
+                            album(),
+                            album(OTHER_ALBUM_ID, "Empty", asset_count=0),
+                        ),
+                        album_memberships=((ALBUM_ID, ASSET_ID),),
+                        people=(person(), person(OTHER_PERSON_ID, "Nobody")),
+                        person_memberships=((PERSON_ID, ASSET_ID),),
+                        trusted_profile=rich_profile(),
+                    )
+                )
+
+                self.assertEqual(catalog.trusted_profile(), rich_profile())
+
+                albums = catalog.lookup(1, "Albums")
+                people = catalog.lookup(1, "People")
+                assert albums is not None
+                assert people is not None
+                self.assertEqual(
+                    [entry.name for entry in catalog.children(albums.inode)],
+                    ["Empty", "Trips"],
+                )
+                self.assertEqual(
+                    [entry.name for entry in catalog.children(people.inode)],
+                    ["Alice", "Nobody"],
+                )
+                trip = catalog.lookup(albums.inode, "Trips")
+                alice = catalog.lookup(people.inode, "Alice")
+                assert trip is not None
+                assert alice is not None
+                aliases = (
+                    catalog.lookup(trip.inode, "photo.jpg"),
+                    catalog.lookup(alice.inode, "photo.jpg"),
+                )
+                self.assertTrue(all(alias is not None for alias in aliases))
+                self.assertEqual({alias.inode for alias in aliases}, {aliases[0].inode})
+                self.assertEqual({alias.nlink for alias in aliases}, {3})
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (
+                        PurePosixPath("Albums/Trips/photo.jpg"),
+                        PurePosixPath("All/photo.jpg"),
+                        PurePosixPath("People/Alice/photo.jpg"),
+                    ),
+                )
+
+    def test_collection_names_and_inodes_survive_collisions_renames_and_tombstones(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                )
+                catalog.replace_album_people(
+                    albums=(
+                        album(OTHER_ALBUM_ID, "Trips"),
+                        album(ALBUM_ID, "Trips"),
+                    ),
+                    album_memberships=((OTHER_ALBUM_ID, ASSET_ID),),
+                    people=(person(PERSON_ID, ""),),
+                    person_memberships=(),
+                    trusted_profile=rich_profile(),
+                )
+
+                albums = catalog.lookup(1, "Albums")
+                people = catalog.lookup(1, "People")
+                assert albums is not None
+                assert people is not None
+                original = {
+                    entry.name: entry.node.inode
+                    for entry in catalog.children(albums.inode)
+                }
+                self.assertEqual(
+                    set(original),
+                    {"Trips", f"Trips__{OTHER_ALBUM_ID}"},
+                )
+                unnamed = catalog.children(people.inode)
+                self.assertEqual(
+                    [entry.name for entry in unnamed],
+                    [f"Unnamed__{PERSON_ID}"],
+                )
+                unnamed_inode = unnamed[0].node.inode
+
+                catalog.replace_album_people(
+                    albums=(album(OTHER_ALBUM_ID, "Renamed"),),
+                    album_memberships=((OTHER_ALBUM_ID, ASSET_ID),),
+                    people=(),
+                    person_memberships=(),
+                )
+                remaining = catalog.children(albums.inode)
+                self.assertEqual(
+                    [(entry.name, entry.node.inode) for entry in remaining],
+                    [
+                        (
+                            f"Trips__{OTHER_ALBUM_ID}",
+                            original[f"Trips__{OTHER_ALBUM_ID}"],
+                        )
+                    ],
+                )
+                self.assertEqual(catalog.children(people.inode), ())
+
+                catalog.replace_album_people(
+                    albums=(
+                        album(ALBUM_ID, "A later rename"),
+                        album(OTHER_ALBUM_ID, "Renamed again"),
+                    ),
+                    album_memberships=((OTHER_ALBUM_ID, ASSET_ID),),
+                    people=(person(PERSON_ID, "A name now"),),
+                    person_memberships=(),
+                )
+                self.assertEqual(
+                    {
+                        entry.name: entry.node.inode
+                        for entry in catalog.children(albums.inode)
+                    },
+                    original,
+                )
+                self.assertEqual(
+                    catalog.children(people.inode)[0].node.inode,
+                    unnamed_inode,
+                )
+
+    def test_collection_names_sanitize_slashes_dots_and_controls_before_collisions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.replace_album_people(
+                    albums=(
+                        album(ALBUM_ID, "Trips/2026"),
+                        album(OTHER_ALBUM_ID, "Trips_2026"),
+                    ),
+                    album_memberships=(),
+                    people=(person(PERSON_ID, ".Alice\n"),),
+                    person_memberships=(),
+                    trusted_profile=rich_profile(),
+                )
+
+                albums = catalog.lookup(1, "Albums")
+                people = catalog.lookup(1, "People")
+                assert albums is not None
+                assert people is not None
+                original = {
+                    entry.name: entry.node.inode
+                    for entry in catalog.children(albums.inode)
+                }
+                self.assertEqual(
+                    set(original),
+                    {"Trips_2026", f"Trips_2026__{OTHER_ALBUM_ID}"},
+                )
+                self.assertEqual(
+                    [entry.name for entry in catalog.children(people.inode)],
+                    ["_Alice_"],
+                )
+
+                catalog.replace_album_people(
+                    albums=(
+                        album(ALBUM_ID, "Changed"),
+                        album(OTHER_ALBUM_ID, "Changed"),
+                    ),
+                    album_memberships=(),
+                    people=(),
+                    person_memberships=(),
+                )
+                self.assertEqual(
+                    {
+                        entry.name: entry.node.inode
+                        for entry in catalog.children(albums.inode)
+                    },
+                    original,
+                )
+
+    def test_asset_refreshes_preserve_relation_inventory_and_reproject_visibility(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                )
+                catalog.replace_album_people(
+                    albums=(album(),),
+                    album_memberships=((ALBUM_ID, ASSET_ID),),
+                    people=(person(),),
+                    person_memberships=((PERSON_ID, ASSET_ID),),
+                    trusted_profile=rich_profile(),
+                )
+                expected = (
+                    PurePosixPath("Albums/Trips/photo.jpg"),
+                    PurePosixPath("All/photo.jpg"),
+                    PurePosixPath("People/Alice/photo.jpg"),
+                )
+
+                catalog.begin_refresh()
+                catalog.stage([replace(asset(), updated_at="2026-08-26T12:00:00Z")])
+                catalog.finish_refresh(
+                    high_water_ms=2,
+                    page_count=1,
+                )
+                self.assertEqual(catalog.aliases(ASSET_ID), expected)
+
+                catalog.begin_refresh()
+                catalog.stage([replace(asset(), is_trashed=True)])
+                catalog.finish_incremental(high_water_ms=3)
+                self.assertEqual(catalog.aliases(ASSET_ID), ())
+
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_incremental(high_water_ms=4)
+                self.assertEqual(catalog.aliases(ASSET_ID), expected)
+
+                catalog.add_uploaded(
+                    replace(asset(), updated_at="2026-08-27T12:00:00Z"),
+                    "ignored.jpg",
+                )
+                self.assertEqual(catalog.aliases(ASSET_ID), expected)
+
+                catalog.begin_refresh()
+                catalog.finish_refresh(
+                    high_water_ms=5,
+                    page_count=1,
+                )
+                self.assertEqual(catalog.aliases(ASSET_ID), ())
+
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=6,
+                    page_count=1,
+                )
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (PurePosixPath("All/photo.jpg"),),
+                )
+
+    def test_replace_album_people_rejects_untrusted_or_invalid_inventory(self) -> None:
+        invalid_asset_ids = (
+            LITERAL_ID,
+            "72345678-1234-4234-8234-123456789abc",
+            "82345678-1234-4234-8234-123456789abc",
+            "92345678-1234-4234-8234-123456789abc",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                )
+                catalog.add_uploaded(
+                    replace(asset(invalid_asset_ids[0], "foreign.jpg"), owner_id=OTHER_ID),
+                    "foreign.jpg",
+                )
+                catalog.add_uploaded(
+                    replace(asset(invalid_asset_ids[1], "hidden.jpg"), visibility="hidden"),
+                    "hidden.jpg",
+                )
+                catalog.add_uploaded(
+                    replace(asset(invalid_asset_ids[2], "offline.jpg"), is_offline=True),
+                    "offline.jpg",
+                )
+                catalog.add_uploaded(
+                    replace(asset(invalid_asset_ids[3], "unknown.jpg"), size=None),
+                    "unknown.jpg",
+                )
+                catalog.replace_album_people(
+                    albums=(album(),),
+                    album_memberships=((ALBUM_ID, ASSET_ID),),
+                    people=(person(),),
+                    person_memberships=((PERSON_ID, ASSET_ID),),
+                    trusted_profile=rich_profile(),
+                )
+                expected_aliases = catalog.aliases(ASSET_ID)
+                albums_root = catalog.lookup(1, "Albums")
+                assert albums_root is not None
+                expected_albums = catalog.children(albums_root.inode)
+
+                cases = (
+                    {
+                        "albums": (album(), album()),
+                        "album_memberships": (),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(),),
+                        "album_memberships": (
+                            (ALBUM_ID, ASSET_ID),
+                            (ALBUM_ID, ASSET_ID),
+                        ),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(),),
+                        "album_memberships": ((OTHER_ALBUM_ID, ASSET_ID),),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(ALBUM_ID.upper()),),
+                        "album_memberships": (),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(),),
+                        "album_memberships": ((ALBUM_ID, OTHER_ID),),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(),),
+                        "album_memberships": ((ALBUM_ID, invalid_asset_ids[0]),),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(),),
+                        "album_memberships": ((ALBUM_ID, invalid_asset_ids[1]),),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(),),
+                        "album_memberships": ((ALBUM_ID, invalid_asset_ids[2]),),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (album(),),
+                        "album_memberships": ((ALBUM_ID, invalid_asset_ids[3]),),
+                        "people": (),
+                        "person_memberships": (),
+                    },
+                    {
+                        "albums": (),
+                        "album_memberships": (),
+                        "people": (replace(person(), is_hidden=True),),
+                        "person_memberships": (),
+                    },
+                )
+                for values in cases:
+                    with self.subTest(values=values), self.assertRaises(ValueError):
+                        catalog.replace_album_people(**values)
+                    self.assertEqual(catalog.aliases(ASSET_ID), expected_aliases)
+                    self.assertEqual(catalog.children(albums_root.inode), expected_albums)
+
+                with self.assertRaisesRegex(ValueError, "version 2"):
+                    catalog.replace_album_people(
+                        albums=(),
+                        album_memberships=(),
+                        people=(),
+                        person_memberships=(),
+                        trusted_profile=trusted_profile(),
+                    )
+                self.assertEqual(catalog.trusted_profile(), rich_profile())
+
+    def test_replace_album_people_rolls_back_directories_memberships_and_profile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                )
+                catalog.replace_album_people(
+                    albums=(album(),),
+                    album_memberships=((ALBUM_ID, ASSET_ID),),
+                    people=(person(),),
+                    person_memberships=((PERSON_ID, ASSET_ID),),
+                    trusted_profile=rich_profile(),
+                )
+
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TRIGGER reject_relation_projection
+                    BEFORE INSERT ON namespace_links
+                    WHEN NEW.directory_inode IN (
+                        SELECT inode FROM namespace_directories
+                         WHERE identity LIKE 'album:%'
+                            OR identity LIKE 'person:%'
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced relation failure');
+                    END;
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog:
+                before_aliases = catalog.aliases(ASSET_ID)
+                albums_root = catalog.lookup(1, "Albums")
+                assert albums_root is not None
+                before_albums = catalog.children(albums_root.inode)
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "forced relation"):
+                    catalog.replace_album_people(
+                        albums=(album(OTHER_ALBUM_ID, "Replacement"),),
+                        album_memberships=((OTHER_ALBUM_ID, ASSET_ID),),
+                        people=(),
+                        person_memberships=(),
+                        trusted_profile=rich_profile(read_key_sha256="b" * 64),
+                    )
+
+                self.assertEqual(catalog.aliases(ASSET_ID), before_aliases)
+                self.assertEqual(catalog.children(albums_root.inode), before_albums)
+                self.assertEqual(catalog.trusted_profile(), rich_profile())
+
+    def test_namespace_migrates_a_legacy_catalog_without_changing_asset_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE assets (
+                        id TEXT PRIMARY KEY,
+                        inode INTEGER NOT NULL UNIQUE,
+                        name TEXT NOT NULL UNIQUE,
+                        owner_id TEXT NOT NULL,
+                        original_name TEXT NOT NULL,
+                        mime_type TEXT NOT NULL,
+                        size INTEGER,
+                        created_ns INTEGER NOT NULL,
+                        modified_ns INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        checksum TEXT NOT NULL,
+                        visibility TEXT NOT NULL,
+                        is_trashed INTEGER NOT NULL,
+                        is_offline INTEGER NOT NULL,
+                        library_id TEXT
+                    );
+                    CREATE TABLE incoming_assets (
+                        id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        original_name TEXT NOT NULL,
+                        mime_type TEXT NOT NULL,
+                        size INTEGER,
+                        created_ns INTEGER NOT NULL,
+                        modified_ns INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        checksum TEXT NOT NULL,
+                        visibility TEXT NOT NULL,
+                        is_trashed INTEGER NOT NULL,
+                        is_offline INTEGER NOT NULL,
+                        library_id TEXT
+                    );
+                    CREATE TABLE metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+                    CREATE TABLE pins (asset_id TEXT PRIMARY KEY) WITHOUT ROWID;
+                    INSERT INTO metadata VALUES ('next_inode', 43);
+                    INSERT INTO metadata VALUES ('high_water_ms', 1);
+                    INSERT INTO metadata VALUES ('full_refresh_pages', 1);
+                    """
+                )
+                old = asset()
+                connection.execute(
+                    "INSERT INTO assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        old.id,
+                        42,
+                        "stable-photo.jpg",
+                        old.owner_id,
+                        old.original_name,
+                        old.mime_type,
+                        old.size,
+                        old.created_ns,
+                        old.modified_ns,
+                        old.updated_at,
+                        old.checksum,
+                        old.visibility,
+                        int(old.is_trashed),
+                        int(old.is_offline),
+                        old.library_id,
+                    ),
+                )
+                connection.execute("INSERT INTO pins VALUES (?)", (old.id,))
+                connection.commit()
+            finally:
+                connection.close()
+            database.chmod(0o600)
+
+            with Catalog(database) as catalog:
+                migrated = catalog.by_id(ASSET_ID)
+                self.assertEqual(
+                    migrated and (migrated.inode, migrated.name),
+                    (42, "stable-photo.jpg"),
+                )
+                self.assertEqual(catalog.pinned_ids(), frozenset({ASSET_ID}))
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (PurePosixPath("All/stable-photo.jpg"),),
+                )
+                assert migrated is not None
+                self.assertIsNone(migrated.asset.local_date)
+                self.assertFalse(migrated.asset.is_favorite)
+
+    def test_failed_namespace_migration_stays_unpublished_and_can_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            with Catalog(database) as catalog:
+                original = catalog.add_uploaded(asset(), "photo.jpg")
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    """
+                    DELETE FROM metadata WHERE key = 'namespace_format';
+                    DELETE FROM namespace_links;
+                    CREATE TRIGGER reject_namespace_migration
+                    BEFORE INSERT ON namespace_links
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced migration failure');
+                    END;
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "forced migration failure"
+            ):
+                Catalog(database)
+            connection = sqlite3.connect(database)
+            try:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'namespace_format'"
+                    ).fetchone()
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT inode, name FROM assets WHERE id = ?", (ASSET_ID,)
+                    ).fetchone(),
+                    (original.inode, original.name),
+                )
+                connection.execute("DROP TRIGGER reject_namespace_migration")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog:
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (PurePosixPath("All/photo.jpg"),),
+                )
+
+    def test_namespace_reuses_one_asset_inode_and_reports_exact_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset(is_favorite=True)])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+
+                all_directory = catalog.lookup(1, "All")
+                date_directory = catalog.lookup(1, "by Date")
+                favorites = catalog.lookup(1, "Favorites")
+                assert all_directory is not None
+                assert date_directory is not None
+                assert favorites is not None
+                year = catalog.lookup(date_directory.inode, "2026")
+                assert year is not None
+                month = catalog.lookup(year.inode, "08")
+                assert month is not None
+                day = catalog.lookup(month.inode, "25")
+                assert day is not None
+
+                aliases = (
+                    catalog.lookup(all_directory.inode, "photo.jpg"),
+                    catalog.lookup(day.inode, "photo.jpg"),
+                    catalog.lookup(favorites.inode, "photo.jpg"),
+                )
+                self.assertTrue(all(alias is not None for alias in aliases))
+                self.assertEqual({alias.inode for alias in aliases}, {aliases[0].inode})
+                self.assertEqual({alias.nlink for alias in aliases}, {3})
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (
+                        PurePosixPath("All/photo.jpg"),
+                        PurePosixPath("Favorites/photo.jpg"),
+                        PurePosixPath("by Date/2026/08/25/photo.jpg"),
+                    ),
+                )
+                self.assertEqual(
+                    [entry.name for entry in catalog.children(day.inode)],
+                    ["photo.jpg"],
+                )
+
+    def test_alias_walk_is_bounded_by_the_namespace_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset()])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                catalog.replace_album_people(
+                    albums=(album(),),
+                    album_memberships=((ALBUM_ID, ASSET_ID),),
+                    people=(),
+                    person_memberships=(),
+                    trusted_profile=rich_profile(),
+                )
+                albums = catalog.lookup(ROOT_INODE, "Albums")
+                assert isinstance(albums, CatalogDirectory)
+                trips = catalog.lookup(albums.inode, "Trips")
+                assert isinstance(trips, CatalogDirectory)
+                catalog._connection.execute(
+                    "UPDATE namespace_directories SET parent_inode = ? WHERE inode = ?",
+                    (trips.inode, trips.inode),
+                )
+                catalog._connection.set_progress_handler(lambda: 1, 10_000)
+                try:
+                    aliases = catalog.aliases(ASSET_ID)
+                finally:
+                    catalog._connection.set_progress_handler(None, 0)
+
+                self.assertEqual(
+                    aliases,
+                    (
+                        PurePosixPath("All/photo.jpg"),
+                        PurePosixPath("by Date/2026/08/25/photo.jpg"),
+                    ),
+                )
+
+    def test_namespace_hides_every_nonvisible_asset_from_every_view(self) -> None:
+        hidden_ids = (
+            OTHER_ID,
+            "32345678-1234-4234-8234-123456789abc",
+            "42345678-1234-4234-8234-123456789abc",
+            "52345678-1234-4234-8234-123456789abc",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage(
+                    [
+                        viewed_asset(),
+                        replace(viewed_asset(hidden_ids[0], "trashed.jpg"), is_trashed=True),
+                        replace(viewed_asset(hidden_ids[1], "offline.jpg"), is_offline=True),
+                        replace(viewed_asset(hidden_ids[2], "hidden.jpg"), visibility="hidden"),
+                        replace(viewed_asset(hidden_ids[3], "unknown.jpg"), size=None),
+                    ]
+                )
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+
+                all_directory = catalog.lookup(1, "All")
+                assert all_directory is not None
+                self.assertEqual(
+                    [entry.name for entry in catalog.children(all_directory.inode)],
+                    ["photo.jpg"],
+                )
+                for asset_id in hidden_ids:
+                    self.assertEqual(catalog.aliases(asset_id), ())
+                    entry = catalog.by_id(asset_id)
+                    assert entry is not None
+                    self.assertIsNone(catalog.node(entry.inode))
+
+    def test_namespace_date_directory_identity_survives_empty_and_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset()])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                by_date = catalog.lookup(1, "by Date")
+                assert by_date is not None
+                year = catalog.lookup(by_date.inode, "2026")
+                assert year is not None
+                month = catalog.lookup(year.inode, "08")
+                assert month is not None
+                original = catalog.lookup(month.inode, "25")
+                assert original is not None
+
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset(local_date=None)])
+                catalog.finish_incremental(high_water_ms=2)
+                self.assertIsNone(catalog.lookup(month.inode, "25"))
+
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset()])
+                catalog.finish_incremental(high_water_ms=3)
+                returned = catalog.lookup(month.inode, "25")
+                self.assertEqual(returned and returned.inode, original.inode)
+
+    def test_incremental_upload_trash_and_restore_reproject_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset(local_date="2026-08-25")])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+
+                catalog.begin_refresh()
+                catalog.stage(
+                    [viewed_asset(local_date="2026-08-26", is_favorite=True)]
+                )
+                catalog.finish_incremental(high_water_ms=2)
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (
+                        PurePosixPath("All/photo.jpg"),
+                        PurePosixPath("Favorites/photo.jpg"),
+                        PurePosixPath("by Date/2026/08/26/photo.jpg"),
+                    ),
+                )
+
+                catalog.mark_trashed(ASSET_ID)
+                self.assertEqual(catalog.aliases(ASSET_ID), ())
+                catalog.mark_restored(ASSET_ID)
+                self.assertEqual(len(catalog.aliases(ASSET_ID)), 3)
+
+                uploaded = catalog.add_uploaded(
+                    viewed_asset(OTHER_ID, "upload.jpg", local_date="2026-08-27"),
+                    "upload.jpg",
+                )
+                self.assertEqual(
+                    catalog.aliases(uploaded.asset.id),
+                    (
+                        PurePosixPath("All/upload.jpg"),
+                        PurePosixPath("by Date/2026/08/27/upload.jpg"),
+                    ),
+                )
+
+    def test_namespace_and_asset_refresh_roll_back_together(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset()])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER reject_namespace_link
+                    BEFORE INSERT ON namespace_links
+                    WHEN NEW.asset_id = '{OTHER_ID}'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced namespace failure');
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset(OTHER_ID, "other.jpg")])
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "forced namespace"):
+                    catalog.finish_refresh(high_water_ms=2, page_count=1)
+
+                self.assertEqual(catalog.refresh_state(), (1, 1))
+                self.assertEqual(
+                    catalog.aliases(ASSET_ID),
+                    (
+                        PurePosixPath("All/photo.jpg"),
+                        PurePosixPath("by Date/2026/08/25/photo.jpg"),
+                    ),
+                )
+                self.assertIsNone(catalog.by_id(OTHER_ID))
+
+    def test_offline_profile_rejects_a_corrupt_namespace_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.db"
+            profile = trusted_profile()
+            with Catalog(database) as catalog:
+                catalog.begin_refresh()
+                catalog.stage([viewed_asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=profile,
+                )
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "DELETE FROM namespace_links WHERE asset_id = ?", (ASSET_ID,)
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Catalog(database) as catalog, self.assertRaisesRegex(
+                ValueError, r"^catalog is not trusted for offline use$"
+            ):
+                catalog.require_offline_profile(profile)
+
+    def test_version_two_offline_profile_accepts_complete_relation_projection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = rich_profile()
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                )
+                catalog.replace_album_people(
+                    albums=(album(), album(OTHER_ALBUM_ID, "Empty")),
+                    album_memberships=((ALBUM_ID, ASSET_ID),),
+                    people=(person(),),
+                    person_memberships=((PERSON_ID, ASSET_ID),),
+                    trusted_profile=profile,
+                )
+
+                self.assertIsNone(catalog.require_offline_profile(profile))
+
+    def test_offline_profile_rejects_corrupt_relation_inventory(self) -> None:
+        corruptions = (
+            f"""
+            DELETE FROM namespace_links
+             WHERE directory_inode = (
+                SELECT inode FROM namespace_directories
+                 WHERE identity = 'album:{ALBUM_ID}'
+             )
+            """,
+            "DELETE FROM namespace_memberships",
+            f"""
+            UPDATE namespace_directories SET active = 0
+             WHERE identity = 'album:{ALBUM_ID}'
+            """,
+            f"""
+            UPDATE namespace_directories
+               SET parent_inode = (
+                    SELECT inode FROM namespace_directories
+                     WHERE identity = 'view:people'
+               )
+             WHERE identity = 'album:{ALBUM_ID}'
+            """,
+            f"""
+            UPDATE namespace_directories SET name = '.'
+             WHERE identity = 'album:{ALBUM_ID}'
+            """,
+            f"""
+            INSERT INTO namespace_memberships(directory_inode, asset_id)
+            SELECT inode, '{OTHER_ID}' FROM namespace_directories
+             WHERE identity = 'album:{ALBUM_ID}'
+            """,
+        )
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "catalog.db"
+                profile = rich_profile()
+                with Catalog(database) as catalog:
+                    catalog.begin_refresh()
+                    catalog.stage([asset()])
+                    catalog.finish_refresh(
+                        high_water_ms=1,
+                        page_count=1,
+                    )
+                    catalog.replace_album_people(
+                        albums=(album(),),
+                        album_memberships=((ALBUM_ID, ASSET_ID),),
+                        people=(person(),),
+                        person_memberships=((PERSON_ID, ASSET_ID),),
+                        trusted_profile=profile,
+                    )
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute(corruption)
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                with Catalog(database) as catalog, self.assertRaisesRegex(
+                    ValueError, r"^catalog is not trusted for offline use$"
+                ):
+                    catalog.require_offline_profile(profile)
+
+    def test_version_one_offline_profile_remains_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "catalog.db"
             profile = trusted_profile()
@@ -70,6 +1039,18 @@ class CatalogTest(unittest.TestCase):
                     self.assertIsNone(catalog.require_offline_profile(profile))
 
                 compare_digest.assert_called_once_with("a" * 64, "a" * 64)
+
+    def test_trusted_profile_versions_require_their_exact_permission_policy(self) -> None:
+        self.assertEqual(trusted_profile().format_version, 1)
+        self.assertEqual(rich_profile().format_version, 2)
+        for values in (
+            {"format_version": 0},
+            {"format_version": 3},
+            {"format_version": 1, "read_permissions": RICH_READ_SCOPES},
+            {"format_version": 2, "read_permissions": READ_SCOPES},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                trusted_profile(**values)
 
     def test_offline_profile_rejects_every_authority_mismatch_with_one_message(
         self,
@@ -211,6 +1192,80 @@ class CatalogTest(unittest.TestCase):
                 catalog.stage([asset(OTHER_ID, "other.jpg")])
                 catalog.finish_refresh(high_water_ms=2, page_count=1)
                 self.assertEqual(catalog.trusted_profile(), profile)
+
+    def test_asset_refresh_rejects_version_two_trust_before_catalog_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                version_one = trusted_profile()
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(
+                    high_water_ms=1,
+                    page_count=1,
+                    trusted_profile=version_one,
+                )
+                original = catalog.by_id(ASSET_ID)
+
+                catalog.begin_refresh()
+                catalog.stage(
+                    [replace(asset(), updated_at="2026-08-27T12:00:00Z")]
+                )
+                with self.assertRaisesRegex(ValueError, "only a version 1"):
+                    catalog.finish_refresh(
+                        high_water_ms=2,
+                        page_count=1,
+                        trusted_profile=rich_profile(),
+                    )
+
+                self.assertEqual(catalog.by_id(ASSET_ID), original)
+                self.assertEqual(catalog.trusted_profile(), version_one)
+                self.assertEqual(catalog.refresh_state(), (1, 1))
+
+                next_version_one = trusted_profile(read_key_sha256="b" * 64)
+                catalog.finish_refresh(
+                    high_water_ms=2,
+                    page_count=1,
+                    trusted_profile=next_version_one,
+                )
+                current = catalog.by_id(ASSET_ID)
+                assert current is not None
+                self.assertEqual(
+                    current.asset.updated_at,
+                    "2026-08-27T12:00:00Z",
+                )
+                self.assertEqual(catalog.trusted_profile(), next_version_one)
+
+    def test_asset_refresh_cannot_downgrade_published_rich_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset()])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                catalog.replace_album_people(
+                    albums=(album(),),
+                    album_memberships=((ALBUM_ID, ASSET_ID),),
+                    people=(),
+                    person_memberships=(),
+                    trusted_profile=rich_profile(),
+                )
+                original = catalog.by_id(ASSET_ID)
+
+                catalog.begin_refresh()
+                catalog.stage(
+                    [replace(asset(), updated_at="2026-08-27T12:00:00Z")]
+                )
+                with self.assertRaisesRegex(ValueError, "downgrade"):
+                    catalog.finish_refresh(
+                        high_water_ms=2,
+                        page_count=1,
+                        trusted_profile=trusted_profile(),
+                    )
+
+                self.assertEqual(catalog.by_id(ASSET_ID), original)
+                self.assertEqual(catalog.trusted_profile(), rich_profile())
+                self.assertEqual(catalog.refresh_state(), (1, 1))
 
     def test_trusted_profile_rejects_invalid_authority_fields(self) -> None:
         invalid = (
@@ -643,14 +1698,14 @@ class CatalogTest(unittest.TestCase):
                 catalog.begin_refresh()
                 catalog.stage([asset()])
                 catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
-                first = catalog.by_name("photo.jpg")
+                first = catalog.by_id(ASSET_ID)
                 assert first is not None
 
                 catalog.begin_refresh()
                 catalog.stage([asset(), asset(OTHER_ID)])
                 catalog.finish_refresh(high_water_ms=1_787_659_200_000, page_count=1)
                 existing = catalog.by_inode(first.inode)
-                added = catalog.by_name(f"photo__{OTHER_ID}.jpg")
+                added = catalog.by_id(OTHER_ID)
 
                 self.assertEqual(existing and existing.name, "photo.jpg")
                 self.assertEqual(existing and existing.asset.id, ASSET_ID)
@@ -692,7 +1747,7 @@ class CatalogTest(unittest.TestCase):
                 catalog.begin_refresh()
                 catalog.stage([asset(), asset(OTHER_ID, "other.jpg")])
                 catalog.finish_refresh(high_water_ms=1000, page_count=2)
-                before = catalog.by_name("photo.jpg")
+                before = catalog.by_id(ASSET_ID)
                 assert before is not None
 
                 catalog.begin_refresh()
@@ -710,7 +1765,7 @@ class CatalogTest(unittest.TestCase):
                 after = catalog.by_inode(before.inode)
                 self.assertEqual(after and after.name, "photo.jpg")
                 self.assertEqual(after and after.asset.original_name, "renamed.jpg")
-                self.assertIsNotNone(catalog.by_name("other.jpg"))
+                self.assertIsNotNone(catalog.by_id(OTHER_ID))
                 self.assertEqual(catalog.refresh_state(), (2000, 2))
 
     def test_complete_refresh_replaces_a_newer_cursor(self) -> None:

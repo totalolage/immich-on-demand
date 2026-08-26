@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pyfuse3
 import trio
 
-from immich_on_demand.catalog import CatalogAsset
+from immich_on_demand.catalog import Catalog, CatalogAsset, CatalogDirectory
 from immich_on_demand.filesystem import ImmichFilesystem
 from immich_on_demand.model import Asset
 from immich_on_demand.uploads import UploadErrorCode, UploadQueue, UploadState
@@ -40,6 +40,8 @@ def catalog_entry() -> CatalogAsset:
             False,
             False,
             None,
+            local_date="2026-08-25",
+            is_favorite=True,
         ),
         2,
         "photo.jpg",
@@ -60,20 +62,11 @@ class Cache:
 
 class FakeLibrary:
     def __init__(self) -> None:
-        self.entries = {"photo.jpg": catalog_entry()}
         self.content_cache = Cache()
         self.reads = 0
         self.trashes: list[CatalogAsset] = []
         self.trash_error: Exception | None = None
         self.mutation_enabled = True
-
-    def list(self) -> list[CatalogAsset]:
-        return list(self.entries.values())
-
-    def lookup(self, identity: str | int) -> CatalogAsset | None:
-        if isinstance(identity, str):
-            return self.entries.get(identity)
-        return next((entry for entry in self.entries.values() if entry.inode == identity), None)
 
     async def read(self, entry: CatalogAsset, offset: int, size: int) -> bytes:
         self.reads += 1
@@ -89,7 +82,18 @@ class FakeLibrary:
         if self.trash_error is not None:
             raise self.trash_error
         self.trashes.append(entry)
-        self.entries.pop(entry.name)
+
+
+def view_inode(filesystem: ImmichFilesystem, name: str) -> int:
+    node = filesystem.catalog.lookup(pyfuse3.ROOT_INODE, name)
+    assert isinstance(node, CatalogDirectory)
+    return node.inode
+
+
+def asset_inode(filesystem: ImmichFilesystem, name: str = "photo.jpg") -> int:
+    node = filesystem.catalog.lookup(view_inode(filesystem, "All"), name)
+    assert node is not None
+    return node.inode
 
 
 class FilesystemTest(unittest.TestCase):
@@ -103,8 +107,14 @@ class FilesystemTest(unittest.TestCase):
     ) -> tuple[ImmichFilesystem, UploadQueue]:
         queue = UploadQueue(root, minimum_free_bytes=minimum_free_bytes)
         self.addCleanup(queue.close)
+        catalog = Catalog(root.parent / f"{root.name}-catalog.db")
+        self.addCleanup(catalog.close)
+        catalog.begin_refresh()
+        catalog.stage([catalog_entry().asset])
+        catalog.finish_refresh(high_water_ms=1, page_count=1)
         filesystem = ImmichFilesystem(
             library,  # type: ignore[arg-type]
+            catalog,
             queue,
             ORIGIN,
             OWNER_ID,
@@ -112,33 +122,145 @@ class FilesystemTest(unittest.TestCase):
         )
         return filesystem, queue
 
-    def test_metadata_lookup_and_listing_do_not_hydrate(self) -> None:
+    def test_multiview_metadata_reuses_the_asset_inode_without_hydration(self) -> None:
         async def scenario(root: Path) -> None:
             library = FakeLibrary()
             filesystem, _ = self.filesystem(library, root / "recovery")
 
-            root_attr = await filesystem.getattr(pyfuse3.ROOT_INODE, None)  # type: ignore[arg-type]
-            file_attr = await filesystem.lookup(
-                pyfuse3.ROOT_INODE, b"photo.jpg", None  # type: ignore[arg-type]
-            )
-            replies: list[tuple[bytes, int]] = []
+            replies: list[tuple[bytes, int, int]] = []
 
-            def reply(token: object, name: bytes, attr: pyfuse3.EntryAttributes, next_id: int) -> bool:
-                replies.append((name, attr.st_ino))
+            def reply(
+                token: object,
+                name: bytes,
+                attr: pyfuse3.EntryAttributes,
+                next_id: int,
+            ) -> bool:
+                replies.append((name, attr.st_ino, attr.st_nlink))
                 return True
 
-            with patch("immich_on_demand.filesystem.pyfuse3.readdir_reply", side_effect=reply):
-                handle = await filesystem.opendir(
+            with patch(
+                "immich_on_demand.filesystem.pyfuse3.readdir_reply",
+                side_effect=reply,
+            ):
+                root_handle = await filesystem.opendir(
                     pyfuse3.ROOT_INODE, None  # type: ignore[arg-type]
                 )
-                await filesystem.readdir(handle, 0, object())  # type: ignore[arg-type]
-                await filesystem.releasedir(handle)
+                await filesystem.readdir(root_handle, 0, object())  # type: ignore[arg-type]
+                await filesystem.releasedir(root_handle)
 
-            self.assertTrue(stat.S_ISDIR(root_attr.st_mode))
-            self.assertEqual(file_attr.st_size, 5)
-            self.assertEqual(replies, [(b"photo.jpg", 2)])
+            self.assertEqual(
+                [name for name, _, _ in replies],
+                [b"Albums", b"All", b"Favorites", b"People", b"by Date"],
+            )
+            all_attributes = await filesystem.lookup(
+                pyfuse3.ROOT_INODE, b"All", None  # type: ignore[arg-type]
+            )
+            file_attributes = await filesystem.lookup(
+                all_attributes.st_ino, b"photo.jpg", None  # type: ignore[arg-type]
+            )
+            favorite_attributes = await filesystem.lookup(
+                pyfuse3.ROOT_INODE, b"Favorites", None  # type: ignore[arg-type]
+            )
+            favorite_file = await filesystem.lookup(
+                favorite_attributes.st_ino, b"photo.jpg", None  # type: ignore[arg-type]
+            )
+            by_date = await filesystem.lookup(
+                pyfuse3.ROOT_INODE, b"by Date", None  # type: ignore[arg-type]
+            )
+            year = await filesystem.lookup(
+                by_date.st_ino, b"2026", None  # type: ignore[arg-type]
+            )
+            month = await filesystem.lookup(
+                year.st_ino, b"08", None  # type: ignore[arg-type]
+            )
+            day = await filesystem.lookup(
+                month.st_ino, b"25", None  # type: ignore[arg-type]
+            )
+            dated_file = await filesystem.lookup(
+                day.st_ino, b"photo.jpg", None  # type: ignore[arg-type]
+            )
+            replies.clear()
+            with patch(
+                "immich_on_demand.filesystem.pyfuse3.readdir_reply",
+                side_effect=reply,
+            ):
+                all_handle = await filesystem.opendir(
+                    all_attributes.st_ino, None  # type: ignore[arg-type]
+                )
+                await filesystem.readdir(all_handle, 0, object())  # type: ignore[arg-type]
+                await filesystem.releasedir(all_handle)
+            self.assertEqual(
+                replies,
+                [(b"photo.jpg", file_attributes.st_ino, 3)],
+            )
+            self.assertEqual(
+                {
+                    file_attributes.st_ino,
+                    favorite_file.st_ino,
+                    dated_file.st_ino,
+                },
+                {file_attributes.st_ino},
+            )
+            self.assertEqual(file_attributes.st_nlink, 3)
+            self.assertEqual(favorite_file.st_nlink, 3)
+            self.assertEqual(dated_file.st_nlink, 3)
+            inode_attributes = await filesystem.getattr(
+                file_attributes.st_ino, None  # type: ignore[arg-type]
+            )
+            self.assertEqual(inode_attributes.st_ino, file_attributes.st_ino)
+            self.assertEqual(inode_attributes.st_nlink, file_attributes.st_nlink)
             self.assertEqual(library.reads, 0)
             self.assertEqual(library.content_cache.acquired, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_only_all_accepts_staged_uploads_and_invalidates_its_entry(self) -> None:
+        async def scenario(root: Path) -> None:
+            filesystem, _ = self.filesystem(FakeLibrary(), root / "recovery")
+            all_attributes = await filesystem.lookup(
+                pyfuse3.ROOT_INODE, b"All", None  # type: ignore[arg-type]
+            )
+            favorites = await filesystem.lookup(
+                pyfuse3.ROOT_INODE, b"Favorites", None  # type: ignore[arg-type]
+            )
+
+            for parent in (pyfuse3.ROOT_INODE, favorites.st_ino):
+                with self.assertRaises(pyfuse3.FUSEError) as denied:
+                    await filesystem.create(
+                        parent,
+                        b"new.jpg",
+                        0o600,
+                        os.O_WRONLY,
+                        None,  # type: ignore[arg-type]
+                    )
+                self.assertEqual(denied.exception.errno, errno.EROFS)
+
+            info, attributes = await filesystem.create(
+                all_attributes.st_ino,
+                b"new.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            staged = await filesystem.lookup(
+                all_attributes.st_ino, b"new.jpg", None  # type: ignore[arg-type]
+            )
+            self.assertEqual(staged.st_ino, attributes.st_ino)
+            with self.assertRaises(pyfuse3.FUSEError) as absent:
+                await filesystem.lookup(
+                    favorites.st_ino, b"new.jpg", None  # type: ignore[arg-type]
+                )
+            self.assertEqual(absent.exception.errno, errno.ENOENT)
+
+            await filesystem.write(info.fh, 0, b"new")
+            with patch(
+                "immich_on_demand.filesystem.pyfuse3.invalidate_entry"
+            ) as invalidate:
+                await filesystem.release(info.fh)
+            invalidate.assert_called_once_with(
+                all_attributes.st_ino, b"new.jpg", attributes.st_ino
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -147,24 +269,26 @@ class FilesystemTest(unittest.TestCase):
         async def scenario(root: Path) -> None:
             library = FakeLibrary()
             filesystem, _ = self.filesystem(library, root / "recovery")
-            info = await filesystem.open(2, os.O_RDONLY, None)  # type: ignore[arg-type]
+            inode = asset_inode(filesystem)
+            all_inode = view_inode(filesystem, "All")
+            info = await filesystem.open(inode, os.O_RDONLY, None)  # type: ignore[arg-type]
 
             self.assertEqual(library.content_cache.acquired, [ASSET_ID])
             self.assertFalse(info.keep_cache)
             self.assertEqual(await filesystem.read(info.fh, 1, 3), b"ell")
             await filesystem.release(info.fh)
             self.assertEqual(library.content_cache.released, [ASSET_ID])
-            reopened = await filesystem.open(2, os.O_RDONLY, None)  # type: ignore[arg-type]
+            reopened = await filesystem.open(inode, os.O_RDONLY, None)  # type: ignore[arg-type]
             self.assertFalse(reopened.keep_cache)
             await filesystem.release(reopened.fh)
             self.assertEqual(library.content_cache.acquired, [ASSET_ID, ASSET_ID])
             self.assertEqual(library.content_cache.released, [ASSET_ID, ASSET_ID])
             with self.assertRaises(pyfuse3.FUSEError) as denied:
-                await filesystem.open(2, os.O_WRONLY, None)  # type: ignore[arg-type]
+                await filesystem.open(inode, os.O_WRONLY, None)  # type: ignore[arg-type]
             self.assertEqual(denied.exception.errno, errno.EROFS)
             with self.assertRaises(pyfuse3.FUSEError) as existing:
                 await filesystem.create(
-                    pyfuse3.ROOT_INODE,
+                    all_inode,
                     b"photo.jpg",
                     0o600,
                     os.O_WRONLY,
@@ -174,7 +298,7 @@ class FilesystemTest(unittest.TestCase):
             library.mutation_enabled = False
             with self.assertRaises(pyfuse3.FUSEError) as read_only:
                 await filesystem.create(
-                    pyfuse3.ROOT_INODE,
+                    all_inode,
                     b"new.jpg",
                     0o600,
                     os.O_WRONLY,
@@ -192,7 +316,9 @@ class FilesystemTest(unittest.TestCase):
 
             with self.assertRaises(pyfuse3.FUSEError) as rejected:
                 await filesystem.open(
-                    2, os.O_RDONLY | os.O_NOATIME, None  # type: ignore[arg-type]
+                    asset_inode(filesystem),
+                    os.O_RDONLY | os.O_NOATIME,
+                    None,  # type: ignore[arg-type]
                 )
 
             self.assertEqual(rejected.exception.errno, errno.EOPNOTSUPP)
@@ -211,7 +337,11 @@ class FilesystemTest(unittest.TestCase):
                 library, recovery, on_pending=lambda: wakes.append(None)
             )
             info, attributes = await filesystem.create(
-                pyfuse3.ROOT_INODE, b"new.jpg", 0o644, os.O_WRONLY, None  # type: ignore[arg-type]
+                view_inode(filesystem, "All"),
+                b"new.jpg",
+                0o644,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
             )
 
             self.assertEqual(await filesystem.write(info.fh, 0, b"hello"), 5)
@@ -231,7 +361,9 @@ class FilesystemTest(unittest.TestCase):
             self.assertEqual(wakes, [None])
             with self.assertRaises(pyfuse3.FUSEError) as missing:
                 await filesystem.lookup(
-                    pyfuse3.ROOT_INODE, b"new.jpg", None  # type: ignore[arg-type]
+                    view_inode(filesystem, "All"),
+                    b"new.jpg",
+                    None,  # type: ignore[arg-type]
                 )
             self.assertEqual(missing.exception.errno, errno.ENOENT)
 
@@ -254,7 +386,7 @@ class FilesystemTest(unittest.TestCase):
             library = FakeLibrary()
             filesystem, queue = self.filesystem(library, root / "recovery")
             creator, attributes = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"shared.jpg",
                 0o600,
                 os.O_RDWR,
@@ -283,7 +415,7 @@ class FilesystemTest(unittest.TestCase):
         async def scenario(root: Path) -> None:
             filesystem, queue = self.filesystem(FakeLibrary(), root / "recovery")
             first, _ = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"reserved.jpg",
                 0o600,
                 os.O_WRONLY,
@@ -295,7 +427,7 @@ class FilesystemTest(unittest.TestCase):
 
             with self.assertRaises(pyfuse3.FUSEError) as duplicate:
                 await filesystem.create(
-                    pyfuse3.ROOT_INODE,
+                    view_inode(filesystem, "All"),
                     b"reserved.jpg",
                     0o600,
                     os.O_WRONLY,
@@ -314,7 +446,7 @@ class FilesystemTest(unittest.TestCase):
             library = FakeLibrary()
             filesystem, queue = self.filesystem(library, root / "recovery")
             creator, attributes = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"flags.jpg",
                 0o600,
                 os.O_RDWR,
@@ -350,7 +482,7 @@ class FilesystemTest(unittest.TestCase):
             library = FakeLibrary()
             filesystem, queue = self.filesystem(library, root / "recovery")
             info, attributes = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"metadata.jpg",
                 0o644,
                 os.O_RDWR,
@@ -405,7 +537,11 @@ class FilesystemTest(unittest.TestCase):
             )
             with self.assertRaises(pyfuse3.FUSEError) as remote:
                 await filesystem.setattr(
-                    2, requested, remote_fields, None, None  # type: ignore[arg-type]
+                    asset_inode(filesystem),
+                    requested,
+                    remote_fields,
+                    None,
+                    None,  # type: ignore[arg-type]
                 )
             self.assertEqual(remote.exception.errno, errno.EROFS)
 
@@ -447,7 +583,7 @@ class FilesystemTest(unittest.TestCase):
                 library, recovery, on_pending=broken_callback
             )
             info, _ = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"committed.jpg",
                 0o600,
                 os.O_WRONLY,
@@ -488,7 +624,7 @@ class FilesystemTest(unittest.TestCase):
                     recovery = root / name
                     filesystem, queue = self.filesystem(library, recovery)
                     info, _ = await filesystem.create(
-                        pyfuse3.ROOT_INODE,
+                        view_inode(filesystem, "All"),
                         name.encode(),
                         0o600,
                         os.O_WRONLY,
@@ -529,7 +665,7 @@ class FilesystemTest(unittest.TestCase):
             library = FakeLibrary()
             filesystem, queue = self.filesystem(library, root / "recovery")
             info, _ = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"failed.jpg",
                 0o600,
                 os.O_WRONLY,
@@ -562,7 +698,7 @@ class FilesystemTest(unittest.TestCase):
             recovery = root / "recovery"
             filesystem, queue = self.filesystem(library, recovery)
             info, attributes = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"truncate.jpg",
                 0o600,
                 os.O_WRONLY,
@@ -602,7 +738,7 @@ class FilesystemTest(unittest.TestCase):
             recovery = root / "recovery"
             filesystem, queue = self.filesystem(library, recovery)
             info, attributes = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"metadata-failure.jpg",
                 0o600,
                 os.O_WRONLY,
@@ -655,7 +791,7 @@ class FilesystemTest(unittest.TestCase):
             recovery = root / ("setattr" if via_setattr else "open")
             filesystem, queue = self.filesystem(library, recovery)
             info, attributes = await filesystem.create(
-                pyfuse3.ROOT_INODE,
+                view_inode(filesystem, "All"),
                 b"sticky.jpg",
                 0o600,
                 os.O_WRONLY,
@@ -719,14 +855,44 @@ class FilesystemTest(unittest.TestCase):
             library = FakeLibrary()
             library.trash_error = PermissionError("remote deletion disabled")
             filesystem, _ = self.filesystem(library, root / "recovery")
+            all_inode = view_inode(filesystem, "All")
+            favorites_inode = view_inode(filesystem, "Favorites")
+
+            for parent in (pyfuse3.ROOT_INODE, favorites_inode):
+                with self.assertRaises(pyfuse3.FUSEError) as read_only:
+                    await filesystem.unlink(
+                        parent, b"photo.jpg", None  # type: ignore[arg-type]
+                    )
+                self.assertEqual(read_only.exception.errno, errno.EROFS)
+
+            with self.assertRaises(pyfuse3.FUSEError) as missing:
+                await filesystem.unlink(
+                    all_inode, b"missing.jpg", None  # type: ignore[arg-type]
+                )
+            self.assertEqual(missing.exception.errno, errno.ENOENT)
+
+            staged, _ = await filesystem.create(
+                all_inode,
+                b"staged.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            with self.assertRaises(pyfuse3.FUSEError) as busy:
+                await filesystem.unlink(
+                    all_inode, b"staged.jpg", None  # type: ignore[arg-type]
+                )
+            self.assertEqual(busy.exception.errno, errno.EBUSY)
+            with patch("immich_on_demand.filesystem.pyfuse3.invalidate_entry"):
+                await filesystem.release(staged.fh)
 
             with self.assertRaises(pyfuse3.FUSEError) as guarded:
                 await filesystem.unlink(
-                    pyfuse3.ROOT_INODE, b"photo.jpg", None  # type: ignore[arg-type]
+                    all_inode, b"photo.jpg", None  # type: ignore[arg-type]
                 )
             self.assertEqual(guarded.exception.errno, errno.EPERM)
             library.trash_error = None
-            await filesystem.unlink(pyfuse3.ROOT_INODE, b"photo.jpg", None)  # type: ignore[arg-type]
+            await filesystem.unlink(all_inode, b"photo.jpg", None)  # type: ignore[arg-type]
             self.assertEqual([entry.name for entry in library.trashes], ["photo.jpg"])
 
             for operation in (

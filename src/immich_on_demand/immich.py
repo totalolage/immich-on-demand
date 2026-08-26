@@ -17,11 +17,14 @@ from uuid import UUID
 import httpx
 import trio
 
-from .model import Asset, timestamp_nanoseconds
+from .model import Album, Asset, Person, timestamp_nanoseconds
 
 
-READ_PERMISSIONS = frozenset({"user.read", "asset.read", "asset.view", "asset.download"})
-UPLOAD_PERMISSIONS = READ_PERMISSIONS | {"asset.upload"}
+CORE_READ_PERMISSIONS = frozenset(
+    {"user.read", "asset.read", "asset.view", "asset.download"}
+)
+READ_PERMISSIONS = CORE_READ_PERMISSIONS | {"album.read", "person.read"}
+UPLOAD_PERMISSIONS = CORE_READ_PERMISSIONS | {"asset.upload"}
 MUTATION_PERMISSIONS = UPLOAD_PERMISSIONS | {"asset.delete"}
 LOGGER = logging.getLogger(__name__)
 UPLOAD_MARKER_KEY = "immich-on-demand.upload"
@@ -229,6 +232,8 @@ class ImmichClient:
         owner_id: str,
         page_size: int = 1000,
         *,
+        album_id: str | None = None,
+        with_people: bool = False,
         updated_after_ms: int | None = None,
         allow_duplicate_ids: bool = False,
         page_limit: int | None = None,
@@ -236,6 +241,17 @@ class ImmichClient:
         UUID(owner_id)
         if type(page_size) is not int or not 1 <= page_size <= 1000:
             raise ValueError("page_size must be between 1 and 1000")
+        if album_id is not None:
+            if not isinstance(album_id, str):
+                raise ValueError("album_id must be a canonical UUID")
+            try:
+                canonical_album_id = str(UUID(album_id))
+            except ValueError as error:
+                raise ValueError("album_id must be a canonical UUID") from error
+            if album_id != canonical_album_id:
+                raise ValueError("album_id must be a canonical UUID")
+        if type(with_people) is not bool:
+            raise ValueError("with_people must be a boolean")
         if updated_after_ms is not None and (
             type(updated_after_ms) is not int or updated_after_ms < 0
         ):
@@ -255,6 +271,10 @@ class ImmichClient:
                 "withDeleted": True,
                 "withStacked": True,
             }
+            if album_id is not None:
+                body["albumIds"] = [album_id]
+            if with_people:
+                body["withPeople"] = True
             if updated_after_ms is not None:
                 body["updatedAfter"] = datetime.fromtimestamp(
                     updated_after_ms / 1000, timezone.utc
@@ -271,6 +291,10 @@ class ImmichClient:
             if any(not isinstance(item, dict) for item in items):
                 raise ImmichResponseError(
                     "Immich search response contains a non-object asset"
+                )
+            if with_people and any("people" not in item for item in items):
+                raise ImmichResponseError(
+                    "Immich search response contains invalid asset people"
                 )
             count = assets_value.get("count")
             if type(count) is not int or count != len(items):
@@ -304,6 +328,108 @@ class ImmichClient:
                 return
             if page_limit is not None and page >= page_limit:
                 raise ImmichPageLimitError("Immich search exceeded its page limit")
+            page += 1
+
+    async def albums(self) -> list[Album]:
+        response = await self._request("GET", "albums")
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise ImmichResponseError("Immich returned invalid albums") from error
+        if not isinstance(value, list):
+            raise ImmichResponseError("Immich returned invalid albums")
+
+        albums: list[Album] = []
+        seen_ids: set[str] = set()
+        for item in value:
+            if not isinstance(item, dict):
+                raise ImmichResponseError("Immich returned invalid albums")
+            album_id = item.get("id")
+            name = item.get("albumName")
+            updated_at = item.get("updatedAt")
+            asset_count = item.get("assetCount")
+            if (
+                not isinstance(album_id, str)
+                or not isinstance(name, str)
+                or not isinstance(updated_at, str)
+                or type(asset_count) is not int
+                or asset_count < 0
+                or not isinstance(item.get("albumUsers"), list)
+            ):
+                raise ImmichResponseError("Immich returned invalid albums")
+            try:
+                canonical_id = str(UUID(album_id))
+                timestamp_nanoseconds(updated_at)
+            except ValueError as error:
+                raise ImmichResponseError("Immich returned invalid albums") from error
+            if canonical_id != album_id or album_id in seen_ids:
+                raise ImmichResponseError("Immich returned invalid albums")
+            seen_ids.add(album_id)
+            albums.append(Album(album_id, name, updated_at, asset_count))
+        return sorted(albums, key=lambda album: album.id)
+
+    async def people(self) -> list[Person]:
+        people: list[Person] = []
+        seen_ids: set[str] = set()
+        page = 1
+        while True:
+            response = await self._request(
+                "GET",
+                "people",
+                params={"page": page, "size": 1000, "withHidden": "false"},
+            )
+            try:
+                value = response.json()
+            except ValueError as error:
+                raise ImmichResponseError("Immich returned invalid people") from error
+            required = {"total", "hidden", "people"}
+            allowed = required | {"hasNextPage"}
+            if (
+                not isinstance(value, dict)
+                or not required.issubset(value)
+                or not set(value).issubset(allowed)
+                or type(value.get("total")) is not int
+                or value["total"] < 0
+                or type(value.get("hidden")) is not int
+                or value["hidden"] < 0
+                or not isinstance(value.get("people"), list)
+            ):
+                raise ImmichResponseError("Immich returned invalid people")
+            has_next_page = value.get("hasNextPage", False)
+            items = value["people"]
+            assert isinstance(items, list)
+            if type(has_next_page) is not bool or has_next_page and not items:
+                raise ImmichResponseError("Immich returned invalid people")
+
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ImmichResponseError("Immich returned invalid people")
+                person_id = item.get("id")
+                name = item.get("name")
+                is_hidden = item.get("isHidden")
+                updated_at = item.get("updatedAt") if "updatedAt" in item else None
+                if (
+                    not isinstance(person_id, str)
+                    or not isinstance(name, str)
+                    or type(is_hidden) is not bool
+                    or is_hidden
+                    or "updatedAt" in item
+                    and not isinstance(updated_at, str)
+                ):
+                    raise ImmichResponseError("Immich returned invalid people")
+                try:
+                    canonical_id = str(UUID(person_id))
+                    if updated_at is not None:
+                        timestamp_nanoseconds(updated_at)
+                except ValueError as error:
+                    raise ImmichResponseError("Immich returned invalid people") from error
+                if canonical_id != person_id or person_id in seen_ids:
+                    raise ImmichResponseError("Immich returned invalid people")
+                seen_ids.add(person_id)
+                people.append(Person(person_id, name, is_hidden, updated_at))
+
+            if not has_next_page:
+                return sorted(people, key=lambda person: person.id)
             page += 1
 
     async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:

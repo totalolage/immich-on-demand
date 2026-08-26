@@ -45,6 +45,38 @@ def _boolean(value: dict[str, object], name: str) -> bool:
     return result
 
 
+def _local_date(value: dict[str, object]) -> str:
+    timestamp = _string(value, "localDateTime")
+    if "T" not in timestamp:
+        raise ValueError("asset localDateTime is not a datetime")
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("asset localDateTime is not a datetime") from error
+    return parsed.date().isoformat()
+
+
+def _person_ids(value: dict[str, object]) -> tuple[str, ...]:
+    if "people" not in value:
+        return ()
+    people = value["people"]
+    if not isinstance(people, list):
+        raise ValueError("asset people is not a list")
+    person_ids: set[str] = set()
+    for person in people:
+        if not isinstance(person, dict):
+            raise ValueError("asset person is not an object")
+        person_id = _string(person, "id")
+        try:
+            canonical_id = str(UUID(person_id))
+        except ValueError as error:
+            raise ValueError("asset person id is not a UUID") from error
+        if person_id != canonical_id:
+            raise ValueError("asset person id is not canonical")
+        person_ids.add(person_id)
+    return tuple(sorted(person_ids))
+
+
 def safe_filename(original: str, asset_id: str, limit: int = 255) -> str:
     UUID(asset_id)
     if limit <= 0:
@@ -94,6 +126,22 @@ def collision_name(
 
 
 @dataclass(frozen=True, slots=True)
+class Album:
+    id: str
+    name: str
+    updated_at: str
+    asset_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class Person:
+    id: str
+    name: str
+    is_hidden: bool
+    updated_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class Asset:
     id: str
     owner_id: str
@@ -108,6 +156,9 @@ class Asset:
     is_trashed: bool
     is_offline: bool
     library_id: str | None
+    local_date: str | None = None
+    is_favorite: bool = False
+    person_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_api(cls, value: dict[str, object]) -> Asset:
@@ -150,6 +201,9 @@ class Asset:
             is_trashed=_boolean(value, "isTrashed"),
             is_offline=_boolean(value, "isOffline"),
             library_id=library_id,
+            local_date=_local_date(value),
+            is_favorite=_boolean(value, "isFavorite"),
+            person_ids=_person_ids(value),
         )
 
     @property

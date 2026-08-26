@@ -18,8 +18,20 @@ from uuid import UUID
 import pyfuse3
 import trio
 
-from .app import FullRefreshRequired, refresh_catalog, refresh_catalog_incremental
-from .catalog import Catalog, CatalogAsset, TrustedProfile
+from .app import (
+    FullRefreshRequired,
+    reconcile_album_people,
+    refresh_catalog,
+    refresh_catalog_incremental,
+)
+from .catalog import (
+    ROOT_INODE,
+    Catalog,
+    CatalogAsset,
+    CatalogDirectory,
+    CatalogFile,
+    TrustedProfile,
+)
 from .content_cache import ContentCache
 from .control import serve_control
 from .filesystem import ImmichFilesystem
@@ -108,9 +120,35 @@ def _evict_to_limits(content_cache: ContentCache, settings: Settings) -> list[st
     )
 
 
+async def _full_refresh(
+    catalog: Catalog,
+    read_client: ImmichClient,
+    read_session: ServerSession,
+    trusted_profile: TrustedProfile,
+    catalog_lock: trio.Lock,
+    mount_path: Path,
+) -> None:
+    await refresh_catalog(catalog, read_client, read_session, catalog_lock)
+    try:
+        await populate_previews(
+            catalog,
+            read_client,
+            mount_path,
+            downloads_enabled=False,
+        )
+    except Exception as error:
+        raise _PreviewSuppressionError("preview suppression failed") from error
+    await reconcile_album_people(
+        catalog,
+        read_client,
+        read_session,
+        catalog_lock,
+        trusted_profile=trusted_profile,
+    )
+
+
 async def _refresh_loop(
     catalog: Catalog,
-    library: Library,
     read_client: ImmichClient,
     read_session: ServerSession,
     trusted_profile: TrustedProfile,
@@ -127,12 +165,13 @@ async def _refresh_loop(
         full_requested[0] = False
         try:
             if force_full:
-                await refresh_catalog(
+                await _full_refresh(
                     catalog,
                     read_client,
                     read_session,
+                    trusted_profile,
                     catalog_lock,
-                    trusted_profile=trusted_profile,
+                    settings.mount_path,
                 )
             else:
                 await refresh_catalog_incremental(
@@ -144,16 +183,27 @@ async def _refresh_loop(
                 )
         except (FullRefreshRequired, ImmichPageLimitError, ImmichResponseError):
             try:
-                await refresh_catalog(
+                await _full_refresh(
                     catalog,
                     read_client,
                     read_session,
+                    trusted_profile,
                     catalog_lock,
-                    trusted_profile=trusted_profile,
+                    settings.mount_path,
                 )
+            except _PreviewSuppressionError as error:
+                LOGGER.error("preview suppression failed; terminating mount: %s", error)
+                fatal_errors.append("preview suppression failed; mount terminated")
+                pyfuse3.terminate()
+                return
             except Exception as error:
                 LOGGER.warning("background full refresh failed: %s", error)
                 continue
+        except _PreviewSuppressionError as error:
+            LOGGER.error("preview suppression failed; terminating mount: %s", error)
+            fatal_errors.append("preview suppression failed; mount terminated")
+            pyfuse3.terminate()
+            return
         except Exception as error:
             LOGGER.warning("background refresh failed: %s", error)
             continue
@@ -165,7 +215,7 @@ async def _refresh_loop(
             # Keep this as the next Trio checkpoint: populate_previews installs every
             # failure record synchronously before it starts any network work.
             await populate_previews(
-                library.list(),
+                catalog,
                 read_client,
                 settings.mount_path,
                 mount_ready=mount_ready,
@@ -179,7 +229,6 @@ async def _refresh_loop(
 
 async def _refresh_worker(
     catalog: Catalog,
-    library: Library,
     read_client: ImmichClient,
     read_session: ServerSession,
     trusted_profile: TrustedProfile,
@@ -187,7 +236,6 @@ async def _refresh_worker(
     content_cache: ContentCache,
     settings: Settings,
     mount_ready: trio.Event,
-    initial_entries: list[CatalogAsset],
     requests: trio.MemoryReceiveChannel[bool],
     full_requested: list[bool],
     fatal_errors: list[str],
@@ -195,7 +243,7 @@ async def _refresh_worker(
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> None:
     await populate_previews(
-        initial_entries,
+        catalog,
         read_client,
         settings.mount_path,
         mount_ready=mount_ready,
@@ -203,7 +251,6 @@ async def _refresh_worker(
     )
     await _refresh_loop(
         catalog,
-        library,
         read_client,
         read_session,
         trusted_profile,
@@ -255,7 +302,7 @@ async def _pin_worker(
     catalog: Catalog,
     content_cache: ContentCache,
     notifications: trio.MemoryReceiveChannel[bool],
-    pending: dict[str, CatalogAsset],
+    pending: dict[str, CatalogAsset | CatalogFile],
     inflight: set[str],
 ) -> None:
     async for _ in notifications:
@@ -442,12 +489,14 @@ async def _restore_worker(
     pending: list[_RestoreJob],
     jobs: dict[str, _RestoreJob],
     refreshes: trio.MemorySendChannel[bool],
+    on_restored: Callable[[CatalogAsset], Awaitable[None]],
 ) -> None:
     async for _ in notifications:
         while pending:
             job = pending.pop()
             try:
-                await library.remote_restore(job.asset_id)
+                entry = await library.remote_restore(job.asset_id)
+                await on_restored(entry)
             except Exception as error:
                 job.failed = True
                 LOGGER.warning("restore failed: %s", type(error).__name__)
@@ -474,6 +523,7 @@ def _trusted_profile(
         server_version=read_session.version,
         read_permissions=READ_PERMISSIONS,
         read_key_sha256=hashlib.sha256(read_key.encode("utf-8")).hexdigest(),
+        format_version=2,
     )
 
 
@@ -512,20 +562,19 @@ async def _offline_worker(
     content_cache: ContentCache,
     settings: Settings,
     mount_ready: trio.Event,
-    initial_entries: list[CatalogAsset],
     requests: trio.MemoryReceiveChannel[bool],
     full_requested: list[bool],
     fatal_errors: list[str],
     mutation_clients: list[ImmichClient],
     online: list[bool],
     pin_requests: trio.MemorySendChannel[bool],
-    pin_pending: dict[str, CatalogAsset],
+    pin_pending: dict[str, CatalogAsset | CatalogFile],
     upload_requests: trio.MemorySendChannel[bool],
     *,
     task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
 ) -> None:
     await populate_previews(
-        initial_entries,
+        catalog,
         read_client,
         settings.mount_path,
         downloads_enabled=False,
@@ -545,12 +594,13 @@ async def _offline_worker(
                 or candidate.owner_id != trusted_profile.owner_id
             ):
                 raise RuntimeError("validated server identity changed while offline")
-            await refresh_catalog(
+            await _full_refresh(
                 catalog,
                 read_client,
                 read_session,
+                candidate,
                 catalog_lock,
-                trusted_profile=candidate,
+                settings.mount_path,
             )
         except ImmichUnavailableError as error:
             LOGGER.warning("offline revalidation remains unavailable: %s", type(error).__name__)
@@ -595,7 +645,7 @@ async def _offline_worker(
             LOGGER.warning("reconnected cache eviction failed: %s", error)
         try:
             await populate_previews(
-                library.list(),
+                catalog,
                 read_client,
                 settings.mount_path,
                 mount_ready=mount_ready,
@@ -607,7 +657,6 @@ async def _offline_worker(
             return
         await _refresh_loop(
             catalog,
-            library,
             read_client,
             read_session,
             candidate,
@@ -622,19 +671,42 @@ async def _offline_worker(
         return
 
 
-def _library_name_from_uri(uri: object, mount_path: Path) -> str:
+def _catalog_file_from_uri(
+    uri: object, mount_path: Path, catalog: Catalog
+) -> CatalogFile | None:
     if not isinstance(uri, str):
-        raise ValueError("evict URI must identify a mounted file")
+        raise ValueError("URI must identify a mounted file")
     parsed = urlsplit(uri)
     if parsed.scheme != "file" or parsed.netloc or parsed.query or parsed.fragment:
-        raise ValueError("evict URI must identify a mounted file")
+        raise ValueError("URI must identify a mounted file")
     try:
-        candidate = Path(unquote_to_bytes(parsed.path).decode("utf-8"))
+        decoded = unquote_to_bytes(parsed.path).decode("utf-8")
     except UnicodeDecodeError as error:
-        raise ValueError("evict URI must identify a mounted file") from error
-    if candidate.parent != mount_path or candidate.name in {"", ".", ".."}:
-        raise ValueError("evict URI must identify a mounted file")
-    return candidate.name
+        raise ValueError("URI must identify a mounted file") from error
+    if not decoded.startswith("/") or any(
+        part in {"", ".", ".."} for part in decoded.split("/")[1:]
+    ):
+        raise ValueError("URI must identify a mounted file")
+    candidate = Path(decoded)
+    try:
+        relative = candidate.relative_to(mount_path)
+    except ValueError:
+        raise ValueError("URI must identify a mounted file") from None
+    if not relative.parts:
+        raise ValueError("URI must identify a mounted file")
+    parent = ROOT_INODE
+    for index, name in enumerate(relative.parts):
+        node = catalog.lookup(parent, name)
+        if node is None:
+            return None
+        if index == len(relative.parts) - 1:
+            if isinstance(node, CatalogFile):
+                return node
+            raise ValueError("URI must identify a mounted file")
+        if not isinstance(node, CatalogDirectory):
+            raise ValueError("URI must identify a mounted file")
+        parent = node.inode
+    raise AssertionError("nonempty mounted path did not resolve")
 
 
 async def run_service(settings: Settings) -> None:
@@ -677,12 +749,13 @@ async def run_service(settings: Settings) -> None:
                     raise RuntimeError(
                         "validated user does not match trusted catalog state"
                     )
-                await refresh_catalog(
+                await _full_refresh(
                     catalog,
                     read_client,
                     read_session,
+                    trusted_profile,
                     catalog_lock,
-                    trusted_profile=trusted_profile,
+                    settings.mount_path,
                 )
                 online = [True]
             except ImmichUnavailableError:
@@ -697,10 +770,11 @@ async def run_service(settings: Settings) -> None:
                     server_origin=settings.server_origin,
                     owner_id=stored_profile.owner_id,
                     server_version="3.0.3",
-                    read_permissions=READ_PERMISSIONS,
+                    read_permissions=stored_profile.read_permissions,
                     read_key_sha256=hashlib.sha256(
                         read_key.encode("utf-8")
                     ).hexdigest(),
+                    format_version=stored_profile.format_version,
                 )
                 catalog.require_offline_profile(trusted_profile)
                 read_session = None
@@ -724,12 +798,15 @@ async def run_service(settings: Settings) -> None:
                 mutation_session=mutation_session,
                 catalog_lock=catalog_lock,
             )
+            all_view = catalog.lookup(ROOT_INODE, "All")
+            if not isinstance(all_view, CatalogDirectory) or not all_view.mutation_root:
+                raise RuntimeError("trusted catalog All View is unavailable")
 
             requests, refreshes = trio.open_memory_channel[bool](1)
             pin_requests, pins = trio.open_memory_channel[bool](1)
             restore_requests, restores = trio.open_memory_channel[bool](1)
             upload_requests, uploads = trio.open_memory_channel[bool](1)
-            pin_pending: dict[str, CatalogAsset] = {}
+            pin_pending: dict[str, CatalogAsset | CatalogFile] = {}
             pin_inflight: set[str] = set()
             restore_pending: list[_RestoreJob] = []
             # ponytail: one terminal success per asset; replace it when the row is trashed again.
@@ -751,32 +828,46 @@ async def run_service(settings: Settings) -> None:
             fatal_errors: list[str] = []
 
             async def on_uploaded(entry: CatalogAsset) -> None:
+                invalidations: list[tuple[int, bytes]] = []
                 try:
                     if entry.asset.size is not None:
-                        source_path = settings.mount_path / entry.name
                         mtime = entry.asset.modified_ns // 1_000_000_000
-                        prepare_thumbnail_cache(
-                            source_path,
-                            mtime,
-                            entry.asset.size,
-                            retain_size=None,
-                        )
+                        aliases = catalog.aliases(entry.asset.id)
+                        if not aliases:
+                            raise ValueError("uploaded asset has no mounted aliases")
+                        for alias in aliases:
+                            if alias.name != entry.name:
+                                raise ValueError("uploaded asset alias name changed")
+                            parent_inode = ROOT_INODE
+                            for component in alias.parts[:-1]:
+                                parent = catalog.lookup(parent_inode, component)
+                                if not isinstance(parent, CatalogDirectory):
+                                    raise ValueError("uploaded asset alias is invalid")
+                                parent_inode = parent.inode
+                            prepare_thumbnail_cache(
+                                settings.mount_path.joinpath(*alias.parts),
+                                mtime,
+                                entry.asset.size,
+                                retain_size=None,
+                            )
+                            invalidations.append(
+                                (parent_inode, entry.name.encode("utf-8"))
+                            )
                 except Exception:
                     fatal_errors.append("preview suppression failed; mount terminated")
+                    pyfuse3.terminate()
                     raise _PreviewSuppressionError(
                         "preview suppression failed"
                     ) from None
-                try:
-                    await trio.to_thread.run_sync(
-                        pyfuse3.invalidate_entry,
-                        pyfuse3.ROOT_INODE,
-                        entry.name.encode("utf-8"),
-                        0,
-                    )
-                except (OSError, RuntimeError) as error:
-                    LOGGER.warning(
-                        "could not invalidate uploaded name: %s", type(error).__name__
-                    )
+                for parent_inode, name in invalidations:
+                    try:
+                        await trio.to_thread.run_sync(
+                            pyfuse3.invalidate_entry, parent_inode, name, 0
+                        )
+                    except (OSError, RuntimeError) as error:
+                        LOGGER.warning(
+                            "could not invalidate uploaded name: %s", type(error).__name__
+                        )
                 try:
                     requests.send_nowait(False)
                 except trio.WouldBlock:
@@ -798,6 +889,7 @@ async def run_service(settings: Settings) -> None:
 
             filesystem = ImmichFilesystem(
                 library,
+                catalog,
                 upload_queue,
                 settings.server_origin,
                 trusted_profile.owner_id,
@@ -930,8 +1022,7 @@ async def run_service(settings: Settings) -> None:
                     raise ValueError("describe requires 1 to 64 mounted file URIs")
                 items: list[dict[str, object]] = []
                 for uri in uris:
-                    name = _library_name_from_uri(uri, settings.mount_path)
-                    entry = library.lookup(name)
+                    entry = _catalog_file_from_uri(uri, settings.mount_path, catalog)
                     if entry is None:
                         continue
                     state = content_cache.describe(entry.asset)
@@ -989,8 +1080,9 @@ async def run_service(settings: Settings) -> None:
                         None,
                     )
                 elif set(params) == {"uri", "pinned"}:
-                    name = _library_name_from_uri(params["uri"], settings.mount_path)
-                    entry = library.lookup(name)
+                    entry = _catalog_file_from_uri(
+                        params["uri"], settings.mount_path, catalog
+                    )
                 else:
                     raise ValueError("pin requires one asset identity and a boolean state")
                 if entry is not None:
@@ -1042,8 +1134,9 @@ async def run_service(settings: Settings) -> None:
                     asset_id = params["asset"]
                     UUID(asset_id)
                 elif set(params) == {"uri"}:
-                    name = _library_name_from_uri(params["uri"], settings.mount_path)
-                    entry = library.lookup(name)
+                    entry = _catalog_file_from_uri(
+                        params["uri"], settings.mount_path, catalog
+                    )
                     if entry is None:
                         raise ValueError("unknown library entry")
                     asset_id = entry.asset.id
@@ -1100,7 +1193,6 @@ async def run_service(settings: Settings) -> None:
                     await nursery.start(
                         _refresh_worker,
                         catalog,
-                        library,
                         read_client,
                         read_session,
                         trusted_profile,
@@ -1108,7 +1200,6 @@ async def run_service(settings: Settings) -> None:
                         content_cache,
                         settings,
                         mount_ready,
-                        library.list(),
                         refreshes,
                         full_requested,
                         fatal_errors,
@@ -1129,7 +1220,6 @@ async def run_service(settings: Settings) -> None:
                         content_cache,
                         settings,
                         mount_ready,
-                        library.list(),
                         refreshes,
                         full_requested,
                         fatal_errors,
@@ -1177,6 +1267,7 @@ async def run_service(settings: Settings) -> None:
                         restore_pending,
                         restore_jobs,
                         requests,
+                        on_uploaded,
                     )
                     nursery.start_soon(
                         _upload_worker,

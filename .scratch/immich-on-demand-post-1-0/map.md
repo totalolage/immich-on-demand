@@ -2,7 +2,7 @@
 
 ## Destination
 
-Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, queued uploads, and the first desktop controls are implemented but await target acceptance. Later releases may add Views, broader media support, Asset replacement, multiple Profiles, and more platforms.
+Extend the released Flat library without weakening its safety rules. Incremental refresh, Pin, Restore, trusted offline startup, queued uploads, the first desktop controls, and rich Views are implemented but await target acceptance. Later releases may add broader media support, Asset replacement, multiple Profiles, and more platforms.
 
 ## Rules
 
@@ -33,8 +33,8 @@ Extend the released Flat library without weakening its safety rules. Incremental
 
 ### 1.3: add rich library Views
 
-- [Define the multi-View namespace](issues/09-define-the-multi-view-namespace.md)
-- [Add All, Album, People, Date, and Favorite Views](issues/10-add-rich-library-views.md)
+- [The multi-View namespace](issues/09-define-the-multi-view-namespace.md) is resolved.
+- [All, Album, People, Date, and Favorite Views](issues/10-add-rich-library-views.md) are implemented. Target read-only acceptance remains.
 
 ### 1.4: expand mutation and media behavior
 

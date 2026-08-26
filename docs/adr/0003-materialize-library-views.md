@@ -1,0 +1,3 @@
+# Materialize library Views in the catalog
+
+Store View directories and View aliases as a materialized catalog projection, and expose them through `node`, `lookup`, `children`, and `aliases`. Every alias reuses the asset's stable inode and Library name. A collection keeps its first assigned mounted name and reserves it after deletion, so refreshes and server renames do not churn paths. Only the All View accepts filesystem Upload and Remote deletion. A generic View registry and a second `apply` transaction interface would duplicate the catalog's existing refresh role without adding a second implementation.

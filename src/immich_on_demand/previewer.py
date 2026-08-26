@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -15,7 +14,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", gi.PyGIDeprecationWarning)
     from gi.repository import Gio, GLib
 
-from .catalog import CatalogAsset
+from .catalog import Catalog, CatalogAsset
 from .immich import ImmichClient
 from .thumbnails import (
     install_thumbnail,
@@ -84,7 +83,7 @@ class PreviewStats:
 
 
 async def populate_previews(
-    entries: Iterable[CatalogAsset],
+    catalog: Catalog,
     client: ImmichClient,
     mount_path: Path,
     *,
@@ -97,29 +96,34 @@ async def populate_previews(
     """Suppress desktop fallbacks, then optionally populate supported previews."""
     if concurrency < 1:
         raise ValueError("preview concurrency must be positive")
-    entries = tuple(entries)
+    entries = tuple(catalog.list_visible())
     if any(entry.asset.size is None for entry in entries):
         raise ValueError("visible catalog entries must have a size")
-    jobs: list[tuple[CatalogAsset, Path, int, int]] = []
+    jobs: list[tuple[CatalogAsset, tuple[Path, ...], int, int]] = []
     current_count = 0
     for entry in entries:
-        source_path = mount_path / entry.name
+        source_paths = tuple(mount_path / alias for alias in catalog.aliases(entry.asset.id))
+        if not source_paths:
+            raise ValueError("visible catalog entry has no namespace alias")
         mtime = entry.asset.modified_ns // 1_000_000_000
         original_size = entry.asset.size
         assert original_size is not None
         supported = entry.asset.mime_type.lower() in PREVIEW_MIME_TYPES
-        current_thumbnail = prepare_thumbnail_cache(
-            source_path,
-            mtime,
-            original_size,
-            cache_home=cache_home,
-            retain_size="large" if supported else None,
+        current_thumbnails = tuple(
+            prepare_thumbnail_cache(
+                source_path,
+                mtime,
+                original_size,
+                cache_home=cache_home,
+                retain_size="large" if supported else None,
+            )
+            for source_path in source_paths
         )
-        if current_thumbnail:
+        if supported and all(current_thumbnails):
             current_count += 1
             continue
         if supported:
-            jobs.append((entry, source_path, mtime, original_size))
+            jobs.append((entry, source_paths, mtime, original_size))
 
     task_status.started()
     job_count = len(jobs)
@@ -135,24 +139,25 @@ async def populate_previews(
     pending = deque(jobs)
     installed: set[str] = set()
 
-    async def fetch(job: tuple[CatalogAsset, Path, int, int]) -> None:
-        entry, source_path, mtime, original_size = job
+    async def fetch(job: tuple[CatalogAsset, tuple[Path, ...], int, int]) -> None:
+        entry, source_paths, mtime, original_size = job
         try:
             preview, _ = await client.thumbnail(entry.asset.id)
-            install_thumbnail(
-                preview,
-                source_path,
-                mtime,
-                original_size,
-                cache_home=cache_home,
-                size="large",
-            )
-            prepare_thumbnail_cache(
-                source_path,
-                mtime,
-                original_size,
-                cache_home=cache_home,
-            )
+            for source_path in source_paths:
+                install_thumbnail(
+                    preview,
+                    source_path,
+                    mtime,
+                    original_size,
+                    cache_home=cache_home,
+                    size="large",
+                )
+                prepare_thumbnail_cache(
+                    source_path,
+                    mtime,
+                    original_size,
+                    cache_home=cache_home,
+                )
             installed.add(entry.asset.id)
         except Exception as error:
             LOGGER.warning("preview failed for asset %s: %s", entry.asset.id, error)
@@ -162,7 +167,9 @@ async def populate_previews(
     next_sort_check = 0.0
     while pending:
         if trio.current_time() >= next_sort_check:
-            metadata = await trio.to_thread.run_sync(_read_nautilus_sort, mount_path)
+            metadata = await trio.to_thread.run_sync(
+                _read_nautilus_sort, mount_path / "All"
+            )
             if metadata != active_sort:
                 ordered_entries, supported = _order_for_nautilus(
                     tuple(job[0] for job in pending), metadata
