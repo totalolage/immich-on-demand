@@ -2,13 +2,13 @@
 
 Immich On-Demand mounts one user's Immich library as a Linux filesystem. Directory listings use a local metadata catalog. Nautilus uses Immich-generated previews, and an application downloads an original only when it reads the file.
 
-Released version 1.0 exposes a flat directory and targets Arch Linux, Niri, Nautilus 50, FUSE 3, and Immich 3.0.3. The current source tree is version 1.4.0.dev0. It implements rich Views and queued Asset replacement. Reference-system acceptance remains pending. Other systems are not tested.
+Released version 1.0 exposes a flat directory and targets Arch Linux, Niri, Nautilus 50, FUSE 3, and Immich 3.0.3. The current source tree is version 2.0.0.dev0. It adds isolated named Profiles to the rich Views and queued Asset replacement implemented in development. Reference-system acceptance remains pending. Other systems are not tested.
 
 ## Filesystem contract
 
 The released 1.0 mount contains one file for each visible asset. The first asset with a given safe basename keeps that name. Later collisions include the complete asset UUID before the extension.
 
-The 1.4 development mount has this root namespace:
+The development mount has this root namespace:
 
 ```text
 /
@@ -23,9 +23,9 @@ The 1.4 development mount has this root namespace:
 
 Existing asset inodes are immutable. Applications can list, read, and copy them through ordinary read-only opens. A read-only remote open with `O_NOATIME` returns `EOPNOTSUPP` before it can download the original. Direct overwrite, truncation, rename, link, and metadata changes return `EROFS`.
 
-Released 1.0 accepts create and unlink at the mount root. Development 1.4 accepts them only in `All`; every other View is read-only. Creating a new file stages private local bytes. Flush and `fsync` make those bytes locally durable but do not contact Immich. The last close seals a Pending upload, but the staged name and bytes remain readable until the upload finishes. One service-owned worker uploads it, verifies the returned asset, publishes the Library entry, and then removes the private copy. Temporary outages retry with bounded backoff; blocked jobs remain available for explicit Retry or confirmed Cancel. FUSE cannot report upload completion from `close`, so a successful close means only that the local Pending copy is durable.
+Released 1.0 accepts create and unlink at the mount root. Development builds accept them only in `All`; every other View is read-only. Creating a new file stages private local bytes. Flush and `fsync` make those bytes locally durable but do not contact Immich. The last close seals a Pending upload, but the staged name and bytes remain readable until the upload finishes. One service-owned worker uploads it, verifies the returned asset, publishes the Library entry, and then removes the private copy. Temporary outages retry with bounded backoff; blocked jobs remain available for explicit Retry or confirmed Cancel. FUSE cannot report upload completion from `close`, so a successful close means only that the local Pending copy is durable.
 
-Development 1.4 supports the temp-file save pattern for replacement. An application creates and writes a temporary file in `All`, then renames it over an existing `All` entry. The target immediately reads the durable local payload while the worker verifies the candidate, copies album membership, and moves the old asset to Immich trash with `force: false`. The catalog then gives the stable target name, Pin, and every View alias to the candidate's new UUID and inode. The old UUID and inode remain recorded as trashed under a collision-safe name, so Restore cannot displace the replacement.
+Development builds support the temp-file save pattern for replacement. An application creates and writes a temporary file in `All`, then renames it over an existing `All` entry. The target immediately reads the durable local payload while the worker verifies the candidate, copies album membership, and moves the old asset to Immich trash with `force: false`. The catalog then gives the stable target name, Pin, and every View alias to the candidate's new UUID and inode. The old UUID and inode remain recorded as trashed under a collision-safe name, so Restore cannot displace the replacement.
 
 Replacing a Pinned asset transfers the Pin and verifies the candidate's cached original before the queue job completes. Unpinned replacements enter the normal original cache on first read.
 
@@ -33,7 +33,7 @@ The service defers a newly sealed ordinary upload for one second so an editor ca
 
 By default, unlink is disabled. If you enable remote deletion, unlink moves an owned asset to Immich trash. The client refuses deletion when the server has disabled trash, and it never requests permanent deletion. Cache eviction is a separate local operation and never changes Immich.
 
-Released 1.0 supports Previews for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Development 1.4 installs a Preview for every alias but groups work by asset, so all aliases use at most one server Preview fetch. Its missing-preview queue follows the Nautilus sort saved for `All` and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. Development 1.4's broader image Preview behavior is described below.
+Released 1.0 supports Previews for JPEG, PNG, GIF, MP4, MOV, and M4V assets. Development builds install a Preview for every alias but group work by asset, so all aliases use at most one server Preview fetch. The missing-preview queue follows the Nautilus sort saved for `All` and reorders pending work when that sort changes. Downloads preserve original bytes in every format. Uploads accept every extension reported by the connected Immich server. The broader development image Preview behavior is described below.
 
 ## Build and install the Arch package
 
@@ -50,7 +50,18 @@ makepkg -si
 
 ## Store API keys in Secret Service
 
-The commands in this section are only for the current 1.4 development tree. Released 1.0 uses the tagged instructions linked above; do not give its mutation key the development-only `asset.copy` permission.
+The commands in this section are only for the current 2.0 development tree. Released 1.0 uses the tagged instructions linked above; do not give its mutation key the development-only `asset.copy` permission. The examples use Profile ID `home`.
+
+Publish the Profile's non-secret configuration before storing either key. Creation refuses an orphan Profile-tagged key so it cannot silently adopt unrelated local state:
+
+```bash
+immich-on-demand --profile home configure \
+  --server https://photos.example.com \
+  --mount "$HOME/Photos" \
+  --cache-max-gib 10 \
+  --cache-max-age-days 30 \
+  --minimum-free-gib 5
+```
 
 Create a read-only API key in Immich with exactly these permissions:
 
@@ -68,8 +79,9 @@ Store the key under the canonical server origin. The following command reads the
 ```bash
 read -rsp 'Read-only Immich API key: ' IMMICH_KEY && printf '\n'
 printf '%s' "$IMMICH_KEY" | secret-tool store \
-  --label='Immich On-Demand read-only API key' \
-  application immich-on-demand server https://photos.example.com purpose read-only
+  --label='Immich On-Demand home read-only API key' \
+  application immich-on-demand profile home \
+  server https://photos.example.com purpose read-only
 unset IMMICH_KEY
 ```
 
@@ -93,26 +105,21 @@ Store it with the `mutation` purpose:
 ```bash
 read -rsp 'Mutation Immich API key: ' IMMICH_KEY && printf '\n'
 printf '%s' "$IMMICH_KEY" | secret-tool store \
-  --label='Immich On-Demand mutation API key' \
-  application immich-on-demand server https://photos.example.com purpose mutation
+  --label='Immich On-Demand home mutation API key' \
+  application immich-on-demand profile home \
+  server https://photos.example.com purpose mutation
 unset IMMICH_KEY
 ```
 
-Replace `https://photos.example.com` with the configured HTTPS origin. Include a nondefault port, but do not include a path. On first use, a development build moves a version 1.0 hostname-only item for a default HTTPS origin to this canonical identity.
+Replace `home` with the selected lowercase Profile ID and `https://photos.example.com` with its configured HTTPS origin. Include a nondefault port, but do not include a path. The first 2.0 use of Profile `default` copies matching version 1.0 credentials into Profile-tagged items and retains the legacy items for rollback.
 
-## Configure and run the service
+## Validate and run the service
 
-Write the server URL, mount path, and default cache limits:
+Validate the configured Profile and its keys:
 
 ```bash
-immich-on-demand configure \
-  --server https://photos.example.com \
-  --mount "$HOME/Photos" \
-  --cache-max-gib 10 \
-  --cache-max-age-days 30 \
-  --minimum-free-gib 5
-immich-on-demand auth-check
-immich-on-demand auth-check --mutation
+immich-on-demand --profile home auth-check
+immich-on-demand --profile home auth-check --mutation
 ```
 
 The first `auth-check` validates Immich 3.0.3 and the exact read-only permissions. The second command validates the optional mutation key against the configured operations.
@@ -123,7 +130,7 @@ The released 1.0 service requires Immich to be online at startup. If Immich beco
 
 The development tree can start from trusted cached state after one successful online run. If Immich is unreachable, it mounts a safe, nonempty catalog in degraded mode. Cached originals remain readable, but uncached reads, Preview downloads, automatic Eviction, and every remote mutation stay disabled. The service retries validation and a stable full refresh in the background before it resumes network access. Observable TLS, authentication, schema, identity, version, scope, and local trust failures prevent the mount or terminate degraded mode. A server-side identity or scope change cannot be detected while the origin is unreachable; reconnection detects it before remote access resumes.
 
-Development 1.4 uses Immich's bounded generated Preview for every image MIME type, including RAW and HEIF originals. Live Photo stills retain their explicit motion-video relationship across refreshes and Views, but the mount exposes and previews only the still. Composite playback, paired export/upload, and Asset replacement of Live Photos are not implemented.
+Development builds use Immich's bounded generated Preview for every image MIME type, including RAW and HEIF originals. Live Photo stills retain their explicit motion-video relationship across refreshes and Views, but the mount exposes and previews only the still. Composite playback, paired export/upload, and Asset replacement of Live Photos are not implemented.
 
 Partial Hydration remains intentionally absent. Immich 3.0.3 does not promise Range behavior for original downloads or expose a strong byte validator or chunk hashes, so original reads continue to download, validate, and cache the complete file atomically.
 
@@ -133,30 +140,32 @@ In the development tree, routine background refreshes request only assets update
 
 Album and People relations refresh as one pair after a complete asset sweep. The catalog publishes the pair only after both server inventories validate. Incremental asset refreshes update View aliases from current asset facts but never infer Album or People relation removal.
 
-The 1.4 implementation has automated coverage. Read-only rich-View acceptance, RAW/HEIF/Live Photo acceptance, Asset-replacement acceptance with project-owned Test assets, and package lifecycle acceptance remain pending on the Reference system.
+The 2.0 implementation has automated coverage. Concurrent Profile isolation, read-only rich-View acceptance, RAW/HEIF/Live Photo acceptance, Asset-replacement acceptance with project-owned Test assets, and package lifecycle acceptance remain pending on the Reference system.
 
 To enable remote deletion and queued asset replacement, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.copy` and `asset.delete`. The service fails closed if either key has unexpected permissions.
 
 Start the filesystem as a systemd user service:
 
 ```bash
-systemctl --user enable --now immich-on-demand.service
-systemctl --user status immich-on-demand.service
+systemctl --user enable --now immich-on-demand@home.service
+systemctl --user status immich-on-demand@home.service
 ```
+
+Each Profile uses a literal `immich-on-demand@ID.service` instance, private socket, catalog, cache, upload queue, credentials, and journal stream. Equal or nested mount paths are refused. For one 2.0 release, `immich-on-demand.service` remains only as a compatibility entry point for the legacy unprofiled installation; it selects `default`, copies matching legacy credentials without deleting them, and migrates the exact local files before mounting.
 
 For foreground diagnostics, stop the user service and run:
 
 ```bash
-immich-on-demand mount
+immich-on-demand --profile home mount
 ```
 
 The following commands talk to the running service through its private Unix socket:
 
 ```bash
-immich-on-demand status
-immich-on-demand refresh
-immich-on-demand evict
-immich-on-demand evict --asset 12345678-1234-4234-8234-123456789abc
+immich-on-demand --profile home status
+immich-on-demand --profile home refresh
+immich-on-demand --profile home evict
+immich-on-demand --profile home evict --asset 12345678-1234-4234-8234-123456789abc
 ```
 
 `evict` removes complete cached originals that are not open or downloading. With no `--asset`, it evicts every eligible original. The file remains in the mount and downloads again on its next read.
@@ -164,9 +173,9 @@ immich-on-demand evict --asset 12345678-1234-4234-8234-123456789abc
 Development builds add durable upload controls:
 
 ```bash
-immich-on-demand uploads
-immich-on-demand retry-upload --id 12345678-1234-4234-8234-123456789abc
-immich-on-demand cancel-upload \
+immich-on-demand --profile home uploads
+immich-on-demand --profile home retry-upload --id 12345678-1234-4234-8234-123456789abc
+immich-on-demand --profile home cancel-upload \
   --id 12345678-1234-4234-8234-123456789abc \
   --revision 4 \
   --confirm-name 'exact original name.jpg'
@@ -175,9 +184,9 @@ immich-on-demand cancel-upload \
 Development builds also provide Pin commands:
 
 ```bash
-immich-on-demand pin --asset 12345678-1234-4234-8234-123456789abc
-immich-on-demand pin-status --asset 12345678-1234-4234-8234-123456789abc
-immich-on-demand unpin --asset 12345678-1234-4234-8234-123456789abc
+immich-on-demand --profile home pin --asset 12345678-1234-4234-8234-123456789abc
+immich-on-demand --profile home pin-status --asset 12345678-1234-4234-8234-123456789abc
+immich-on-demand --profile home unpin --asset 12345678-1234-4234-8234-123456789abc
 ```
 
 `pin` records the Pin before it downloads the original. A Pin protects a complete original from automatic and manual Eviction. If a download fails, the Pin remains and the next service start retries it. Run `pin` again to retry without restarting. The minimum free-space limit still applies.
@@ -191,7 +200,7 @@ immich-on-demand unpin --asset 12345678-1234-4234-8234-123456789abc
 Development builds also provide an explicit Restore command:
 
 ```bash
-immich-on-demand restore --asset 12345678-1234-4234-8234-123456789abc
+immich-on-demand --profile home restore --asset 12345678-1234-4234-8234-123456789abc
 ```
 
 Restore requires `--enable-remote-delete` and a mutation key with exactly `user.read`, `asset.read`, `asset.view`, `asset.download`, `asset.upload`, `asset.copy`, and `asset.delete`. The service accepts only a canonical asset UUID for a known, trashed asset owned by the mutation user. Immediately before the restore request, the client fetches the current server features and requires literal `trash: true`.
@@ -201,12 +210,12 @@ A successful response must report that Immich restored exactly one asset. The se
 After a configuration change, restart the service:
 
 ```bash
-systemctl --user restart immich-on-demand.service
+systemctl --user restart immich-on-demand@home.service
 ```
 
 ## Desktop integration in development
 
-The development tree contains a GTK 4 and libadwaita settings application plus a Nautilus 50 extension. The settings application edits the single configured server, mount, cache policy, refresh interval, and remote-delete policy. Nonblank API key fields replace the matching Secret Service item. Saving settings does not restart the service.
+The development tree contains a GTK 4 and libadwaita settings application plus a Nautilus 50 extension. Create a Profile with the CLI `configure` command; the settings application then selects one configured Profile at a time and edits its server, mount, cache policy, refresh interval, remote-delete policy, and Profile-tagged keys. Each background operation retains the Profile selected when it began. Saving settings does not restart a service.
 
 On Arch Linux, build the VCS package from the current `main` branch:
 
@@ -220,17 +229,18 @@ This installs `immich-on-demand-git`, including the desktop entry, Nautilus load
 Before uninstalling it, stop the per-user service and remove its enablement link:
 
 ```bash
-systemctl --user disable --now immich-on-demand.service
+systemctl --user disable --now immich-on-demand@home.service
 sudo pacman -Rns immich-on-demand-git
 ```
 
 The GUI Restore control accepts one asset UUID. The UUID is transient and is not saved in configuration. The GUI also lists Pending uploads and exposes Retry and confirmed Cancel. These operations use the private control socket from its bounded worker and display only fixed success or failure text.
 
-Inside the configured mount, Nautilus adds folder actions for Refresh, Settings, and Manage Pending Uploads. A one-file selection can Pin, Unpin, retry a failed pinned download, or Evict its local copy. Emblems report cached, pinned, and busy state. The extension returns no actions or emblems outside the configured mount.
+Inside every configured, non-overlapping Profile mount, Nautilus routes folder actions, menus, emblems, and result relays to that Profile's private control socket. It adds folder actions for Refresh, Settings, and Manage Pending Uploads. A one-file selection can Pin, Unpin, retry a failed pinned download, or Evict its local copy. The extension returns no actions or emblems outside configured mounts.
 
 The released version 1.0 Arch recipe does not install this desktop entry, the Nautilus loader, or the emblem icons. The following development-package checks remain open on the Reference system:
 
 - Build, install, upgrade, restart, and uninstall a package that contains the desktop files.
+- Run two configured template instances concurrently, including two Profiles for the same origin and owner, and verify separate mounts, sockets, credentials, catalogs, caches, Pending uploads, and journal units.
 - Load the extension in Nautilus 50 and verify mount scoping, menus, emblem changes, and failure behavior.
 - Save settings and replacement keys through the GUI, then restart the user service and verify the new configuration.
 - Pin one recorded Test asset, verify restart and Eviction behavior, inspect it with `pin-status`, then Unpin it. Do not use a Protected-library asset.
@@ -242,12 +252,12 @@ The released version 1.0 Arch recipe does not install this desktop entry, the Na
 
 Immich On-Demand follows the XDG base-directory variables. Without overrides, it stores local data at these paths:
 
-- Configuration: `~/.config/immich-on-demand/config.json`
-- Catalog: `~/.local/state/immich-on-demand/catalog.db`
-- Pending uploads: `~/.local/share/immich-on-demand/uploads/`
-- Complete originals: `~/.cache/immich-on-demand/originals/`
+- Configuration: `~/.config/immich-on-demand/profiles/home/config.json`
+- Catalog: `~/.local/state/immich-on-demand/profiles/home/catalog.db`
+- Pending uploads: `~/.local/share/immich-on-demand/profiles/home/uploads/`
+- Complete originals: `~/.cache/immich-on-demand/profiles/home/originals/`
 - Previews: `~/.cache/thumbnails/`
-- Control socket: `$XDG_RUNTIME_DIR/immich-on-demand/control.sock`
+- Control socket: `$XDG_RUNTIME_DIR/immich-on-demand/profiles/home/control.sock`
 
 Configured XDG base directories must be absolute paths. The service rejects a relative value before it opens local state.
 
@@ -273,7 +283,7 @@ scripts/check
 
 Version 1.0 is available on GitHub. The package has not been published to the AUR.
 
-The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, trusted offline startup, desktop controls, queued uploads, rich Views, and Asset replacement. It also tracks AUR publication, broader Preview formats, partial Hydration, multiple Profiles, and more platforms.
+The [post-1.0 roadmap](.scratch/immich-on-demand-post-1-0/map.md) records target acceptance for incremental refresh, Pin, Restore, trusted offline startup, desktop controls, queued uploads, rich Views, Asset replacement, and multiple Profiles. It also tracks AUR publication, broader Preview formats, partial Hydration, and more platforms.
 
 ## License
 

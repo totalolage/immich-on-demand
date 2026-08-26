@@ -99,9 +99,10 @@ with systemd user lingering are not supported by this decision.
 
 ### systemd user service and native packages
 
-The existing service is a `Type=exec` user unit installed in the system user-unit
-directory and enabled under `default.target`. A Debian-family package should put
-the same unit in the path reported by `pkg-config systemd --variable=systemduserunitdir`.
+The service uses one `Type=exec` template instance per Profile, plus the one-release
+`default` compatibility unit, installed in the system user-unit directory and
+enabled under `default.target`. A Debian-family package should put both units in
+the path reported by `pkg-config systemd --variable=systemduserunitdir`.
 The [systemd daemon packaging guidance](https://manpages.debian.org/trixie/systemd/daemon.7.en.html)
 defines that location, and
 [`dh_installsystemduser`](https://manpages.debian.org/trixie/debhelper/dh_installsystemduser.1.en.html)
@@ -262,10 +263,10 @@ ready for its support decision.
 | Lifecycle | Required observation |
 | --- | --- |
 | Native install | Install locally built `.deb` files with APT. APT resolves every runtime dependency from Ubuntu packages. There is no pip invocation, venv, vendored Python runtime, or local pyfuse3 build. Package-file ownership and the user-unit location are correct. The package uses `debhelper-compat (= 14)` and `dh_installsystemduser --no-enable`; a disabled, inactive unit stays inert and no unconfigured daemon starts. |
-| Configure | In a logged-in graphical session, configure the server and store read-only and mutation keys through Secret Service. No key appears in process arguments, the unit, environment files, logs, or package-owned files. |
-| First enable | Enabling and starting the user unit after configuration produces one active FUSE mount and a valid control socket under `XDG_RUNTIME_DIR`. Starting before configuration exits nonzero with a configuration error and leaves no stale mount or socket. |
+| Configure | In a logged-in graphical session, configure one explicit Profile and store its Profile-tagged read-only and mutation keys through Secret Service. No key appears in process arguments, the unit, environment files, logs, or package-owned files. |
+| First enable | Enabling and starting `immich-on-demand@ID.service` after configuration produces one active FUSE mount and that Profile's valid control socket under `XDG_RUNTIME_DIR`. Starting before configuration exits nonzero with a configuration error and leaves no stale mount or socket. |
 | File-manager behavior | Every applicable row in the file-manager matrix passes with the exact package versions in the distribution table. |
-| Service restart | Restarting the user unit cleanly unmounts and remounts the configured path. Catalog, cache, pending uploads, and secrets remain intact. No second daemon or duplicate mount survives. |
+| Service restart | Restarting one Profile instance cleanly unmounts and remounts only its configured path. Catalog, cache, pending uploads, and secrets remain intact. No second daemon or duplicate mount survives. |
 | Package upgrade | Seed a catalog, one content-cache object, one pinned object, one valid thumbnail, and one resumable pending upload. Upgrade through APT. An enabled or active unit restarts at most once; a disabled and inactive unit does not start. All hashes and user-owned state remain intact, and the pending upload resumes according to its existing recovery contract. |
 | Package removal | `apt remove` exercises the generated `deb-systemd-invoke --user stop` path for every active user manager, removes each active mount, then removes the unit, executable, desktop files, and provider installed by the package. XDG config, state, data, cache, upload recovery, Secret Service items, and any user-owned enable choice remain unchanged. Reinstall can use them. |
 | Offline restart | With a previously synchronized catalog, restart while Immich is unreachable. The mount behavior matches the project's documented offline guarantees; no package helper substitutes a different policy. |

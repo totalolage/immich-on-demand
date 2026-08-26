@@ -4,12 +4,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import gi
 import json
+from pathlib import Path
 import threading
 import time
 
 import trio
 
 from .desktop import run_action
+from .profiles import Profile, profiles
 from .settings import load
 
 gi.require_version("Gio", "2.0")
@@ -33,6 +35,7 @@ _EMBLEMS = (
 
 @dataclass(slots=True)
 class _Update:
+    profile: Profile
     provider: object
     handle: object
     closure: object
@@ -41,11 +44,26 @@ class _Update:
     completed: bool = False
 
 
-def _load_mount():
+def _load_mounts() -> tuple[tuple[Profile, object], ...]:
     try:
-        return Gio.File.new_for_path(str(load().mount_path))
+        configured: list[tuple[Profile, Path, object]] = []
+        for profile in profiles():
+            mount_path = load(profile.config / "config.json").mount_path.resolve(
+                strict=False
+            )
+            for _other_profile, other_path, _other_mount in configured:
+                if (
+                    mount_path == other_path
+                    or mount_path in other_path.parents
+                    or other_path in mount_path.parents
+                ):
+                    return ()
+            configured.append(
+                (profile, mount_path, Gio.File.new_for_path(str(mount_path)))
+            )
+        return tuple((profile, mount) for profile, _path, mount in configured)
     except Exception:
-        return None
+        return ()
 
 
 def _describe_request_size(uris: list[str]) -> int:
@@ -69,26 +87,27 @@ class NautilusExtension(
 ):
     def __init__(self) -> None:
         super().__init__()
-        self._mount = _load_mount()
+        self._mounts = _load_mounts()
         self._pending: list[_Update] = []
         self._inflight: list[_Update] = []
         self._idle_source = None
         # ponytail: one worker preserves request order; add a pool only if UI latency demands it.
         self._worker_active = False
         self._cache: OrderedDict[
-            str, tuple[float, dict[str, bool]]
+            tuple[str, str], tuple[float, dict[str, bool]]
         ] = OrderedDict()
-        self._busy_refreshes: set[str] = set()
+        self._busy_refreshes: set[tuple[str, str]] = set()
 
-    def _in_mount(self, candidate) -> bool:
-        return self._mount is not None and (
-            candidate.equal(self._mount) or candidate.has_prefix(self._mount)
-        )
+    def _profile(self, candidate) -> Profile | None:
+        for profile, mount in self._mounts:
+            if candidate.equal(mount) or candidate.has_prefix(mount):
+                return profile
+        return None
 
-    def _launch(self, *arguments: str, invalidate=None) -> None:
+    def _launch(self, profile: Profile, *arguments: str, invalidate=None) -> None:
         try:
             process = Gio.Subprocess.new(
-                [_DESKTOP_CLIENT, *arguments],
+                [_DESKTOP_CLIENT, "--profile", profile.id, *arguments],
                 Gio.SubprocessFlags.NONE,
             )
         except Exception:
@@ -96,75 +115,105 @@ class NautilusExtension(
         if invalidate is not None:
             uri, file = invalidate
             try:
-                process.wait_async(None, self._action_finished, (uri, file))
+                process.wait_async(
+                    None, self._action_finished, (profile, uri, file)
+                )
             except Exception:
-                self._invalidate(uri, file)
+                self._invalidate(profile, uri, file)
 
     def _action_finished(self, process, result, invalidate) -> None:
-        uri, file = invalidate
+        profile, uri, file = invalidate
         try:
             process.wait_finish(result)
         except Exception:
             pass
-        self._invalidate(uri, file)
+        self._invalidate(profile, uri, file)
 
-    def _invalidate(self, uri: str, file) -> None:
-        self._cache.pop(uri, None)
+    def _invalidate(self, profile: Profile, uri: str, file) -> None:
+        self._cache.pop((profile.id, uri), None)
         try:
             file.invalidate_extension_info()
         except Exception:
             pass
 
-    def _schedule_refresh(self, uri: str, file) -> None:
-        if uri in self._busy_refreshes:
+    def _schedule_refresh(self, profile: Profile, uri: str, file) -> None:
+        key = (profile.id, uri)
+        if key in self._busy_refreshes:
             return
-        self._busy_refreshes.add(uri)
+        self._busy_refreshes.add(key)
         try:
             GLib.timeout_add(
-                int(_CACHE_SECONDS * 1000), self._refresh_state, uri, file
+                int(_CACHE_SECONDS * 1000),
+                self._refresh_state,
+                profile,
+                uri,
+                file,
             )
         except Exception:
-            self._busy_refreshes.discard(uri)
+            self._busy_refreshes.discard(key)
 
-    def _refresh_state(self, uri: str, file) -> bool:
-        self._busy_refreshes.discard(uri)
-        self._invalidate(uri, file)
+    def _refresh_state(self, profile: Profile, uri: str, file) -> bool:
+        self._busy_refreshes.discard((profile.id, uri))
+        self._invalidate(profile, uri, file)
         return False
 
-    def _activate_refresh(self, _item) -> None:
-        self._launch("--action", "refresh")
+    def _activate_refresh(self, _item, profile: Profile) -> None:
+        self._launch(profile, "--action", "refresh")
 
-    def _activate_settings(self, _item) -> None:
-        self._launch()
+    def _activate_settings(self, _item, profile: Profile) -> None:
+        self._launch(profile)
 
-    def _activate_evict(self, _item, uri: str, file) -> None:
+    def _activate_evict(
+        self, _item, profile: Profile, uri: str, file
+    ) -> None:
         self._launch(
-            "--action", "evict", "--uri", uri, invalidate=(uri, file)
+            profile,
+            "--action",
+            "evict",
+            "--uri",
+            uri,
+            invalidate=(uri, file),
         )
 
-    def _activate_pin(self, _item, action: str, uri: str, file) -> None:
+    def _activate_pin(
+        self, _item, profile: Profile, action: str, uri: str, file
+    ) -> None:
         self._launch(
-            "--action", action, "--uri", uri, invalidate=(uri, file)
+            profile,
+            "--action",
+            action,
+            "--uri",
+            uri,
+            invalidate=(uri, file),
         )
         if action == "pin":
-            self._schedule_refresh(uri, file)
+            self._schedule_refresh(profile, uri, file)
 
     @staticmethod
-    def _menu_item(name: str, label: str, callback):
+    def _menu_item(name: str, label: str, callback, profile: Profile):
         item = Nautilus.MenuItem(name=f"ImmichOnDemand::{name}", label=label)
-        item.connect("activate", callback)
+        item.connect("activate", callback, profile)
         return item
 
     def get_background_items(self, current_folder) -> list:
-        if not self._in_mount(current_folder.get_location()):
+        profile = self._profile(current_folder.get_location())
+        if profile is None:
             return []
         return [
-            self._menu_item("refresh", "Refresh Immich", self._activate_refresh),
             self._menu_item(
-                "uploads", "Manage Pending Uploads", self._activate_settings
+                "refresh", "Refresh Immich", self._activate_refresh, profile
             ),
             self._menu_item(
-                "settings", "Immich On-Demand Settings", self._activate_settings
+                "uploads",
+                "Manage Pending Uploads",
+                self._activate_settings,
+                profile,
+            ),
+            self._menu_item(
+                "settings",
+                "Immich On-Demand Settings",
+                self._activate_settings,
+                profile,
             ),
         ]
 
@@ -172,23 +221,26 @@ class NautilusExtension(
         if len(files) != 1:
             return []
         file = files[0]
-        if file.is_directory() or not self._in_mount(file.get_location()):
+        profile = self._profile(file.get_location())
+        if file.is_directory() or profile is None:
             return []
         uri = file.get_uri()
-        state = self._cached_state(uri)
+        state = self._cached_state(profile, uri)
         pinned = state is not None and state["pinned"]
         action = "unpin" if pinned else "pin"
         pin = Nautilus.MenuItem(
             name="ImmichOnDemand::pin",
             label="Unpin" if action == "unpin" else "Pin for Offline Use",
         )
-        pin.connect("activate", self._activate_pin, action, uri, file)
+        pin.connect("activate", self._activate_pin, profile, action, uri, file)
         if pinned and state is not None and not state["cached"] and not state["busy"]:
             retry = Nautilus.MenuItem(
                 name="ImmichOnDemand::retry-pin",
                 label="Retry Pinned Download",
             )
-            retry.connect("activate", self._activate_pin, "pin", uri, file)
+            retry.connect(
+                "activate", self._activate_pin, profile, "pin", uri, file
+            )
             return [retry, pin]
         if pinned:
             return [pin]
@@ -196,34 +248,40 @@ class NautilusExtension(
             name="ImmichOnDemand::evict",
             label="Evict Local Copy",
         )
-        evict.connect("activate", self._activate_evict, uri, file)
+        evict.connect("activate", self._activate_evict, profile, uri, file)
         return [pin, evict]
 
-    def _cached_state(self, uri: str) -> dict[str, bool] | None:
-        cached = self._cache.get(uri)
+    def _cached_state(
+        self, profile: Profile, uri: str
+    ) -> dict[str, bool] | None:
+        key = (profile.id, uri)
+        cached = self._cache.get(key)
         if cached is None:
             return None
         expires, state = cached
         if expires <= time.monotonic():
-            del self._cache[uri]
+            del self._cache[key]
             return None
-        self._cache.move_to_end(uri)
+        self._cache.move_to_end(key)
         return state
 
     def update_file_info_full(self, provider, handle, closure, file):
-        if not self._in_mount(file.get_location()):
+        profile = self._profile(file.get_location())
+        if profile is None:
             return Nautilus.OperationResult.COMPLETE
         uri = file.get_uri()
         if not isinstance(uri, str):
             return Nautilus.OperationResult.COMPLETE
-        state = self._cached_state(uri)
+        state = self._cached_state(profile, uri)
         if state is not None:
             try:
                 self._apply_state(file, state)
             except Exception:
                 pass
             return Nautilus.OperationResult.COMPLETE
-        self._pending.append(_Update(provider, handle, closure, file, uri))
+        self._pending.append(
+            _Update(profile, provider, handle, closure, file, uri)
+        )
         if self._idle_source is None and not self._worker_active:
             self._idle_source = GLib.idle_add(self._start_batch)
         return Nautilus.OperationResult.IN_PROGRESS
@@ -241,8 +299,11 @@ class NautilusExtension(
         self._idle_source = None
         if not self._pending or self._worker_active:
             return False
+        profile = self._pending[0].profile
         uris: list[str] = []
         for update in self._pending:
+            if update.profile != profile:
+                continue
             if update.uri in uris:
                 continue
             candidate = [*uris, update.uri]
@@ -255,10 +316,16 @@ class NautilusExtension(
         if not uris:
             oversized_uri = self._pending[0].uri
             oversized = [
-                update for update in self._pending if update.uri == oversized_uri
+                update
+                for update in self._pending
+                if update.profile == profile and update.uri == oversized_uri
             ]
             self._pending = [
-                update for update in self._pending if update.uri != oversized_uri
+                update
+                for update in self._pending
+                if not (
+                    update.profile == profile and update.uri == oversized_uri
+                )
             ]
             for update in oversized:
                 self._complete(update)
@@ -266,23 +333,33 @@ class NautilusExtension(
                 self._idle_source = GLib.idle_add(self._start_batch)
             return False
         selected = set(uris)
-        batch = [update for update in self._pending if update.uri in selected]
-        self._pending = [update for update in self._pending if update.uri not in selected]
+        batch = [
+            update
+            for update in self._pending
+            if update.profile == profile and update.uri in selected
+        ]
+        self._pending = [
+            update
+            for update in self._pending
+            if not (update.profile == profile and update.uri in selected)
+        ]
         self._inflight = batch
         self._worker_active = True
         try:
             threading.Thread(
                 target=self._describe,
-                args=(batch, uris),
+                args=(batch, profile, uris),
                 daemon=True,
             ).start()
         except Exception:
             return self._finish_batch(batch, None)
         return False
 
-    def _describe(self, batch: list[_Update], uris: list[str]) -> None:
+    def _describe(
+        self, batch: list[_Update], profile: Profile, uris: list[str]
+    ) -> None:
         try:
-            response = trio.run(run_action, "describe", uris)
+            response = trio.run(run_action, profile, "describe", uris)
         except Exception:
             response = None
         GLib.idle_add(self._finish_batch, batch, response)
@@ -336,9 +413,11 @@ class NautilusExtension(
     def _finish_batch(self, batch: list[_Update], response: object) -> bool:
         states = self._states(response, [update.uri for update in batch])
         expires = time.monotonic() + _CACHE_SECONDS
+        profile = batch[0].profile
         for uri, state in states.items():
-            self._cache[uri] = (expires, state)
-            self._cache.move_to_end(uri)
+            key = (profile.id, uri)
+            self._cache[key] = (expires, state)
+            self._cache.move_to_end(key)
         while len(self._cache) > _MAX_CACHE_ITEMS:
             self._cache.popitem(last=False)
         for update in batch:
@@ -347,7 +426,9 @@ class NautilusExtension(
                 if state is not None and not update.completed:
                     self._apply_state(update.file, state)
                     if state["busy"]:
-                        self._schedule_refresh(update.uri, update.file)
+                        self._schedule_refresh(
+                            update.profile, update.uri, update.file
+                        )
             except Exception:
                 pass
             finally:

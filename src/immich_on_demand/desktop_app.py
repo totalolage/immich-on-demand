@@ -12,6 +12,7 @@ import gi
 import trio
 
 from .desktop import run_action
+from .profiles import Profile, manage_profile, profiles, select_profile
 from .settings import Settings, load, save, store_api_key
 
 gi.require_version("Adw", "1")
@@ -72,12 +73,12 @@ def _parse_action(arguments: list[str]) -> tuple[str | None, str | None]:
     raise ValueError("invalid desktop action")
 
 
-def _relay_result(name: str) -> None:
+def _relay_result(profile: Profile, name: str) -> None:
     if name not in _RESULT_MESSAGES:
         raise ValueError("invalid desktop result")
     try:
         subprocess.Popen(
-            [_PROGRAM_NAME, "--result", name],
+            [_PROGRAM_NAME, "--profile", profile.id, "--result", name],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -146,12 +147,14 @@ def _upload_page(response: object) -> tuple[list[dict[str, object]], str | None]
     return items, next_id
 
 
-async def _fetch_uploads() -> str:
+async def _fetch_uploads(profile: Profile) -> str:
     after: str | None = None
     seen: set[str] = set()
     lines: list[str] = []
     while True:
-        items, next_id = _upload_page(await run_action("uploads", after))
+        items, next_id = _upload_page(
+            await run_action(profile, "uploads", after)
+        )
         lines.extend(
             " ".join(
                 (
@@ -173,11 +176,13 @@ async def _fetch_uploads() -> str:
         after = next_id
 
 
-async def _run_action_command(action: str, uri: str | None) -> int:
+async def _run_action_command(
+    profile: Profile, action: str, uri: str | None
+) -> int:
     try:
-        result = await run_action(action, uri)
+        result = await run_action(profile, action, uri)
     except Exception:
-        _relay_result(f"{action}-error")
+        _relay_result(profile, f"{action}-error")
         return 1
 
     if action == "status":
@@ -201,6 +206,7 @@ async def _run_action_command(action: str, uri: str | None) -> int:
             and all(type(result[name]) is int for name in expected - booleans)
         )
         _relay_result(
+            profile,
             f"status-{'online' if result['online'] else 'offline'}"
             if valid
             else "status-error"
@@ -208,7 +214,7 @@ async def _run_action_command(action: str, uri: str | None) -> int:
         return 0 if valid else 1
     if action == "refresh":
         valid = result == {"scheduled": True}
-        _relay_result("refresh-ok" if valid else "refresh-error")
+        _relay_result(profile, "refresh-ok" if valid else "refresh-error")
         return 0 if valid else 1
     if action == "evict":
         valid = (
@@ -216,7 +222,7 @@ async def _run_action_command(action: str, uri: str | None) -> int:
             and set(result) == {"evicted"}
             and type(result["evicted"]) is bool
         )
-        _relay_result("evict-ok" if valid else "evict-error")
+        _relay_result(profile, "evict-ok" if valid else "evict-error")
         return 0 if valid else 1
 
     if (
@@ -226,44 +232,46 @@ async def _run_action_command(action: str, uri: str | None) -> int:
         or any(type(result.get(name)) is not bool for name in result)
         or uri is None
     ):
-        _relay_result(f"{action}-error")
+        _relay_result(profile, f"{action}-error")
         return 1
     if action == "unpin" and result["pinned"] is not False:
-        _relay_result("unpin-error")
+        _relay_result(profile, "unpin-error")
         return 1
     if action == "unpin":
-        _relay_result("unpin-cached" if result["cached"] else "unpin-ok")
+        _relay_result(
+            profile, "unpin-cached" if result["cached"] else "unpin-ok"
+        )
         return 0
     if action == "pin" and result["pinned"] is not True:
-        _relay_result("pin-error")
+        _relay_result(profile, "pin-error")
         return 1
     if action == "pin" and result["cached"] is True and result["busy"] is False:
-        _relay_result("pin-cached")
+        _relay_result(profile, "pin-cached")
         return 0
     with trio.move_on_after(_ACTION_WAIT_SECONDS) as wait:
         while True:
             response = None
             try:
-                response = await run_action("describe", [uri])
+                response = await run_action(profile, "describe", [uri])
                 state = _described_pin(response, uri)
             except Exception:
                 state = None
             if state is None:
-                _relay_result("pin-unknown")
+                _relay_result(profile, "pin-unknown")
                 return 1
             if state["busy"] is True:
                 await trio.sleep(_PIN_POLL_SECONDS)
                 continue
             if state["pinned"] is False:
-                _relay_result("pin-cancelled")
+                _relay_result(profile, "pin-cancelled")
                 return 0
             if state["cached"] is True:
-                _relay_result("pin-cached")
+                _relay_result(profile, "pin-cached")
                 return 0
-            _relay_result("pin-retry")
+            _relay_result(profile, "pin-retry")
             return 1
     assert wait.cancelled_caught
-    _relay_result("pin-timeout")
+    _relay_result(profile, "pin-timeout")
     return 124
 
 
@@ -315,6 +323,11 @@ class DesktopApplication(Adw.Application):
         )
         self._worker = _Worker()
         self._window = None
+        self._profile: Profile | None = None
+        self._profiles: tuple[Profile, ...] = ()
+        self._profile_generation = 0
+        self._profile_selector = None
+        self._profile_controls: list[object] = []
         self._entries: dict[str, object] = {}
         self._remote_delete = None
         self._restore_entry = None
@@ -332,25 +345,42 @@ class DesktopApplication(Adw.Application):
     def do_activate(self) -> None:
         if self._window is None:
             self._build_window()
-            self._message.set_text("Loading settings.")
-            if not self._worker.submit(load, self._finish_load):
-                self._message.set_text("Desktop worker is busy.")
+            self._message.set_text("Select a Profile.")
         self._window.present()
 
     def do_command_line(self, command_line) -> int:
         arguments = list(command_line.get_arguments())[1:]
-        result = (
-            arguments[1]
-            if len(arguments) == 2
-            and arguments[0] == "--result"
-            and arguments[1] in _RESULT_MESSAGES
-            else None
-        )
-        if arguments and result is None:
+        profile = None
+        result = None
+        try:
+            if arguments:
+                if len(arguments) < 2 or arguments[0] != "--profile":
+                    raise ValueError
+                profile = select_profile(arguments[1])
+                remaining = arguments[2:]
+                if remaining:
+                    if (
+                        len(remaining) != 2
+                        or remaining[0] != "--result"
+                        or remaining[1] not in _RESULT_MESSAGES
+                    ):
+                        raise ValueError
+                    result = remaining[1]
+        except (RuntimeError, ValueError):
             self.activate()
             self._message.set_text("Invalid desktop action.")
             return 2
         self.activate()
+        if profile is not None:
+            if (
+                result is not None
+                and self._profile is not None
+                and self._profile != profile
+            ):
+                return 0
+            if not self._choose_profile(profile):
+                self._message.set_text("Profile is not available.")
+                return 2
         if result is not None:
             self._message.set_text(_RESULT_MESSAGES[result])
         return 0
@@ -377,6 +407,17 @@ class DesktopApplication(Adw.Application):
         )
         content.append(grid)
 
+        try:
+            self._profiles = profiles()
+            choices = ["Select a Profile", *(profile.id for profile in self._profiles)]
+        except Exception:
+            self._profiles = ()
+            choices = ["Could not list Profiles"]
+        grid.attach(Gtk.Label(label="Profile", xalign=0), 0, 0, 1, 1)
+        self._profile_selector = Gtk.DropDown(model=Gtk.StringList.new(choices))
+        self._profile_selector.connect("notify::selected", self._profile_changed)
+        grid.attach(self._profile_selector, 1, 0, 1, 1)
+
         fields = (
             ("server_url", "Server URL", True),
             ("mount_path", "Mount path", True),
@@ -387,19 +428,21 @@ class DesktopApplication(Adw.Application):
             ("read_only_key", "Read-only API key", False),
             ("mutation_key", "Mutation API key", False),
         )
-        for row, (name, label, visible) in enumerate(fields):
+        for row, (name, label, visible) in enumerate(fields, start=1):
             grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
             entry = Gtk.Entry(hexpand=True)
             entry.set_visibility(visible)
             grid.attach(entry, 1, row, 1, 1)
             self._entries[name] = entry
+            self._profile_controls.append(entry)
 
         self._remote_delete = Gtk.CheckButton(label="Enable remote deletion")
-        grid.attach(self._remote_delete, 1, len(fields), 1, 1)
+        self._profile_controls.append(self._remote_delete)
+        grid.attach(self._remote_delete, 1, len(fields) + 1, 1, 1)
         grid.attach(
             Gtk.Label(label="Restore asset UUID", xalign=0),
             0,
-            len(fields) + 1,
+            len(fields) + 2,
             1,
             1,
         )
@@ -408,68 +451,136 @@ class DesktopApplication(Adw.Application):
         restore_controls.append(self._restore_entry)
         self._restore_button = Gtk.Button(label="Restore Asset")
         self._restore_button.connect("clicked", self._restore_asset)
+        self._profile_controls.extend((self._restore_entry, self._restore_button))
         restore_controls.append(self._restore_button)
-        grid.attach(restore_controls, 1, len(fields) + 1, 1, 1)
+        grid.attach(restore_controls, 1, len(fields) + 2, 1, 1)
         grid.attach(
             Gtk.Label(label="Pending uploads", xalign=0),
             0,
-            len(fields) + 2,
+            len(fields) + 3,
             1,
             1,
         )
         self._uploads_refresh_button = Gtk.Button(label="Refresh")
         self._uploads_refresh_button.connect("clicked", self._refresh_uploads)
-        grid.attach(self._uploads_refresh_button, 1, len(fields) + 2, 1, 1)
+        self._profile_controls.append(self._uploads_refresh_button)
+        grid.attach(self._uploads_refresh_button, 1, len(fields) + 3, 1, 1)
         self._uploads_label = Gtk.Label(
             label="Pending uploads not loaded.", xalign=0, selectable=True
         )
-        grid.attach(self._uploads_label, 0, len(fields) + 3, 2, 1)
+        grid.attach(self._uploads_label, 0, len(fields) + 4, 2, 1)
         grid.attach(
             Gtk.Label(label="Pending upload UUID", xalign=0),
-            0,
-            len(fields) + 4,
-            1,
-            1,
-        )
-        self._upload_id_entry = Gtk.Entry(hexpand=True)
-        grid.attach(self._upload_id_entry, 1, len(fields) + 4, 1, 1)
-        grid.attach(
-            Gtk.Label(label="Current revision", xalign=0),
             0,
             len(fields) + 5,
             1,
             1,
         )
-        self._upload_revision_entry = Gtk.Entry(hexpand=True)
-        grid.attach(self._upload_revision_entry, 1, len(fields) + 5, 1, 1)
+        self._upload_id_entry = Gtk.Entry(hexpand=True)
+        self._profile_controls.append(self._upload_id_entry)
+        grid.attach(self._upload_id_entry, 1, len(fields) + 5, 1, 1)
         grid.attach(
-            Gtk.Label(label="Exact name for Cancel", xalign=0),
+            Gtk.Label(label="Current revision", xalign=0),
             0,
             len(fields) + 6,
             1,
             1,
         )
+        self._upload_revision_entry = Gtk.Entry(hexpand=True)
+        self._profile_controls.append(self._upload_revision_entry)
+        grid.attach(self._upload_revision_entry, 1, len(fields) + 6, 1, 1)
+        grid.attach(
+            Gtk.Label(label="Exact name for Cancel", xalign=0),
+            0,
+            len(fields) + 7,
+            1,
+            1,
+        )
         self._upload_name_entry = Gtk.Entry(hexpand=True)
-        grid.attach(self._upload_name_entry, 1, len(fields) + 6, 1, 1)
+        self._profile_controls.append(self._upload_name_entry)
+        grid.attach(self._upload_name_entry, 1, len(fields) + 7, 1, 1)
         upload_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._retry_upload_button = Gtk.Button(label="Retry Upload")
         self._retry_upload_button.connect("clicked", self._retry_upload)
         upload_controls.append(self._retry_upload_button)
         self._cancel_upload_button = Gtk.Button(label="Cancel Upload")
         self._cancel_upload_button.connect("clicked", self._cancel_upload)
+        self._profile_controls.extend(
+            (self._retry_upload_button, self._cancel_upload_button)
+        )
         upload_controls.append(self._cancel_upload_button)
-        grid.attach(upload_controls, 1, len(fields) + 7, 1, 1)
+        grid.attach(upload_controls, 1, len(fields) + 8, 1, 1)
         self._message = Gtk.Label(label="", xalign=0)
-        grid.attach(self._message, 0, len(fields) + 8, 2, 1)
+        grid.attach(self._message, 0, len(fields) + 9, 2, 1)
         self._save_button = Gtk.Button(label="Save Settings")
         self._save_button.connect("clicked", self._save_settings)
-        grid.attach(self._save_button, 1, len(fields) + 9, 1, 1)
+        self._profile_controls.append(self._save_button)
+        grid.attach(self._save_button, 1, len(fields) + 10, 1, 1)
         self._window.set_content(content)
+        self._set_profile_controls_sensitive(False)
 
-    def _finish_load(self, success: bool, result) -> bool:
+    def _set_profile_controls_sensitive(self, sensitive: bool) -> None:
+        for control in self._profile_controls:
+            control.set_sensitive(sensitive)
+
+    def _clear_profile_form(self) -> None:
+        for entry in self._entries.values():
+            entry.set_text("")
+        self._remote_delete.set_active(False)
+        self._uploads_label.set_text("Pending uploads not loaded.")
+        self._clear_pending_upload_fields()
+
+    def _profile_changed(self, selector, _parameter) -> None:
+        selected = selector.get_selected()
+        profile = self._profiles[selected - 1] if selected else None
+        self._select_profile(profile)
+
+    def _choose_profile(self, profile: Profile) -> bool:
+        for index, candidate in enumerate(self._profiles, start=1):
+            if candidate == profile:
+                self._profile_selector.set_selected(index)
+                return True
+        return False
+
+    def _select_profile(self, profile: Profile | None) -> None:
+        self._profile_generation += 1
+        generation = self._profile_generation
+        self._profile = profile
+        self._clear_profile_form()
+        self._set_profile_controls_sensitive(False)
+        if profile is None:
+            self._message.set_text("Select a Profile.")
+            return
+        self._message.set_text(f"Loading Profile {profile.id}.")
+        if not self._worker.submit(
+            lambda: load(profile.config / "config.json"),
+            lambda success, result: self._finish_load(
+                profile, generation, success, result
+            ),
+        ):
+            self._message.set_text("Desktop worker is busy.")
+
+    def _capture_profile(self) -> tuple[Profile, int] | None:
+        if self._profile is None:
+            self._message.set_text("Select a Profile.")
+            return None
+        return self._profile, self._profile_generation
+
+    def _is_current(self, profile: Profile, generation: int) -> bool:
+        return self._profile == profile and self._profile_generation == generation
+
+    def _finish_load(
+        self,
+        profile: Profile,
+        generation: int,
+        success: bool,
+        result,
+    ) -> bool:
+        if self._profile != profile or self._profile_generation != generation:
+            return False
         if not success or not isinstance(result, Settings):
-            if self._message.get_text() == "Loading settings.":
-                self._message.set_text("Could not load settings.")
+            if self._message.get_text() == f"Loading Profile {profile.id}.":
+                self._message.set_text(f"Could not load Profile {profile.id}.")
             return False
         values = {
             "server_url": result.server_url,
@@ -482,8 +593,9 @@ class DesktopApplication(Adw.Application):
         for name, value in values.items():
             self._entries[name].set_text(value)
         self._remote_delete.set_active(result.remote_delete)
-        if self._message.get_text() == "Loading settings.":
-            self._message.set_text("Settings loaded.")
+        self._set_profile_controls_sensitive(True)
+        if self._message.get_text() == f"Loading Profile {profile.id}.":
+            self._message.set_text(f"Profile {profile.id} loaded.")
         return False
 
     def _settings_from_form(self) -> Settings:
@@ -502,6 +614,10 @@ class DesktopApplication(Adw.Application):
         )
 
     def _save_settings(self, _button) -> None:
+        captured = self._capture_profile()
+        if captured is None:
+            return
+        profile, generation = captured
         try:
             settings = self._settings_from_form()
         except (TypeError, ValueError):
@@ -511,35 +627,80 @@ class DesktopApplication(Adw.Application):
         mutation_key = self._entries["mutation_key"].get_text()
 
         def persist() -> Settings:
-            if read_only_key:
-                store_api_key(settings, "read-only", read_only_key)
-            if mutation_key:
-                store_api_key(settings, "mutation", mutation_key)
-            save(settings)
+            with manage_profile(profile, settings.mount_path):
+                save(settings, profile.config / "config.json")
+                if read_only_key:
+                    store_api_key(
+                        settings,
+                        "read-only",
+                        read_only_key,
+                        profile_id=profile.id,
+                    )
+                if mutation_key:
+                    store_api_key(
+                        settings,
+                        "mutation",
+                        mutation_key,
+                        profile_id=profile.id,
+                    )
             return settings
 
-        if not self._worker.submit(persist, self._finish_save):
+        if not self._worker.submit(
+            persist,
+            lambda success, result: self._finish_save(
+                profile, generation, success, result
+            ),
+        ):
             self._message.set_text("Desktop worker is busy.")
             return
         self._entries["read_only_key"].set_text("")
         self._entries["mutation_key"].set_text("")
         self._message.set_text("Saving settings.")
 
-    def _finish_save(self, success: bool, _result) -> bool:
+    def _finish_save(
+        self,
+        profile: Profile,
+        generation: int,
+        success: bool,
+        _result,
+    ) -> bool:
+        if not self._is_current(profile, generation):
+            return False
         self._message.set_text(
             "Settings saved." if success else "Could not save settings."
         )
         return False
 
     def _refresh_uploads(self, _button=None) -> None:
+        captured = self._capture_profile()
+        if captured is None:
+            return
+        self._submit_upload_refresh(*captured)
+
+    def _submit_upload_refresh(
+        self, profile: Profile, generation: int
+    ) -> None:
+        if not self._is_current(profile, generation):
+            return
         if not self._worker.submit(
-            lambda: trio.run(_fetch_uploads), self._finish_upload_refresh
+            lambda: trio.run(_fetch_uploads, profile),
+            lambda success, result: self._finish_upload_refresh(
+                profile, generation, success, result
+            ),
         ):
             self._uploads_label.set_text("Desktop worker is busy.")
             return
         self._uploads_label.set_text("Loading Pending uploads.")
 
-    def _finish_upload_refresh(self, success: bool, result) -> bool:
+    def _finish_upload_refresh(
+        self,
+        profile: Profile,
+        generation: int,
+        success: bool,
+        result,
+    ) -> bool:
+        if not self._is_current(profile, generation):
+            return False
         self._uploads_label.set_text(
             (result or "No Pending uploads.")
             if success and isinstance(result, str)
@@ -559,6 +720,10 @@ class DesktopApplication(Adw.Application):
         self._upload_revision_entry.set_text("")
 
     def _retry_upload(self, _button) -> None:
+        captured = self._capture_profile()
+        if captured is None:
+            return
+        profile, generation = captured
         try:
             upload_id = self._pending_upload_id()
         except ValueError:
@@ -566,16 +731,25 @@ class DesktopApplication(Adw.Application):
             return
 
         if not self._worker.submit(
-            lambda: trio.run(run_action, "retry-upload", upload_id),
+            lambda: trio.run(run_action, profile, "retry-upload", upload_id),
             lambda success, result: self._finish_retry_upload(
-                success, result, upload_id
+                profile, generation, success, result, upload_id
             ),
         ):
             self._message.set_text("Desktop worker is busy.")
             return
         self._message.set_text("Requesting upload retry.")
 
-    def _finish_retry_upload(self, success: bool, result, upload_id: str) -> bool:
+    def _finish_retry_upload(
+        self,
+        profile: Profile,
+        generation: int,
+        success: bool,
+        result,
+        upload_id: str,
+    ) -> bool:
+        if not self._is_current(profile, generation):
+            return False
         accepted = (
             success
             and isinstance(result, dict)
@@ -588,10 +762,14 @@ class DesktopApplication(Adw.Application):
             return False
         self._clear_pending_upload_fields()
         self._message.set_text("Upload retry requested.")
-        self._refresh_uploads()
+        self._submit_upload_refresh(profile, generation)
         return False
 
     def _cancel_upload(self, _button) -> None:
+        captured = self._capture_profile()
+        if captured is None:
+            return
+        profile, generation = captured
         try:
             upload_id = self._pending_upload_id()
         except ValueError:
@@ -613,20 +791,30 @@ class DesktopApplication(Adw.Application):
         if not self._worker.submit(
             lambda: trio.run(
                 run_action,
+                profile,
                 "cancel-upload",
                 upload_id,
                 revision,
                 confirm_name,
             ),
             lambda success, result: self._finish_cancel_upload(
-                success, result, upload_id
+                profile, generation, success, result, upload_id
             ),
         ):
             self._message.set_text("Desktop worker is busy.")
             return
         self._message.set_text("Requesting Pending upload cancellation.")
 
-    def _finish_cancel_upload(self, success: bool, result, upload_id: str) -> bool:
+    def _finish_cancel_upload(
+        self,
+        profile: Profile,
+        generation: int,
+        success: bool,
+        result,
+        upload_id: str,
+    ) -> bool:
+        if not self._is_current(profile, generation):
+            return False
         accepted = (
             success
             and isinstance(result, dict)
@@ -639,10 +827,14 @@ class DesktopApplication(Adw.Application):
             return False
         self._clear_pending_upload_fields()
         self._message.set_text("Pending upload cancelled.")
-        self._refresh_uploads()
+        self._submit_upload_refresh(profile, generation)
         return False
 
     def _restore_asset(self, _button) -> None:
+        captured = self._capture_profile()
+        if captured is None:
+            return
+        profile, generation = captured
         try:
             asset_id = str(UUID(self._restore_entry.get_text().strip()))
         except ValueError:
@@ -650,15 +842,28 @@ class DesktopApplication(Adw.Application):
             return
 
         def restore():
-            return trio.run(run_action, "restore", asset_id)
+            return trio.run(run_action, profile, "restore", asset_id)
 
-        if not self._worker.submit(restore, self._finish_restore):
+        if not self._worker.submit(
+            restore,
+            lambda success, result: self._finish_restore(
+                profile, generation, success, result
+            ),
+        ):
             self._message.set_text("Desktop worker is busy.")
             return
         self._restore_entry.set_text("")
         self._message.set_text("Requesting restore.")
 
-    def _finish_restore(self, success: bool, result) -> bool:
+    def _finish_restore(
+        self,
+        profile: Profile,
+        generation: int,
+        success: bool,
+        result,
+    ) -> bool:
+        if not self._is_current(profile, generation):
+            return False
         confirmed = (
             success
             and isinstance(result, dict)
@@ -674,11 +879,18 @@ class DesktopApplication(Adw.Application):
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if arguments and arguments[0] == "--action":
+    if (
+        len(arguments) >= 3
+        and arguments[0] == "--profile"
+        and arguments[2] == "--action"
+    ):
         try:
-            action, uri = _parse_action(arguments)
-        except ValueError:
+            profile = select_profile(arguments[1])
+            action, uri = _parse_action(arguments[2:])
+        except (RuntimeError, ValueError):
             return 2
         assert action is not None
-        return trio.run(_run_action_command, action, uri)
+        return trio.run(_run_action_command, profile, action, uri)
+    if "--action" in arguments:
+        return 2
     return DesktopApplication().run([_PROGRAM_NAME, *arguments])

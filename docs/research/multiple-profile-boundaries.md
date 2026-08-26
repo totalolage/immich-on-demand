@@ -1,6 +1,6 @@
 # Multiple Profile boundaries
 
-Status: design resolved; implementation not started
+Status: core source implementation complete; reversible retirement and target acceptance pending
 Date: 2026-08-26
 Examined baseline: Immich On-Demand development tree at version `1.4.0.dev0`
 
@@ -26,7 +26,7 @@ def profiles() -> tuple[Profile, ...]: ...
 
 
 @contextmanager
-def manage_profile(profile: Profile) -> Iterator[Profile]: ...
+def manage_profile(profile: Profile, mount_path: Path | None = None) -> Iterator[Profile]: ...
 
 
 @contextmanager

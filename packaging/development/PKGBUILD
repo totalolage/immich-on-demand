@@ -1,6 +1,6 @@
 pkgname=immich-on-demand-git
 _project=immich-on-demand
-pkgver=1.4.0.dev0.r85.g07a5573
+pkgver=2.0.0.dev0.r92.g14b52dd
 pkgrel=1
 pkgdesc='Expose an Immich library as a Linux filesystem with files on demand'
 arch=('any')
@@ -56,6 +56,8 @@ package() {
   python -m installer --destdir="$pkgdir" dist/*.whl
   install -Dm644 packaging/immich-on-demand.service \
     "$pkgdir/usr/lib/systemd/user/immich-on-demand.service"
+  install -Dm644 packaging/immich-on-demand@.service \
+    "$pkgdir/usr/lib/systemd/user/immich-on-demand@.service"
   install -Dm644 packaging/net.kalny.ImmichOnDemand.desktop \
     "$pkgdir/usr/share/applications/net.kalny.ImmichOnDemand.desktop"
   install -Dm644 packaging/immich-on-demand-nautilus.py \

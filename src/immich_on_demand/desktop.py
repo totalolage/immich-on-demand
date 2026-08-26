@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from .control import send_request
-from .settings import runtime_path
+from .profiles import Profile
 
 
 def _is_local_uri(value: object) -> bool:
@@ -31,6 +31,7 @@ def _canonical_id(value: object) -> str:
 
 
 async def run_action(
+    profile: Profile,
     action: str,
     target: str | list[str] | None = None,
     revision: int | None = None,
@@ -127,7 +128,7 @@ async def run_action(
     else:
         raise ValueError("invalid desktop action")
     return await send_request(
-        runtime_path() / "control.sock",
+        profile.runtime / "control.sock",
         secrets.randbits(63) or 1,
         method,
         params,

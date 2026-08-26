@@ -21,7 +21,7 @@ Extend the private control protocol only for operations the clients need. Add a 
 
 The Nautilus 50 adapter caches the configured mount and uses `Gio.File` identity and prefix checks for scoping. Folder menus open Refresh and Settings. A one-file menu exposes Pin, Unpin, retry, and Evict according to cached daemon state. The info provider batches bounded state requests and adds cached, pinned, and busy emblems without importing the service, FUSE, or Immich client.
 
-The GTK 4 and libadwaita application edits one Profile through the existing settings API. It writes replacement keys to Secret Service before it saves non-secret settings. Blank key fields leave stored keys unchanged. Settings work uses one bounded worker. Short-lived action processes use the private Unix control socket and report fixed results to the unique GUI application.
+The GTK 4 and libadwaita application selects and edits one configured Profile through the existing settings API. It publishes validated non-secret settings before requested replacement keys, so an interrupted key write leaves an active editable Profile. Blank key fields leave stored keys unchanged. Settings work uses one bounded worker. Short-lived action processes use the selected Profile's private Unix control socket and report fixed results to the unique GUI application.
 
 The source tree also contains the desktop entry, Nautilus loader, and application and emblem icons. The released Arch recipe does not install these files. The `immich-on-demand-git` development recipe installs them with GTK 4, libadwaita, and nautilus-python while leaving the released 1.0 recipe unchanged.
 

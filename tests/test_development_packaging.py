@@ -37,6 +37,7 @@ class DevelopmentPackagingTests(unittest.TestCase):
             "/usr/share/icons/hicolor/scalable/apps/immich-on-demand.svg",
             "/usr/share/icons/hicolor/scalable/emblems",
             "/usr/lib/systemd/user/immich-on-demand.service",
+            "/usr/lib/systemd/user/immich-on-demand@.service",
         ):
             self.assertIn(destination, package)
         self.assertIn("git clean -dfx", package)
@@ -54,7 +55,7 @@ class DevelopmentPackagingTests(unittest.TestCase):
 
         readme = README.read_text(encoding="utf-8")
         self.assertIn(
-            "systemctl --user disable --now immich-on-demand.service", readme
+            "systemctl --user disable --now immich-on-demand@home.service", readme
         )
         self.assertIn("sudo pacman -Rns immich-on-demand-git", readme)
 

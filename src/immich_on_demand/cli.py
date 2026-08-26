@@ -12,13 +12,12 @@ import trio
 from . import __version__
 from .auth import validate_api_key
 from .control import send_request
+from .profiles import Profile, ProfileError, manage_profile, select_profile
 from .service import run_service
 from .settings import (
     Settings,
-    config_path,
     load,
     load_api_key,
-    runtime_path,
     save,
 )
 from .uploads import UploadErrorCode, UploadState
@@ -54,7 +53,7 @@ def _confirmation_name(value: str) -> str:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="immich-on-demand")
     result.add_argument("--version", action="version", version=__version__)
-    result.add_argument("--config", type=Path, default=config_path())
+    result.add_argument("--profile", required=True)
     commands = result.add_subparsers(dest="command", required=True)
 
     configure = commands.add_parser("configure", help="write non-secret settings")
@@ -96,28 +95,40 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
+        profile = select_profile(arguments.profile)
         if arguments.command == "configure":
-            destination = save(
-                Settings(
-                    arguments.server,
-                    arguments.mount.expanduser().resolve(),
-                    cache_max_bytes=arguments.cache_max_gib * 1024**3,
-                    cache_max_age_seconds=arguments.cache_max_age_days * 24 * 60 * 60,
-                    minimum_free_bytes=arguments.minimum_free_gib * 1024**3,
-                    remote_delete=arguments.enable_remote_delete,
-                ),
-                arguments.config,
+            settings = Settings(
+                arguments.server,
+                arguments.mount.expanduser().resolve(),
+                cache_max_bytes=arguments.cache_max_gib * 1024**3,
+                cache_max_age_seconds=arguments.cache_max_age_days * 24 * 60 * 60,
+                minimum_free_bytes=arguments.minimum_free_gib * 1024**3,
+                remote_delete=arguments.enable_remote_delete,
             )
+            with manage_profile(profile, settings.mount_path):
+                try:
+                    destination = save(settings, profile.config / "config.json")
+                except RuntimeError as error:
+                    raise ProfileError("Profile config is unsafe") from error
             print(destination)
             return 0
         if arguments.command == "auth-check":
-            return trio.run(_auth_check, load(arguments.config), arguments.mutation)
+            try:
+                settings = load(profile.config / "config.json")
+            except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
+                raise ProfileError("Profile config is invalid") from error
+            return trio.run(
+                _auth_check,
+                profile,
+                settings,
+                arguments.mutation,
+            )
         if arguments.command == "mount":
             logging.basicConfig(level=logging.INFO)
-            trio.run(run_service, load(arguments.config))
+            trio.run(run_service, profile)
             return 0
         if arguments.command == "uploads":
-            return trio.run(_uploads)
+            return trio.run(_uploads, profile)
         if arguments.command in {
             "refresh",
             "status",
@@ -158,38 +169,43 @@ def main(argv: list[str] | None = None) -> int:
                     if arguments.command == "evict" and arguments.asset is not None
                     else {}
                 )
-            return trio.run(_control, method, params)
+            return trio.run(_control, profile, method, params)
         raise AssertionError(arguments.command)
+    except ProfileError as error:
+        print(f"immich-on-demand: {error}", file=sys.stderr)
+        return error.exit_status
     except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
         print(f"immich-on-demand: {error}", file=sys.stderr)
         return 1
 
 
-async def _auth_check(settings: Settings, mutation: bool) -> int:
+async def _auth_check(profile: Profile, settings: Settings, mutation: bool) -> int:
     purpose = "mutation" if mutation else "read-only"
     session = await validate_api_key(
         settings,
         purpose,
-        load_api_key(settings, purpose),
+        load_api_key(settings, purpose, profile_id=profile.id),
     )
     print(f"Immich {session.version}; {purpose} key verified")
     return 0
 
 
-async def _control(method: str, params: dict[str, object]) -> int:
+async def _control(
+    profile: Profile, method: str, params: dict[str, object]
+) -> int:
     result = await send_request(
-        runtime_path() / "control.sock", secrets.randbits(63) or 1, method, params
+        profile.runtime / "control.sock", secrets.randbits(63) or 1, method, params
     )
     _print_result(result)
     return 0
 
 
-async def _uploads() -> int:
+async def _uploads(profile: Profile) -> int:
     after: str | None = None
     seen: set[str] = set()
     while True:
         result = await send_request(
-            runtime_path() / "control.sock",
+            profile.runtime / "control.sock",
             secrets.randbits(63) or 1,
             "uploads",
             {"after": after, "limit": 32},

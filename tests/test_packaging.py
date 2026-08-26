@@ -5,6 +5,7 @@ import unittest
 ROOT = Path(__file__).parents[1]
 PKGBUILD = ROOT / "packaging" / "PKGBUILD"
 SERVICE = ROOT / "packaging" / "immich-on-demand.service"
+SERVICE_TEMPLATE = ROOT / "packaging" / "immich-on-demand@.service"
 
 
 class PackagingTests(unittest.TestCase):
@@ -34,17 +35,24 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn("SKIP", package)
         self.assertNotIn("nautilus-python", package)
 
-    def test_service_runs_unprivileged_foreground_process(self) -> None:
+    def test_services_run_profiled_unprivileged_foreground_processes(self) -> None:
         service = SERVICE.read_text(encoding="utf-8")
+        template = SERVICE_TEMPLATE.read_text(encoding="utf-8")
 
-        self.assertIn("Type=exec", service)
-        self.assertIn("ExecStart=/usr/bin/immich-on-demand mount", service)
-        self.assertIn("KillSignal=SIGINT", service)
-        self.assertIn("Restart=on-failure", service)
-        self.assertIn("UMask=0077", service)
-        self.assertNotIn("User=root", service)
-        for forbidden in ("sudo", "docker", "podman", "systemd-sysusers"):
-            self.assertNotIn(forbidden, service.lower())
+        self.assertIn(
+            "ExecStart=/usr/bin/immich-on-demand --profile default mount", service
+        )
+        self.assertIn("ExecStart=/usr/bin/immich-on-demand --profile %i mount", template)
+        self.assertNotIn("%I", template)
+        for unit in (service, template):
+            self.assertIn("Type=exec", unit)
+            self.assertIn("KillSignal=SIGINT", unit)
+            self.assertIn("Restart=on-failure", unit)
+            self.assertIn("RestartPreventExitStatus=78", unit)
+            self.assertIn("UMask=0077", unit)
+            self.assertNotIn("User=root", unit)
+            for forbidden in ("sudo", "docker", "podman", "systemd-sysusers"):
+                self.assertNotIn(forbidden, unit.lower())
 
 if __name__ == "__main__":
     unittest.main()

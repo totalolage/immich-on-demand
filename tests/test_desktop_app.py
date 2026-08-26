@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import importlib
 from pathlib import Path
 import queue
@@ -7,11 +8,36 @@ import types
 import unittest
 from unittest import mock
 
+from immich_on_demand.profiles import Profile
 from immich_on_demand.settings import Settings
 
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 NEXT_ID = "87654321-4321-4321-8321-cba987654321"
+
+
+def _profile(profile_id: str) -> Profile:
+    root = Path("/profiles") / profile_id
+    return Profile(
+        profile_id,
+        root / "config",
+        root / "state",
+        root / "data",
+        root / "cache",
+        root / "runtime",
+    )
+
+
+def _settings(name: str = "home") -> Settings:
+    return Settings(
+        f"https://{name}.example.test",
+        Path(f"/mnt/{name}"),
+        cache_max_bytes=123,
+        cache_max_age_seconds=456,
+        minimum_free_bytes=78,
+        refresh_seconds=90,
+        remote_delete=True,
+    )
 
 
 class _IdleQueue:
@@ -78,6 +104,7 @@ class _Entry:
         self.properties = properties
         self._text = ""
         self.visible = True
+        self.sensitive = True
 
     def get_text(self) -> str:
         return self._text
@@ -88,17 +115,24 @@ class _Entry:
     def set_visibility(self, visible: bool) -> None:
         self.visible = visible
 
+    def set_sensitive(self, sensitive: bool) -> None:
+        self.sensitive = sensitive
+
 
 class _CheckButton:
     def __init__(self, **properties) -> None:
         self.properties = properties
         self._active = False
+        self.sensitive = True
 
     def get_active(self) -> bool:
         return self._active
 
     def set_active(self, active: bool) -> None:
         self._active = active
+
+    def set_sensitive(self, sensitive: bool) -> None:
+        self.sensitive = sensitive
 
 
 class _Label:
@@ -117,6 +151,7 @@ class _Button:
     def __init__(self, **properties) -> None:
         self.properties = properties
         self._callback = None
+        self.sensitive = True
 
     def connect(self, signal: str, callback) -> None:
         if signal != "clicked":
@@ -127,6 +162,36 @@ class _Button:
         if self._callback is None:
             raise AssertionError("button has no callback")
         self._callback(self)
+
+    def set_sensitive(self, sensitive: bool) -> None:
+        self.sensitive = sensitive
+
+
+class _StringList(list[str]):
+    @classmethod
+    def new(cls, values: list[str]) -> "_StringList":
+        return cls(values)
+
+
+class _DropDown:
+    def __init__(self, **properties) -> None:
+        self.model = properties["model"]
+        self._selected = 0
+        self._callback = None
+
+    def connect(self, signal: str, callback) -> None:
+        if signal != "notify::selected":
+            raise AssertionError(f"unexpected signal: {signal}")
+        self._callback = callback
+
+    def get_selected(self) -> int:
+        return self._selected
+
+    def set_selected(self, selected: int) -> None:
+        changed = selected != self._selected
+        self._selected = selected
+        if changed and self._callback is not None:
+            self._callback(self, None)
 
 
 class _CommandLine:
@@ -156,10 +221,12 @@ def _load_desktop_app():
         Box=_Container,
         Button=_Button,
         CheckButton=_CheckButton,
+        DropDown=_DropDown,
         Entry=_Entry,
         Grid=_Grid,
         Label=_Label,
         Orientation=types.SimpleNamespace(HORIZONTAL=1, VERTICAL=2),
+        StringList=_StringList,
     )
     gi.repository = repository
     sys.modules.pop("immich_on_demand.desktop_app", None)
@@ -168,245 +235,257 @@ def _load_desktop_app():
     return module, idle
 
 
+def _selected_application(module, idle, profile: Profile, settings: Settings):
+    with (
+        mock.patch.object(module, "profiles", return_value=(profile,)),
+        mock.patch.object(module, "load", return_value=settings),
+    ):
+        application = module.DesktopApplication()
+        application.do_activate()
+        application._profile_selector.set_selected(1)
+        idle.run_next()
+    return application
+
+
 class DesktopApplicationTests(unittest.TestCase):
     def tearDown(self) -> None:
         sys.modules.pop("immich_on_demand.desktop_app", None)
 
-    def test_activation_loads_profile_off_thread_before_populating_form(self) -> None:
-        module, idle = _load_desktop_app()
-        expected = Settings(
-            "https://photos.example.test",
-            Path("/home/user/Immich"),
-            cache_max_bytes=12_345,
-            cache_max_age_seconds=67_890,
-            minimum_free_bytes=2_345,
-            refresh_seconds=45,
-            remote_delete=True,
-        )
-        load_threads: list[int] = []
-
-        def load_profile() -> Settings:
-            load_threads.append(threading.get_ident())
-            return expected
-
-        application = None
-        with mock.patch.object(module, "load", side_effect=load_profile):
-            application = module.DesktopApplication()
-            application.do_activate()
-            self.assertEqual(application._window.present_count, 1)
-            self.assertEqual(application._entries["server_url"].get_text(), "")
-            idle.run_next()
-
-        self.assertNotEqual(load_threads, [threading.get_ident()])
-        self.assertEqual(
-            {
-                name: entry.get_text()
-                for name, entry in application._entries.items()
-            },
-            {
-                "server_url": "https://photos.example.test",
-                "mount_path": "/home/user/Immich",
-                "cache_max_bytes": "12345",
-                "cache_max_age_seconds": "67890",
-                "minimum_free_bytes": "2345",
-                "refresh_seconds": "45",
-                "read_only_key": "",
-                "mutation_key": "",
-            },
-        )
-        self.assertTrue(application._remote_delete.get_active())
-        self.assertEqual(application._message.get_text(), "Settings loaded.")
-        application.do_shutdown()
-
-    def test_save_persists_profile_and_only_nonblank_keys_off_thread(self) -> None:
-        module, idle = _load_desktop_app()
-        original = Settings(
-            "https://old.example.test",
-            Path("/old/Immich"),
-        )
-        saved: list[tuple[Settings, int]] = []
-        stored: list[tuple[Settings, str, str, int]] = []
-
-        def save_profile(settings: Settings) -> None:
-            saved.append((settings, threading.get_ident()))
-
-        def store_key(settings: Settings, purpose: str, secret: str) -> None:
-            stored.append((settings, purpose, secret, threading.get_ident()))
-
+    def test_no_selection_performs_no_profile_operation(self) -> None:
+        module, _idle = _load_desktop_app()
+        profile = _profile("home")
         with (
-            mock.patch.object(module, "load", return_value=original),
-            mock.patch.object(module, "save", side_effect=save_profile),
-            mock.patch.object(module, "store_api_key", side_effect=store_key),
+            mock.patch.object(module, "profiles", return_value=(profile,)),
+            mock.patch.object(module, "load") as load,
+            mock.patch.object(module, "run_action") as run_action,
+            mock.patch.object(module, "save") as save,
+            mock.patch.object(module, "store_api_key") as store_api_key,
         ):
             application = module.DesktopApplication()
             application.do_activate()
-            idle.run_next()
-            values = {
-                "server_url": "https://new.example.test",
-                "mount_path": "/new/Immich",
-                "cache_max_bytes": "123",
-                "cache_max_age_seconds": "456",
-                "minimum_free_bytes": "78",
-                "refresh_seconds": "90",
-                "read_only_key": "read-secret",
-                "mutation_key": "mutation-secret",
-            }
-            for name, value in values.items():
-                application._entries[name].set_text(value)
-            application._remote_delete.set_active(True)
-
             application._save_button.click()
-            self.assertEqual(
-                application._entries["read_only_key"].get_text(), ""
-            )
+            application._uploads_refresh_button.click()
+            application._retry_upload_button.click()
+            application._cancel_upload_button.click()
+            application._restore_button.click()
+
+        self.assertIsNone(application._profile)
+        self.assertEqual(
+            list(application._profile_selector.model),
+            ["Select a Profile", "home"],
+        )
+        self.assertTrue(
+            all(not control.sensitive for control in application._profile_controls)
+        )
+        self.assertEqual(application._message.get_text(), "Select a Profile.")
+        load.assert_not_called()
+        run_action.assert_not_called()
+        save.assert_not_called()
+        store_api_key.assert_not_called()
+        application.do_shutdown()
+
+    def test_selection_loads_exact_config_off_thread_and_enables_controls(self) -> None:
+        module, idle = _load_desktop_app()
+        profile = _profile("home")
+        expected = _settings()
+        calls: list[tuple[Path, int]] = []
+
+        def load_profile(path: Path) -> Settings:
+            calls.append((path, threading.get_ident()))
+            return expected
+
+        with (
+            mock.patch.object(module, "profiles", return_value=(profile,)),
+            mock.patch.object(module, "load", side_effect=load_profile),
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            application._profile_selector.set_selected(1)
+            self.assertEqual(application._message.get_text(), "Loading Profile home.")
+            idle.run_next()
+
+        self.assertEqual(calls[0][0], profile.config / "config.json")
+        self.assertNotEqual(calls[0][1], threading.get_ident())
+        self.assertEqual(
+            application._entries["server_url"].get_text(), expected.server_url
+        )
+        self.assertEqual(application._entries["mount_path"].get_text(), "/mnt/home")
+        self.assertTrue(application._remote_delete.get_active())
+        self.assertTrue(
+            all(control.sensitive for control in application._profile_controls)
+        )
+        self.assertEqual(application._message.get_text(), "Profile home loaded.")
+        application.do_shutdown()
+
+    def test_profile_change_discards_stale_load_completion(self) -> None:
+        module, idle = _load_desktop_app()
+        home = _profile("home")
+        work = _profile("work")
+
+        def load_profile(path: Path) -> Settings:
+            return _settings(path.parent.parent.name)
+
+        with (
+            mock.patch.object(module, "profiles", return_value=(home, work)),
+            mock.patch.object(module, "load", side_effect=load_profile),
+        ):
+            application = module.DesktopApplication()
+            application.do_activate()
+            application._profile_selector.set_selected(1)
+            application._profile_selector.set_selected(2)
+            idle.run_next()
+            self.assertEqual(application._entries["server_url"].get_text(), "")
+            self.assertEqual(application._message.get_text(), "Loading Profile work.")
+            idle.run_next()
+
+        self.assertEqual(application._profile, work)
+        self.assertEqual(
+            application._entries["server_url"].get_text(),
+            "https://work.example.test",
+        )
+        application._profile_selector.set_selected(0)
+        self.assertIsNone(application._profile)
+        self.assertEqual(application._entries["server_url"].get_text(), "")
+        self.assertEqual(application._message.get_text(), "Select a Profile.")
+        application.do_shutdown()
+
+    def test_save_locks_mount_then_writes_config_before_nonblank_keys(self) -> None:
+        module, idle = _load_desktop_app()
+        profile = _profile("home")
+        application = _selected_application(module, idle, profile, _settings())
+        events: list[tuple[object, ...]] = []
+        worker_threads: list[int] = []
+
+        @contextmanager
+        def manage(selected: Profile, mount_path: Path):
+            events.append(("manage", selected, mount_path))
+            yield selected
+            events.append(("unlock", selected))
+
+        def persist(settings: Settings, path: Path) -> None:
+            worker_threads.append(threading.get_ident())
+            events.append(("save", settings, path))
+
+        def store(
+            settings: Settings,
+            purpose: str,
+            secret: str,
+            *,
+            profile_id: str,
+        ) -> None:
+            worker_threads.append(threading.get_ident())
+            events.append(("key", purpose, secret, profile_id, settings))
+
+        application._entries["server_url"].set_text("https://new.example.test")
+        application._entries["mount_path"].set_text("/mnt/new")
+        application._entries["read_only_key"].set_text("read-secret")
+        application._entries["mutation_key"].set_text("mutation-secret")
+        with (
+            mock.patch.object(module, "manage_profile", side_effect=manage),
+            mock.patch.object(module, "save", side_effect=persist),
+            mock.patch.object(module, "store_api_key", side_effect=store),
+        ):
+            application._save_button.click()
+            self.assertEqual(application._entries["read_only_key"].get_text(), "")
             self.assertEqual(application._entries["mutation_key"].get_text(), "")
             idle.run_next()
-            application._save_button.click()
-            idle.run_next()
 
-        expected = Settings(
-            "https://new.example.test",
-            Path("/new/Immich"),
-            cache_max_bytes=123,
-            cache_max_age_seconds=456,
-            minimum_free_bytes=78,
-            refresh_seconds=90,
-            remote_delete=True,
-        )
-        main_thread = threading.get_ident()
-        self.assertEqual([value for value, _thread in saved], [expected, expected])
+        written = events[1][1]
         self.assertEqual(
-            [(settings, purpose, secret) for settings, purpose, secret, _ in stored],
+            [event[0] for event in events],
+            ["manage", "save", "key", "key", "unlock"],
+        )
+        self.assertEqual(events[0], ("manage", profile, Path("/mnt/new")))
+        self.assertEqual(events[1], ("save", written, profile.config / "config.json"))
+        self.assertEqual(
+            [(event[1], event[2], event[3]) for event in events[2:4]],
             [
-                (expected, "read-only", "read-secret"),
-                (expected, "mutation", "mutation-secret"),
+                ("read-only", "read-secret", "home"),
+                ("mutation", "mutation-secret", "home"),
             ],
         )
-        self.assertTrue(all(thread != main_thread for _value, thread in saved))
-        self.assertTrue(all(thread != main_thread for *_value, thread in stored))
+        self.assertTrue(
+            all(thread != threading.get_ident() for thread in worker_threads)
+        )
         self.assertEqual(application._message.get_text(), "Settings saved.")
         application.do_shutdown()
 
-    def test_failed_key_store_does_not_switch_the_active_profile(self) -> None:
+    def test_key_failure_occurs_after_config_save_and_is_sanitized(self) -> None:
         module, idle = _load_desktop_app()
-        current = Settings(
-            "https://old.example.test",
-            Path("/old/Immich"),
-        )
-        save_profile = mock.Mock()
-        store_key = mock.Mock(side_effect=RuntimeError("secret failure"))
+        profile = _profile("home")
+        application = _selected_application(module, idle, profile, _settings())
+        events: list[str] = []
 
+        @contextmanager
+        def manage(_profile: Profile, _mount_path: Path):
+            yield
+
+        def persist(_settings: Settings, _path: Path) -> None:
+            events.append("save")
+
+        def fail_store(*_args, **_kwargs) -> None:
+            events.append("key")
+            raise RuntimeError("api-key and private path")
+
+        application._entries["read_only_key"].set_text("replacement")
         with (
-            mock.patch.object(module, "load", return_value=current),
-            mock.patch.object(module, "save", save_profile),
-            mock.patch.object(module, "store_api_key", store_key),
+            mock.patch.object(module, "manage_profile", side_effect=manage),
+            mock.patch.object(module, "save", side_effect=persist),
+            mock.patch.object(module, "store_api_key", side_effect=fail_store),
         ):
-            application = module.DesktopApplication()
-            application.do_activate()
-            idle.run_next()
-            application._entries["server_url"].set_text(
-                "https://new.example.test"
-            )
-            application._entries["mount_path"].set_text("/new/Immich")
-            application._entries["read_only_key"].set_text("replacement")
-
             application._save_button.click()
             idle.run_next()
 
-        store_key.assert_called_once()
-        save_profile.assert_not_called()
-        self.assertEqual(
-            application._message.get_text(), "Could not save settings."
-        )
+        self.assertEqual(events, ["save", "key"])
+        self.assertEqual(application._message.get_text(), "Could not save settings.")
+        self.assertNotIn("api-key", application._message.get_text())
         application.do_shutdown()
 
-    def test_restore_uses_the_bounded_worker_with_a_canonical_asset_id(self) -> None:
+    def test_stale_action_completion_cannot_change_new_profile(self) -> None:
         module, idle = _load_desktop_app()
-        calls: list[tuple[str, object, int]] = []
+        home = _profile("home")
+        work = _profile("work")
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[tuple[Profile, str, object]] = []
 
-        async def restore(action: str, target=None):
-            calls.append((action, target, threading.get_ident()))
+        def load_profile(path: Path) -> Settings:
+            return _settings(path.parent.parent.name)
+
+        async def restore(profile: Profile, action: str, target=None):
+            calls.append((profile, action, target))
+            started.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("test timed out")
             return {"restored": True, "scheduled": True}
 
         with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
-            ),
+            mock.patch.object(module, "profiles", return_value=(home, work)),
+            mock.patch.object(module, "load", side_effect=load_profile),
             mock.patch.object(module, "run_action", side_effect=restore),
         ):
             application = module.DesktopApplication()
             application.do_activate()
+            application._profile_selector.set_selected(1)
             idle.run_next()
-            application._restore_entry.set_text(ASSET_ID.upper())
-
+            application._restore_entry.set_text(ASSET_ID)
             application._restore_button.click()
-
-            self.assertEqual(application._restore_entry.get_text(), "")
-            self.assertEqual(application._message.get_text(), "Requesting restore.")
+            self.assertTrue(started.wait(timeout=2))
+            application._profile_selector.set_selected(2)
+            release.set()
+            idle.run_next()
+            self.assertEqual(application._message.get_text(), "Loading Profile work.")
             idle.run_next()
 
-        self.assertEqual(
-            [(action, target) for action, target, _thread in calls],
-            [("restore", ASSET_ID)],
-        )
-        self.assertNotEqual(calls[0][2], threading.get_ident())
-        self.assertEqual(application._message.get_text(), "Restore requested.")
+        self.assertEqual(calls, [(home, "restore", ASSET_ID)])
+        self.assertEqual(application._profile, work)
+        self.assertEqual(application._message.get_text(), "Profile work loaded.")
         application.do_shutdown()
 
-    def test_restore_rejects_invalid_identity_and_sanitizes_failures(self) -> None:
-        module, idle = _load_desktop_app()
-        responses = iter(
-            (
-                RuntimeError("private path and api-key must not be shown"),
-                {"restored": True, "scheduled": 1},
-            )
-        )
-
-        async def restore(_action: str, _target=None):
-            result = next(responses)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
-            ),
-            mock.patch.object(module, "run_action", side_effect=restore) as action,
-        ):
-            application = module.DesktopApplication()
-            application.do_activate()
-            idle.run_next()
-            application._restore_entry.set_text("not-a-uuid")
-            application._restore_button.click()
-            self.assertEqual(
-                application._message.get_text(), "Restore asset UUID is invalid."
-            )
-            action.assert_not_called()
-
-            for _ in range(2):
-                application._restore_entry.set_text(ASSET_ID)
-                application._restore_button.click()
-                idle.run_next()
-                self.assertEqual(
-                    application._message.get_text(), "Could not restore asset."
-                )
-                self.assertNotIn("private path", application._message.get_text())
-                self.assertNotIn("api-key", application._message.get_text())
-
-        application.do_shutdown()
-
-    def test_pending_upload_refresh_fetches_all_pages_off_thread(self) -> None:
-        module, idle = _load_desktop_app()
-        calls: list[tuple[str, object, int]] = []
+    def test_pending_upload_pagination_captures_one_profile(self) -> None:
+        module, _idle = _load_desktop_app()
+        profile = _profile("home")
+        calls: list[tuple[Profile, str, object]] = []
         pages = iter(
             (
                 {
@@ -422,103 +501,27 @@ class DesktopApplicationTests(unittest.TestCase):
                     ],
                     "next": NEXT_ID,
                 },
-                {
-                    "items": [
-                        {
-                            "id": NEXT_ID,
-                            "name": "second.png",
-                            "state": "pending",
-                            "size": 456,
-                            "error": None,
-                            "revision": 3,
-                        }
-                    ],
-                    "next": None,
-                },
+                {"items": [], "next": None},
             )
         )
 
-        async def action(name: str, target=None):
-            calls.append((name, target, threading.get_ident()))
+        async def action(selected: Profile, name: str, target=None):
+            calls.append((selected, name, target))
             return next(pages)
 
-        with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
-            ),
-            mock.patch.object(module, "run_action", side_effect=action),
-        ):
-            application = module.DesktopApplication()
-            application.do_activate()
-            idle.run_next()
-
-            application._uploads_refresh_button.click()
-            self.assertEqual(
-                application._uploads_label.get_text(), "Loading Pending uploads."
-            )
-            idle.run_next()
+        with mock.patch.object(module, "run_action", side_effect=action):
+            result = module.trio.run(module._fetch_uploads, profile)
 
         self.assertEqual(
-            [(name, target) for name, target, _thread in calls],
-            [("uploads", None), ("uploads", NEXT_ID)],
+            calls,
+            [(profile, "uploads", None), (profile, "uploads", NEXT_ID)],
         )
-        self.assertTrue(
-            all(thread != threading.get_ident() for _name, _target, thread in calls)
-        )
-        self.assertEqual(
-            application._uploads_label.get_text(),
-            'id=12345678-1234-4234-8234-123456789abc name="First image.jpg" state=blocked size=null error="interrupted-write" revision=2\n'
-            'id=87654321-4321-4321-8321-cba987654321 name="second.png" state=pending size=456 error=null revision=3',
-        )
-        application.do_shutdown()
+        self.assertIn(f"id={ASSET_ID}", result)
 
-    def test_pending_upload_refresh_rejects_malformed_or_private_results(self) -> None:
+    def test_retry_cancel_and_restore_keep_the_selected_profile(self) -> None:
         module, idle = _load_desktop_app()
-        response = {
-            "items": [
-                {
-                    "id": ASSET_ID,
-                    "name": "image.jpg",
-                    "state": "blocked",
-                    "size": 123,
-                    "error": "upload-unavailable",
-                    "revision": 2,
-                    "path": "/private/recovery/api-key",
-                }
-            ]
-        }
-        with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
-            ),
-            mock.patch.object(
-                module, "run_action", mock.AsyncMock(return_value=response)
-            ),
-        ):
-            application = module.DesktopApplication()
-            application.do_activate()
-            idle.run_next()
-            application._uploads_refresh_button.click()
-            idle.run_next()
-
-        self.assertEqual(
-            application._uploads_label.get_text(),
-            "Could not load Pending uploads.",
-        )
-        self.assertNotIn("private", application._uploads_label.get_text())
-        self.assertNotIn("api-key", application._uploads_label.get_text())
-        application.do_shutdown()
-
-    def test_pending_upload_retry_and_cancel_refresh_after_queue_acceptance(self) -> None:
-        module, idle = _load_desktop_app()
+        profile = _profile("home")
+        application = _selected_application(module, idle, profile, _settings())
         calls: list[tuple[object, ...]] = []
         responses = iter(
             (
@@ -526,196 +529,71 @@ class DesktopApplicationTests(unittest.TestCase):
                 {"items": [], "next": None},
                 {"id": ASSET_ID, "cancelled": True},
                 {"items": [], "next": None},
+                {"restored": True, "scheduled": True},
             )
         )
 
         async def action(*arguments):
-            calls.append((*arguments, threading.get_ident()))
+            calls.append(arguments)
             return next(responses)
 
-        with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
-            ),
-            mock.patch.object(module, "run_action", side_effect=action),
-        ):
-            application = module.DesktopApplication()
-            application.do_activate()
-            idle.run_next()
+        with mock.patch.object(module, "run_action", side_effect=action):
             application._upload_id_entry.set_text(ASSET_ID)
-            application._upload_name_entry.set_text("Exact name.jpg")
-            application._upload_revision_entry.set_text("7")
-
             application._retry_upload_button.click()
-            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
-            self.assertEqual(
-                application._message.get_text(), "Requesting upload retry."
-            )
             idle.run_next()
-            self.assertEqual(application._upload_id_entry.get_text(), "")
-            self.assertEqual(application._upload_name_entry.get_text(), "")
-            self.assertEqual(application._upload_revision_entry.get_text(), "")
             idle.run_next()
 
             application._upload_id_entry.set_text(ASSET_ID)
-            application._upload_name_entry.set_text("Exact name.jpg")
             application._upload_revision_entry.set_text("7")
+            application._upload_name_entry.set_text("Exact name.jpg")
             application._cancel_upload_button.click()
-            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
-            self.assertEqual(
-                application._message.get_text(),
-                "Requesting Pending upload cancellation.",
-            )
             idle.run_next()
-            self.assertEqual(application._upload_id_entry.get_text(), "")
-            self.assertEqual(application._upload_name_entry.get_text(), "")
-            self.assertEqual(application._upload_revision_entry.get_text(), "")
+            idle.run_next()
+
+            application._restore_entry.set_text(ASSET_ID.upper())
+            application._restore_button.click()
             idle.run_next()
 
         self.assertEqual(
-            [call[:-1] for call in calls],
+            calls,
             [
-                ("retry-upload", ASSET_ID),
-                ("uploads", None),
-                ("cancel-upload", ASSET_ID, 7, "Exact name.jpg"),
-                ("uploads", None),
+                (profile, "retry-upload", ASSET_ID),
+                (profile, "uploads", None),
+                (profile, "cancel-upload", ASSET_ID, 7, "Exact name.jpg"),
+                (profile, "uploads", None),
+                (profile, "restore", ASSET_ID),
             ],
         )
-        self.assertTrue(
-            all(call[-1] != threading.get_ident() for call in calls)
-        )
-        self.assertEqual(application._uploads_label.get_text(), "No Pending uploads.")
-        self.assertEqual(
-            application._message.get_text(), "Pending upload cancelled."
-        )
+        self.assertEqual(application._message.get_text(), "Restore requested.")
         application.do_shutdown()
 
-    def test_pending_upload_actions_keep_fields_and_sanitize_failures(self) -> None:
-        module, idle = _load_desktop_app()
-        responses = iter(
-            (
-                RuntimeError("private path and api-key must not be shown"),
-                {"id": ASSET_ID, "cancelled": 1},
-            )
-        )
-
-        async def action(*_arguments):
-            result = next(responses)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        with (
-            mock.patch.object(
-                module,
-                "load",
-                return_value=Settings(
-                    "https://photos.example.test", Path("/home/user/Immich")
-                ),
-            ),
-            mock.patch.object(module, "run_action", side_effect=action) as request,
-        ):
-            application = module.DesktopApplication()
-            application.do_activate()
-            idle.run_next()
-
-            application._upload_id_entry.set_text(ASSET_ID.upper())
-            application._retry_upload_button.click()
-            self.assertEqual(
-                application._message.get_text(), "Pending upload UUID is invalid."
-            )
-
-            application._upload_id_entry.set_text(ASSET_ID)
-            application._upload_revision_entry.set_text("-1")
-            application._upload_name_entry.set_text("Exact name.jpg")
-            application._cancel_upload_button.click()
-            self.assertEqual(
-                application._message.get_text(),
-                "Pending upload revision is invalid.",
-            )
-
-            application._upload_revision_entry.set_text("7")
-            application._upload_name_entry.set_text("   ")
-            application._cancel_upload_button.click()
-            self.assertEqual(
-                application._message.get_text(),
-                "Pending upload confirmation name is required.",
-            )
-            request.assert_not_called()
-
-            application._upload_name_entry.set_text("Exact name.jpg")
-            application._retry_upload_button.click()
-            idle.run_next()
-            self.assertEqual(
-                application._message.get_text(), "Could not request upload retry."
-            )
-            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
-
-            application._cancel_upload_button.click()
-            idle.run_next()
-            self.assertEqual(
-                application._message.get_text(), "Could not cancel Pending upload."
-            )
-            self.assertEqual(application._upload_id_entry.get_text(), ASSET_ID)
-            self.assertEqual(
-                application._upload_name_entry.get_text(), "Exact name.jpg"
-            )
-            self.assertEqual(application._upload_revision_entry.get_text(), "7")
-
-        self.assertNotIn("private path", application._message.get_text())
-        self.assertNotIn("api-key", application._message.get_text())
-        application.do_shutdown()
-
-    def test_result_relay_uses_only_fixed_messages(self) -> None:
-        module, idle = _load_desktop_app()
-        with mock.patch.object(
-            module,
-            "load",
-            return_value=Settings(
-                "https://photos.example.test", Path("/home/user/Immich")
-            ),
-        ):
-            application = module.DesktopApplication()
-            cases = (
-                ("status-online", "Service is online."),
-                (
-                    "status-offline",
-                    "Service is offline; cached files remain available.",
-                ),
-                ("refresh-ok", "Refresh requested."),
-                ("evict-ok", "Eviction requested."),
-                ("pin-cached", "Pinned and cached."),
-                ("pin-retry", "Pin saved; download needs retry."),
-                ("unpin-cached", "Pin removed; cached copy retained."),
-            )
-            for index, (name, message) in enumerate(cases):
-                with self.subTest(name=name):
-                    self.assertEqual(
-                        application.do_command_line(
-                            _CommandLine(["desktop", "--result", name])
-                        ),
-                        0,
-                    )
-                    if index == 0:
-                        idle.run_next()
-                    self.assertEqual(application._message.get_text(), message)
-
-        self.assertEqual(
-            application.do_command_line(
-                _CommandLine(["desktop", "--result", "not-a-real-result"])
-            ),
-            2,
-        )
-        self.assertEqual(application._message.get_text(), "Invalid desktop action.")
-        application.do_shutdown()
-
-    def test_status_action_requires_exact_online_and_counter_types(self) -> None:
+    def test_result_relay_argv_includes_profile_and_fixed_result(self) -> None:
         module, _idle = _load_desktop_app()
-        base = {
+        profile = _profile("home")
+        with mock.patch.object(module.subprocess, "Popen") as popen:
+            module._relay_result(profile, "refresh-ok")
+
+        popen.assert_called_once_with(
+            [
+                "immich-on-demand-desktop",
+                "--profile",
+                "home",
+                "--result",
+                "refresh-ok",
+            ],
+            stdin=module.subprocess.DEVNULL,
+            stdout=module.subprocess.DEVNULL,
+            stderr=module.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        with self.assertRaises(ValueError):
+            module._relay_result(profile, "not-a-result")
+
+    def test_action_command_captures_profile_for_control_and_relay(self) -> None:
+        module, _idle = _load_desktop_app()
+        profile = _profile("home")
+        response = {
+            "online": True,
             "total": 7,
             "visible": 6,
             "missing_size": 1,
@@ -726,100 +604,36 @@ class DesktopApplicationTests(unittest.TestCase):
             "upload_quarantined": 1,
             "mutation_enabled": False,
         }
+        calls: list[tuple[Profile, str, object]] = []
+        relayed: list[tuple[Profile, str]] = []
 
-        for online, expected in ((True, "status-online"), (False, "status-offline")):
-            relayed: list[str] = []
-
-            async def action(_name: str, _target=None, *, value=online):
-                return {**base, "online": value}
-
-            with (
-                mock.patch.object(module, "run_action", side_effect=action),
-                mock.patch.object(module, "_relay_result", side_effect=relayed.append),
-            ):
-                result = module.trio.run(module._run_action_command, "status", None)
-
-            self.assertEqual(result, 0)
-            self.assertEqual(relayed, [expected])
-
-        malformed = (
-            {key: value for key, value in base.items() if key != "pending_uploads"},
-            {key: value for key, value in base.items() if key != "upload_quarantined"},
-            {**base, "online": 1},
-            {**base, "online": True, "mutation_enabled": 0},
-            {**base, "online": True, "total": True},
-            {**base, "online": True, "pending_uploads": False},
-            {**base, "online": True, "upload_quarantined": False},
-            {**base, "online": True, "extra": 0},
-        )
-        for response in malformed:
-            relayed = []
-
-            async def action(_name: str, _target=None, *, value=response):
-                return value
-
-            with (
-                mock.patch.object(module, "run_action", side_effect=action),
-                mock.patch.object(module, "_relay_result", side_effect=relayed.append),
-            ):
-                result = module.trio.run(module._run_action_command, "status", None)
-
-            self.assertEqual(result, 1)
-            self.assertEqual(relayed, ["status-error"])
-
-    def test_worker_bounds_pending_operations(self) -> None:
-        module, idle = _load_desktop_app()
-        save_started = threading.Event()
-        release_save = threading.Event()
-        save_calls: list[Settings] = []
-        settings = Settings(
-            "https://photos.example.test", Path("/home/user/Immich")
-        )
-
-        def slow_save(value: Settings) -> None:
-            save_calls.append(value)
-            save_started.set()
-            if not release_save.wait(timeout=2):
-                raise RuntimeError("test timed out")
+        async def action(selected: Profile, name: str, target=None):
+            calls.append((selected, name, target))
+            return response
 
         with (
-            mock.patch.object(module, "load", return_value=settings),
-            mock.patch.object(module, "save", side_effect=slow_save),
+            mock.patch.object(module, "run_action", side_effect=action),
+            mock.patch.object(
+                module,
+                "_relay_result",
+                side_effect=lambda selected, name: relayed.append((selected, name)),
+            ),
         ):
-            application = module.DesktopApplication()
-            application.do_activate()
-            idle.run_next()
-            application._save_button.click()
-            self.assertTrue(save_started.wait(timeout=2))
-            application._save_button.click()
-            application._save_button.click()
-            self.assertEqual(
-                application._message.get_text(), "Desktop worker is busy."
+            result = module.trio.run(
+                module._run_action_command, profile, "status", None
             )
-            release_save.set()
-            idle.run_next()
-            idle.run_next()
 
-        self.assertEqual(save_calls, [settings, settings])
-        application.do_shutdown()
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [(profile, "status", None)])
+        self.assertEqual(relayed, [(profile, "status-online")])
 
-    def test_pin_action_process_waits_for_terminal_hydration(self) -> None:
+    def test_pin_polling_keeps_the_selected_profile(self) -> None:
         module, _idle = _load_desktop_app()
-        uri = "file:///home/user/Immich/photo.jpg"
+        profile = _profile("home")
+        uri = "file:///mnt/home/photo.jpg"
         responses = iter(
             (
                 {"pinned": True, "cached": False, "busy": True, "scheduled": True},
-                {
-                    "items": [
-                        {
-                            "uri": uri,
-                            "cached": False,
-                            "pinned": True,
-                            "busy": True,
-                            "recoverable": False,
-                        }
-                    ]
-                },
                 {
                     "items": [
                         {
@@ -833,161 +647,179 @@ class DesktopApplicationTests(unittest.TestCase):
                 },
             )
         )
-        calls: list[tuple[str, object]] = []
-        relayed: list[str] = []
+        calls: list[tuple[Profile, str, object]] = []
+        relayed: list[tuple[Profile, str]] = []
 
-        async def action(name: str, target=None):
-            calls.append((name, target))
+        async def action(selected: Profile, name: str, target=None):
+            calls.append((selected, name, target))
             return next(responses)
-
-        async def no_wait(_seconds: float) -> None:
-            pass
 
         with (
             mock.patch.object(module, "run_action", side_effect=action),
-            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
-            mock.patch.object(module.trio, "sleep", side_effect=no_wait),
+            mock.patch.object(
+                module,
+                "_relay_result",
+                side_effect=lambda selected, name: relayed.append((selected, name)),
+            ),
         ):
-            result = module.trio.run(module._run_action_command, "pin", uri)
+            result = module.trio.run(
+                module._run_action_command, profile, "pin", uri
+            )
 
         self.assertEqual(result, 0)
         self.assertEqual(
             calls,
-            [("pin", uri), ("describe", [uri]), ("describe", [uri])],
+            [(profile, "pin", uri), (profile, "describe", [uri])],
         )
-        self.assertEqual(relayed, ["pin-cached"])
+        self.assertEqual(relayed, [(profile, "pin-cached")])
 
-    def test_pin_action_reports_retryable_terminal_state(self) -> None:
-        module, _idle = _load_desktop_app()
-        uri = "file:///home/user/Immich/photo.jpg"
-        responses = iter(
-            (
-                {"pinned": True, "cached": False, "busy": True, "scheduled": True},
-                {
-                    "items": [
-                        {
-                            "uri": uri,
-                            "cached": False,
-                            "pinned": True,
-                            "busy": False,
-                            "recoverable": False,
-                        }
-                    ]
-                },
+    def test_command_line_selects_profile_before_showing_result(self) -> None:
+        module, idle = _load_desktop_app()
+        home = _profile("home")
+        with (
+            mock.patch.object(module, "profiles", return_value=(home,)),
+            mock.patch.object(module, "select_profile", return_value=home) as select,
+            mock.patch.object(module, "load", return_value=_settings()),
+        ):
+            application = module.DesktopApplication()
+            result = application.do_command_line(
+                _CommandLine(
+                    ["desktop", "--profile", "home", "--result", "refresh-ok"]
+                )
             )
-        )
-        relayed: list[str] = []
-
-        async def action(_name: str, _target=None):
-            return next(responses)
-
-        with (
-            mock.patch.object(module, "run_action", side_effect=action),
-            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
-        ):
-            result = module.trio.run(module._run_action_command, "pin", uri)
-
-        self.assertEqual(result, 1)
-        self.assertEqual(relayed, ["pin-retry"])
-
-    def test_pin_action_timeout_keeps_the_durable_pin_truthful(self) -> None:
-        module, _idle = _load_desktop_app()
-        uri = "file:///home/user/Immich/photo.jpg"
-        relayed: list[str] = []
-
-        async def action(name: str, _target=None):
-            if name == "pin":
-                return {
-                    "pinned": True,
-                    "cached": False,
-                    "busy": True,
-                    "scheduled": True,
-                }
-            return {
-                "items": [
-                    {
-                        "uri": uri,
-                        "cached": False,
-                        "pinned": True,
-                        "busy": True,
-                        "recoverable": False,
-                    }
-                ]
-            }
-
-        with (
-            mock.patch.object(module, "run_action", side_effect=action),
-            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
-            mock.patch.object(module, "_ACTION_WAIT_SECONDS", 0.01, create=True),
-        ):
-            result = module.trio.run(module._run_action_command, "pin", uri)
-
-        self.assertEqual(result, 124)
-        self.assertEqual(relayed, ["pin-timeout"])
-
-    def test_unpin_action_finishes_when_the_durable_pin_is_removed(self) -> None:
-        module, _idle = _load_desktop_app()
-        uri = "file:///home/user/Immich/photo.jpg"
-        response = {
-            "pinned": False,
-            "cached": True,
-            "busy": True,
-            "scheduled": False,
-        }
-        relayed: list[str] = []
-        calls: list[tuple[str, object]] = []
-
-        async def action(name: str, target=None):
-            calls.append((name, target))
-            return response
-
-        with (
-            mock.patch.object(module, "run_action", side_effect=action),
-            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
-        ):
-            result = module.trio.run(module._run_action_command, "unpin", uri)
+            self.assertEqual(application._message.get_text(), "Refresh requested.")
+            idle.run_next()
 
         self.assertEqual(result, 0)
-        self.assertEqual(calls, [("unpin", uri)])
-        self.assertEqual(relayed, ["unpin-cached"])
+        select.assert_called_once_with("home")
+        self.assertEqual(application._profile, home)
+        self.assertEqual(application._message.get_text(), "Refresh requested.")
+        application.do_shutdown()
 
-    def test_control_failure_relays_only_a_fixed_error(self) -> None:
-        module, _idle = _load_desktop_app()
-        relayed: list[str] = []
+    def test_stale_relay_does_not_switch_the_visible_profile(self) -> None:
+        module, idle = _load_desktop_app()
+        home = _profile("home")
+        work = _profile("work")
 
-        async def broken(_name: str, _target=None):
-            raise RuntimeError("api-key=do-not-display")
+        def load_profile(path: Path) -> Settings:
+            return _settings(path.parent.parent.name)
 
         with (
-            mock.patch.object(module, "run_action", side_effect=broken),
-            mock.patch.object(module, "_relay_result", side_effect=relayed.append),
+            mock.patch.object(module, "profiles", return_value=(home, work)),
+            mock.patch.object(module, "select_profile", return_value=home),
+            mock.patch.object(module, "load", side_effect=load_profile) as load,
         ):
-            result = module.trio.run(module._run_action_command, "refresh", None)
+            application = module.DesktopApplication()
+            application.do_activate()
+            application._profile_selector.set_selected(2)
+            idle.run_next()
+            self.assertEqual(application._message.get_text(), "Profile work loaded.")
 
-        self.assertEqual(result, 1)
-        self.assertEqual(relayed, ["refresh-error"])
+            result = application.do_command_line(
+                _CommandLine(
+                    ["desktop", "--profile", "home", "--result", "refresh-ok"]
+                )
+            )
 
-    def test_main_runs_the_unique_settings_application_without_an_action(self) -> None:
+        self.assertEqual(result, 0)
+        self.assertEqual(application._profile, work)
+        self.assertEqual(application._message.get_text(), "Profile work loaded.")
+        self.assertEqual(load.call_count, 1)
+        application.do_shutdown()
+
+    def test_command_line_rejects_missing_or_unlisted_profile(self) -> None:
         module, _idle = _load_desktop_app()
+        home = _profile("home")
+        work = _profile("work")
+        with (
+            mock.patch.object(module, "profiles", return_value=(home,)),
+            mock.patch.object(module, "select_profile", return_value=work),
+        ):
+            application = module.DesktopApplication()
+            self.assertEqual(
+                application.do_command_line(
+                    _CommandLine(
+                        ["desktop", "--profile", "work", "--result", "refresh-ok"]
+                    )
+                ),
+                2,
+            )
+            self.assertEqual(
+                application._message.get_text(), "Profile is not available."
+            )
+            self.assertEqual(
+                application.do_command_line(
+                    _CommandLine(["desktop", "--result", "refresh-ok"])
+                ),
+                2,
+            )
 
-        result = module.main([])
+        self.assertEqual(application._message.get_text(), "Invalid desktop action.")
+        application.do_shutdown()
 
-        self.assertEqual(result, 17)
-        self.assertEqual(
-            _Application.run_calls,
-            [["immich-on-demand-desktop"]],
+    def test_worker_bounds_pending_operations(self) -> None:
+        module, idle = _load_desktop_app()
+        started = threading.Event()
+        release = threading.Event()
+        completed: list[tuple[bool, object]] = []
+
+        def blocked() -> str:
+            started.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("test timed out")
+            return "first"
+
+        worker = module._Worker()
+        self.assertTrue(
+            worker.submit(blocked, lambda *result: completed.append(result))
         )
+        self.assertTrue(started.wait(timeout=2))
+        self.assertTrue(
+            worker.submit(lambda: "second", lambda *result: completed.append(result))
+        )
+        self.assertFalse(
+            worker.submit(lambda: "third", lambda *result: completed.append(result))
+        )
+        release.set()
+        idle.run_next()
+        idle.run_next()
+        self.assertEqual(completed, [(True, "first"), (True, "second")])
+        worker.close()
 
-    def test_main_action_bypasses_the_unique_settings_application(self) -> None:
+    def test_main_action_selects_profile_before_running_action(self) -> None:
         module, _idle = _load_desktop_app()
-        run = mock.Mock(return_value=7)
+        profile = _profile("home")
+        events: list[str] = []
 
-        with mock.patch.object(module.trio, "run", run):
-            result = module.main(["--action", "refresh"])
+        def select(profile_id: str) -> Profile:
+            self.assertEqual(profile_id, "home")
+            events.append("select")
+            return profile
+
+        def run(*arguments) -> int:
+            events.append("run")
+            self.assertEqual(
+                arguments,
+                (module._run_action_command, profile, "refresh", None),
+            )
+            return 7
+
+        with (
+            mock.patch.object(module, "select_profile", side_effect=select),
+            mock.patch.object(module.trio, "run", side_effect=run),
+        ):
+            result = module.main(["--profile", "home", "--action", "refresh"])
 
         self.assertEqual(result, 7)
-        run.assert_called_once_with(module._run_action_command, "refresh", None)
+        self.assertEqual(events, ["select", "run"])
         self.assertEqual(_Application.run_calls, [])
+        self.assertEqual(module.main(["--action", "refresh"]), 2)
+
+    def test_main_keeps_one_application_without_an_action(self) -> None:
+        module, _idle = _load_desktop_app()
+
+        self.assertEqual(module.main([]), 17)
+        self.assertEqual(_Application.run_calls, [["immich-on-demand-desktop"]])
 
 
 if __name__ == "__main__":

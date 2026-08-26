@@ -1,9 +1,9 @@
 [Unit]
-Description=Immich On-Demand filesystem
+Description=Immich On-Demand filesystem (%i)
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/immich-on-demand --profile default mount
+ExecStart=/usr/bin/immich-on-demand --profile %i mount
 KillSignal=SIGINT
 Restart=on-failure
 RestartSec=5s

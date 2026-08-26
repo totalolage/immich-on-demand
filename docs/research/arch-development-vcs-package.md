@@ -1,14 +1,14 @@
 # Arch development VCS package
 
-Status: implementation-ready research
+Status: implemented in the development package; target acceptance pending
 Date: 2026-08-26
-Examined baseline: Immich On-Demand 1.4.0.dev0, Arch Linux, Nautilus 50
+Examined baseline: Immich On-Demand 2.0.0.dev0, Arch Linux, Nautilus 50
 
 ## Decision
 
 Keep `packaging/PKGBUILD` as the checksum-pinned version 1.0.0 release recipe. Add the moving development recipe only at `packaging/development/PKGBUILD`, named `immich-on-demand-git`. This keeps release builds reproducible while providing one Reference-system package for the current daemon, CLI, GTK application, Nautilus adapter, and icons.
 
-Use a Git source named `immich-on-demand`, fetched from the HTTPS `main` branch, and derive `pkgver` as `1.4.0.dev0.r<commit-count>.g<short-hash>`. The repository's last tag is still 1.0.0, so reading the development version from `pyproject.toml` and appending a monotonic revision identifies the current source more accurately than `git describe` alone. Arch's VCS guidance permits parsing project files for the release component and recommends the `RELEASE.rREVISION` form, a `-git` package name, the VCS tool in `makedepends`, and `SKIP` for a moving VCS checksum. It also recommends versioned `provides`, `conflicts`, and no `replaces`. See the official [VCS package guidelines](https://wiki.archlinux.org/title/VCS_package_guidelines) and [PKGBUILD relations](https://wiki.archlinux.org/title/PKGBUILD#Package_relations).
+Use a Git source named `immich-on-demand`, fetched from the HTTPS `main` branch, and derive `pkgver` as `2.0.0.dev0.r<commit-count>.g<short-hash>`. The repository's last tag is still 1.0.0, so reading the development version from `pyproject.toml` and appending a monotonic revision identifies the current source more accurately than `git describe` alone. Arch's VCS guidance permits parsing project files for the release component and recommends the `RELEASE.rREVISION` form, a `-git` package name, the VCS tool in `makedepends`, and `SKIP` for a moving VCS checksum. It also recommends versioned `provides`, `conflicts`, and no `replaces`. See the official [VCS package guidelines](https://wiki.archlinux.org/title/VCS_package_guidelines) and [PKGBUILD relations](https://wiki.archlinux.org/title/PKGBUILD#Package_relations).
 
 Use:
 
@@ -43,6 +43,7 @@ Let the wheel install the Python package and both executables. Install the remai
 | Source | Destination |
 | --- | --- |
 | `packaging/immich-on-demand.service` | `/usr/lib/systemd/user/immich-on-demand.service` |
+| `packaging/immich-on-demand@.service` | `/usr/lib/systemd/user/immich-on-demand@.service` |
 | `packaging/net.kalny.ImmichOnDemand.desktop` | `/usr/share/applications/net.kalny.ImmichOnDemand.desktop` |
 | `packaging/immich-on-demand-nautilus.py` | `/usr/share/nautilus-python/extensions/immich-on-demand.py` |
 | application SVG | `/usr/share/icons/hicolor/scalable/apps/immich-on-demand.svg` |
@@ -74,20 +75,22 @@ pacman -Q immich-on-demand-git
 pacman -Ql immich-on-demand-git
 immich-on-demand --version
 desktop-file-validate /usr/share/applications/net.kalny.ImmichOnDemand.desktop
-systemd-analyze --user verify /usr/lib/systemd/user/immich-on-demand.service
+systemd-analyze --user verify \
+  /usr/lib/systemd/user/immich-on-demand.service \
+  /usr/lib/systemd/user/immich-on-demand@.service
 systemctl --user daemon-reload
-systemctl --user restart immich-on-demand.service
-systemctl --user is-active immich-on-demand.service
+systemctl --user restart immich-on-demand@home.service
+systemctl --user is-active immich-on-demand@home.service
 nautilus -q
 NAUTILUS_PYTHON_DEBUG=misc nautilus
 ```
 
-Confirm that the printed Arch version ends in the source commit hash, the Python version is `1.4.0.dev0`, every table destination is owned by the package, the service is active, and Nautilus reports no loader traceback. Then perform ticket 05's mount-scope, action, emblem, settings, replacement-key, and daemon/CLI independence checks.
+Confirm that the printed Arch version ends in the source commit hash, the Python version is `2.0.0.dev0`, every table destination is owned by the package, the selected Profile service is active, and Nautilus reports no loader traceback. Then perform ticket 05's mount-scope, action, emblem, settings, replacement-key, and daemon/CLI independence checks.
 
 For the uninstall check, stop and disable the user service first, remove the package, and restart Nautilus:
 
 ```bash
-systemctl --user disable --now immich-on-demand.service
+systemctl --user disable --now immich-on-demand@home.service
 sudo pacman -Rns immich-on-demand-git
 nautilus -q
 ```

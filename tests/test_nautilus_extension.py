@@ -176,10 +176,26 @@ def _load_extension_module():
         return importlib.import_module("immich_on_demand.nautilus_extension")
 
 
-def _write_config(root: Path, mount_path: Path) -> Path:
-    config_home = root / "config"
-    path = config_home / "immich-on-demand" / "config.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _xdg_environment(root: Path) -> dict[str, str]:
+    return {
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_RUNTIME_DIR": str(root / "runtime"),
+    }
+
+
+def _write_config(
+    root: Path, mount_path: Path, profile_id: str = "home"
+) -> Path:
+    application = root / "config" / "immich-on-demand"
+    registry = application / "profiles"
+    directory = registry / profile_id
+    for path in (application, registry, directory):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.chmod(0o700)
+    path = directory / "config.json"
     path.write_text(
         json.dumps(
             {
@@ -189,15 +205,14 @@ def _write_config(root: Path, mount_path: Path) -> Path:
         ),
         encoding="utf-8",
     )
-    return config_home
+    path.chmod(0o600)
+    return path
 
 
 def _configured_extension(root: Path):
     mount_path = root / "Immich"
-    config_home = _write_config(root, mount_path)
-    with mock.patch.dict(
-        os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=False
-    ):
+    _write_config(root, mount_path)
+    with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
         module = _load_extension_module()
         return module, module.NautilusExtension(), mount_path
 
@@ -234,10 +249,8 @@ class NautilusExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             mount_path = root / "Immich"
-            config_home = _write_config(root, mount_path)
-            with mock.patch.dict(
-                os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=False
-            ):
+            _write_config(root, mount_path)
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
                 module = _load_extension_module()
                 extension = module.NautilusExtension()
 
@@ -261,9 +274,18 @@ class NautilusExtensionTests(unittest.TestCase):
             self.assertEqual(
                 _Subprocess.calls,
                 [
-                    (["immich-on-demand-desktop", "--action", "refresh"], 0),
-                    (["immich-on-demand-desktop"], 0),
-                    (["immich-on-demand-desktop"], 0),
+                    (
+                        [
+                            "immich-on-demand-desktop",
+                            "--profile",
+                            "home",
+                            "--action",
+                            "refresh",
+                        ],
+                        0,
+                    ),
+                    (["immich-on-demand-desktop", "--profile", "home"], 0),
+                    (["immich-on-demand-desktop", "--profile", "home"], 0),
                 ],
             )
 
@@ -322,7 +344,9 @@ class NautilusExtensionTests(unittest.TestCase):
 
                 _DeferredThread.created[0].run()
                 describe.assert_awaited_once_with(
-                    "describe", [file.get_uri() for file in files]
+                    extension._mounts[0][0],
+                    "describe",
+                    [file.get_uri() for file in files],
                 )
                 self.assertEqual(len(_GLib.callbacks), 1)
 
@@ -344,6 +368,125 @@ class NautilusExtensionTests(unittest.TestCase):
                     (closures[1], provider, handles[1], _OperationResult.COMPLETE),
                 ],
             )
+
+    def test_interleaved_profiles_use_separate_batches_caches_and_actions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home_mount = root / "Home"
+            work_mount = root / "Work"
+            _write_config(root, home_mount, "home")
+            _write_config(root, work_mount, "work")
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
+                module = _load_extension_module()
+                extension = module.NautilusExtension()
+
+            provider = object()
+            files = [
+                _FileInfo(str(home_mount / "first.jpg")),
+                _FileInfo(str(work_mount / "second.jpg")),
+                _FileInfo(str(home_mount / "third.jpg")),
+            ]
+            for file in files:
+                extension.update_file_info_full(
+                    provider, object(), object(), file
+                )
+
+            async def describe(profile, action, uris):
+                self.assertEqual(action, "describe")
+                return {
+                    "items": [
+                        {
+                            "uri": uri,
+                            "cached": True,
+                            "pinned": False,
+                            "busy": False,
+                            "recoverable": False,
+                        }
+                        for uri in uris
+                    ]
+                }
+
+            action = mock.AsyncMock(side_effect=describe)
+            with (
+                mock.patch.object(module, "run_action", action),
+                mock.patch("threading.Thread", _DeferredThread),
+            ):
+                _drain_deferred_work()
+
+            self.assertEqual(
+                [
+                    (call.args[0].id, call.args[2])
+                    for call in action.await_args_list
+                ],
+                [
+                    ("home", [files[0].get_uri(), files[2].get_uri()]),
+                    ("work", [files[1].get_uri()]),
+                ],
+            )
+            self.assertEqual(len(_DeferredThread.created), 2)
+            self.assertEqual(
+                set(extension._cache),
+                {
+                    ("home", files[0].get_uri()),
+                    ("home", files[2].get_uri()),
+                    ("work", files[1].get_uri()),
+                },
+            )
+
+            work_items = extension.get_background_items(
+                _FileInfo(str(work_mount), directory=True)
+            )
+            work_items[0].activate()
+            self.assertEqual(
+                _Subprocess.calls,
+                [
+                    (
+                        [
+                            "immich-on-demand-desktop",
+                            "--profile",
+                            "work",
+                            "--action",
+                            "refresh",
+                        ],
+                        0,
+                    )
+                ],
+            )
+
+    def test_overlapping_active_mounts_make_the_provider_inert(self) -> None:
+        for work_mount in ("Home", "Home/Work", "."):
+            with self.subTest(work_mount=work_mount), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home = root / "Home"
+                _write_config(root, home, "home")
+                _write_config(root, root / work_mount, "work")
+                with mock.patch.dict(
+                    os.environ, _xdg_environment(root), clear=False
+                ):
+                    module = _load_extension_module()
+                    extension = module.NautilusExtension()
+
+                self.assertEqual(extension._mounts, ())
+                self.assertEqual(
+                    extension.get_background_items(
+                        _FileInfo(str(home), directory=True)
+                    ),
+                    [],
+                )
+
+    def test_one_unreadable_active_config_makes_the_provider_inert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_config(root, root / "Home", "home")
+            unreadable = _write_config(root, root / "Work", "work")
+            unreadable.chmod(0o644)
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
+                module = _load_extension_module()
+                extension = module.NautilusExtension()
+
+            self.assertEqual(extension._mounts, ())
 
     def test_busy_state_invalidates_again_after_the_cache_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -376,13 +519,13 @@ class NautilusExtensionTests(unittest.TestCase):
             callback, args = _GLib.callbacks.pop(0)
             callback(*args)
 
-            self.assertIn(uri, extension._cache)
+            self.assertIn(("home", uri), extension._cache)
             self.assertEqual(file.invalidations, 0)
             self.assertEqual(len(_GLib.timeouts), 1)
             milliseconds, callback, args = _GLib.timeouts.pop(0)
             self.assertEqual(milliseconds, int(module._CACHE_SECONDS * 1000))
             self.assertFalse(callback(*args))
-            self.assertNotIn(uri, extension._cache)
+            self.assertNotIn(("home", uri), extension._cache)
             self.assertEqual(file.invalidations, 1)
 
     def test_cancel_completes_once_and_removes_the_uri_from_pending_work(self) -> None:
@@ -414,7 +557,11 @@ class NautilusExtensionTests(unittest.TestCase):
                 callback, args = _GLib.callbacks.pop(0)
                 callback(*args)
                 _DeferredThread.created[0].run()
-                describe.assert_awaited_once_with("describe", [files[1].get_uri()])
+                describe.assert_awaited_once_with(
+                    extension._mounts[0][0],
+                    "describe",
+                    [files[1].get_uri()],
+                )
                 callback, args = _GLib.callbacks.pop(0)
                 callback(*args)
 
@@ -449,7 +596,7 @@ class NautilusExtensionTests(unittest.TestCase):
                 _drain_deferred_work()
 
             self.assertEqual(
-                [len(awaited.args[1]) for awaited in describe.await_args_list],
+                [len(awaited.args[2]) for awaited in describe.await_args_list],
                 [64, 1],
             )
             self.assertEqual(len(_NautilusRuntime.completions), 65)
@@ -476,7 +623,7 @@ class NautilusExtensionTests(unittest.TestCase):
             ):
                 _drain_deferred_work()
 
-            batches = [awaited.args[1] for awaited in describe.await_args_list]
+            batches = [awaited.args[2] for awaited in describe.await_args_list]
             self.assertGreater(len(batches), 1)
             for uris in batches:
                 frame = json.dumps(
@@ -662,10 +809,8 @@ class NautilusExtensionTests(unittest.TestCase):
             root = Path(directory)
             mount_path = root / "Immich"
             asset_path = mount_path / "name with spaces.jpg"
-            config_home = _write_config(root, mount_path)
-            with mock.patch.dict(
-                os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=False
-            ):
+            _write_config(root, mount_path)
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
                 module = _load_extension_module()
                 extension = module.NautilusExtension()
 
@@ -685,6 +830,8 @@ class NautilusExtensionTests(unittest.TestCase):
                     (
                         [
                             "immich-on-demand-desktop",
+                            "--profile",
+                            "home",
                             "--action",
                             "pin",
                             "--uri",
@@ -695,6 +842,8 @@ class NautilusExtensionTests(unittest.TestCase):
                     (
                         [
                             "immich-on-demand-desktop",
+                            "--profile",
+                            "home",
                             "--action",
                             "evict",
                             "--uri",
@@ -710,7 +859,7 @@ class NautilusExtensionTests(unittest.TestCase):
             root = Path(directory)
             module, extension, mount_path = _configured_extension(root)
             asset = _FileInfo(str(mount_path / "pinned.jpg"))
-            extension._cache[asset.get_uri()] = (
+            extension._cache[("home", asset.get_uri())] = (
                 module.time.monotonic() + 10,
                 {
                     "cached": True,
@@ -726,10 +875,10 @@ class NautilusExtensionTests(unittest.TestCase):
                 [item.properties["label"] for item in items], ["Unpin"]
             )
             items[0].activate()
-            self.assertIn(asset.get_uri(), extension._cache)
+            self.assertIn(("home", asset.get_uri()), extension._cache)
             self.assertEqual(asset.invalidations, 0)
             _Subprocess.pending[0].complete()
-            self.assertNotIn(asset.get_uri(), extension._cache)
+            self.assertNotIn(("home", asset.get_uri()), extension._cache)
             self.assertEqual(asset.invalidations, 1)
             self.assertEqual(
                 _Subprocess.calls,
@@ -737,6 +886,8 @@ class NautilusExtensionTests(unittest.TestCase):
                     (
                         [
                             "immich-on-demand-desktop",
+                            "--profile",
+                            "home",
                             "--action",
                             "unpin",
                             "--uri",
@@ -753,7 +904,7 @@ class NautilusExtensionTests(unittest.TestCase):
             module, extension, mount_path = _configured_extension(root)
             asset = _FileInfo(str(mount_path / "slow-video.mp4"))
             uri = asset.get_uri()
-            extension._cache[uri] = (
+            extension._cache[("home", uri)] = (
                 module.time.monotonic() + 10,
                 {
                     "cached": False,
@@ -766,13 +917,13 @@ class NautilusExtensionTests(unittest.TestCase):
             items = extension.get_file_items([asset])
             items[0].activate()
 
-            self.assertIn(uri, extension._cache)
+            self.assertIn(("home", uri), extension._cache)
             self.assertEqual(asset.invalidations, 0)
             self.assertEqual(len(_Subprocess.pending), 1)
             self.assertEqual(len(_GLib.timeouts), 1)
             _milliseconds, callback, args = _GLib.timeouts.pop(0)
             self.assertFalse(callback(*args))
-            self.assertNotIn(uri, extension._cache)
+            self.assertNotIn(("home", uri), extension._cache)
             self.assertEqual(asset.invalidations, 1)
             self.assertEqual(len(_Subprocess.pending), 1)
 
@@ -781,7 +932,7 @@ class NautilusExtensionTests(unittest.TestCase):
             root = Path(directory)
             module, extension, mount_path = _configured_extension(root)
             asset = _FileInfo(str(mount_path / "retry.jpg"))
-            extension._cache[asset.get_uri()] = (
+            extension._cache[("home", asset.get_uri())] = (
                 module.time.monotonic() + 10,
                 {
                     "cached": False,
@@ -802,6 +953,8 @@ class NautilusExtensionTests(unittest.TestCase):
                 _Subprocess.calls[0][0],
                 [
                     "immich-on-demand-desktop",
+                    "--profile",
+                    "home",
                     "--action",
                     "pin",
                     "--uri",
@@ -813,10 +966,8 @@ class NautilusExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             mount_path = root / "Immich"
-            config_home = _write_config(root, mount_path)
-            with mock.patch.dict(
-                os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=False
-            ):
+            _write_config(root, mount_path)
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
                 module = _load_extension_module()
                 extension = module.NautilusExtension()
 
@@ -851,10 +1002,8 @@ class NautilusExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             mount_path = root / "Immich"
-            config_home = _write_config(root, mount_path)
-            with mock.patch.dict(
-                os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=False
-            ):
+            _write_config(root, mount_path)
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
                 module = _load_extension_module()
                 extension = module.NautilusExtension()
 
@@ -876,11 +1025,8 @@ class NautilusExtensionTests(unittest.TestCase):
 
     def test_missing_configuration_makes_the_provider_inert(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.dict(
-                os.environ,
-                {"XDG_CONFIG_HOME": str(Path(directory) / "missing")},
-                clear=False,
-            ):
+            root = Path(directory)
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
                 module = _load_extension_module()
                 extension = module.NautilusExtension()
 
@@ -897,12 +1043,10 @@ class NautilusExtensionTests(unittest.TestCase):
     def test_malformed_tilde_mount_makes_the_provider_inert(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config_home = _write_config(
+            _write_config(
                 root, Path("~immich-on-demand-user-does-not-exist/Immich")
             )
-            with mock.patch.dict(
-                os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=False
-            ):
+            with mock.patch.dict(os.environ, _xdg_environment(root), clear=False):
                 module = _load_extension_module()
                 extension = module.NautilusExtension()
 

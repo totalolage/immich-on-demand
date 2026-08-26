@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 import base64
 from functools import partial
@@ -51,7 +51,8 @@ from .immich import (
 from .library import Library
 from .model import Asset
 from .previewer import populate_previews
-from .settings import Settings, cache_path, data_path, load_api_key, runtime_path, state_path
+from .profiles import Profile, ProfileError, claim_service
+from .settings import Settings, load_api_key
 from .thumbnails import prepare_thumbnail_cache
 from .uploads import (
     UploadErrorCode,
@@ -89,16 +90,19 @@ async def _queue_call(
 
 
 def _check_mountpoint(path: Path) -> None:
-    info = path.stat(follow_symlinks=False)
-    if stat.S_ISLNK(info.st_mode):
-        raise PermissionError(f"refusing symlinked mountpoint: {path}")
-    if not stat.S_ISDIR(info.st_mode):
-        raise NotADirectoryError(path)
-    if info.st_uid != os.getuid():
-        raise PermissionError(f"mountpoint is not owned by this user: {path}")
-    with os.scandir(path) as entries:
-        if next(entries, None) is not None:
-            raise OSError(f"mountpoint is not empty: {path}")
+    try:
+        info = path.stat(follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ProfileError("Profile mount path is not a directory")
+        if info.st_uid != os.getuid():
+            raise ProfileError("Profile mount path is not owned by this user")
+        with os.scandir(path) as entries:
+            if next(entries, None) is not None:
+                raise ProfileError("Profile mount path is not empty")
+    except ProfileError:
+        raise
+    except OSError as error:
+        raise ProfileError("could not inspect Profile mount path") from error
 
 
 def _prepare_mountpoint(path: Path) -> None:
@@ -106,18 +110,27 @@ def _prepare_mountpoint(path: Path) -> None:
         path.mkdir(mode=0o700, parents=True)
     except FileExistsError:
         pass
+    except OSError as error:
+        raise ProfileError("could not create Profile mount path") from error
     _check_mountpoint(path)
 
 
-def _prepare_cache_root(path: Path) -> None:
+def _prepare_profile_root(path: Path, name: str) -> None:
     try:
         path.mkdir(mode=0o700, parents=True)
     except FileExistsError:
         pass
-    info = os.lstat(path)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        raise PermissionError("cache root must be a directory owned by this user")
-    os.chmod(path, 0o700)
+    except OSError as error:
+        raise ProfileError(f"could not create Profile {name} root") from error
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ProfileError(f"Profile {name} root is unsafe")
+        os.chmod(path, 0o700)
+    except ProfileError:
+        raise
+    except OSError as error:
+        raise ProfileError(f"could not inspect Profile {name} root") from error
 
 
 def _evict_to_limits(content_cache: ContentCache, settings: Settings) -> list[str]:
@@ -948,11 +961,13 @@ def _trusted_profile(
 
 
 async def _validate_access(
-    settings: Settings, read_client: ImmichClient
+    profile: Profile, settings: Settings, read_client: ImmichClient
 ) -> tuple[ServerSession, ImmichClient | None, ServerSession | None]:
     read_session = await read_client.validate()
     try:
-        mutation_key = load_api_key(settings, purpose="mutation")
+        mutation_key = load_api_key(
+            settings, purpose="mutation", profile_id=profile.id
+        )
     except RuntimeError as error:
         if not _missing_mutation_key(error):
             raise
@@ -973,6 +988,7 @@ async def _validate_access(
 
 
 async def _offline_worker(
+    profile: Profile,
     catalog: Catalog,
     library: Library,
     read_client: ImmichClient,
@@ -1005,7 +1021,7 @@ async def _offline_worker(
         mutation_client: ImmichClient | None = None
         try:
             read_session, mutation_client, mutation_session = await _validate_access(
-                settings, read_client
+                profile, settings, read_client
             )
             if mutation_client is not None:
                 mutation_clients.append(mutation_client)
@@ -1136,22 +1152,42 @@ def _catalog_file_from_uri(
     raise AssertionError("nonempty mounted path did not resolve")
 
 
-async def run_service(settings: Settings) -> None:
+async def run_service(profile: Profile) -> None:
+    try:
+        with claim_service(profile) as settings:
+            await _run_claimed_service(profile, settings)
+    except BaseExceptionGroup as errors:
+        match, rest = errors.split(ProfileError)
+        if match is not None and rest is None:
+            raise ProfileError("Profile service could not start") from errors
+        raise
+
+
+async def _run_claimed_service(profile: Profile, settings: Settings) -> None:
     _prepare_mountpoint(settings.mount_path)
-    cache_root = cache_path()
-    _prepare_cache_root(cache_root)
-    read_key = load_api_key(settings, purpose="read-only")
+    cache_root = profile.cache
+    _prepare_profile_root(cache_root, "cache")
+    _prepare_profile_root(profile.data, "data")
+    read_key = load_api_key(
+        settings, purpose="read-only", profile_id=profile.id
+    )
     read_client = ImmichClient(settings.server_url, read_key)
     mutation_clients: list[ImmichClient] = []
     try:
-        state_root = state_path()
-        with (
-            Catalog(state_root / "catalog.db") as catalog,
-            UploadQueue(
-                data_path() / "uploads",
-                minimum_free_bytes=settings.minimum_free_bytes,
-            ) as upload_queue,
-        ):
+        state_root = profile.state
+        with ExitStack() as local_state:
+            try:
+                catalog = local_state.enter_context(
+                    Catalog(state_root / "catalog.db")
+                )
+                upload_queue = local_state.enter_context(
+                    UploadQueue(
+                        profile.data / "uploads",
+                        minimum_free_bytes=settings.minimum_free_bytes,
+                    )
+                )
+            except (PermissionError, UploadQueueError) as error:
+                raise ProfileError("Profile local state is unsafe") from error
             catalog_lock = trio.Lock()
             stored_profile = catalog.trusted_profile()
             if (
@@ -1164,7 +1200,7 @@ async def run_service(settings: Settings) -> None:
             mutation_session: ServerSession | None = None
             try:
                 read_session, mutation_client, mutation_session = await _validate_access(
-                    settings, read_client
+                    profile, settings, read_client
                 )
                 if mutation_client is not None:
                     mutation_clients.append(mutation_client)
@@ -1214,14 +1250,17 @@ async def run_service(settings: Settings) -> None:
                 mutation_session = None
                 online = [False]
 
-            content_cache = ContentCache(
-                cache_root / "originals",
-                read_client,
-                max_bytes=settings.cache_max_bytes,
-                minimum_free_bytes=settings.minimum_free_bytes,
-                pinned_ids=catalog.pinned_ids(),
-                downloads_enabled=online[0],
-            )
+            try:
+                content_cache = ContentCache(
+                    cache_root / "originals",
+                    read_client,
+                    max_bytes=settings.cache_max_bytes,
+                    minimum_free_bytes=settings.minimum_free_bytes,
+                    pinned_ids=catalog.pinned_ids(),
+                    downloads_enabled=online[0],
+                )
+            except PermissionError as error:
+                raise ProfileError("Profile cache state is unsafe") from error
             library = Library(
                 catalog,
                 content_cache,
@@ -1646,6 +1685,7 @@ async def run_service(settings: Settings) -> None:
                 else:
                     await nursery.start(
                         _offline_worker,
+                        profile,
                         catalog,
                         library,
                         read_client,
@@ -1665,17 +1705,24 @@ async def run_service(settings: Settings) -> None:
                         upload_requests,
                         upload_queue,
                     )
+                try:
+                    current_mount = settings.mount_path.resolve(strict=False)
+                except OSError as error:
+                    raise ProfileError("could not resolve Profile mount path") from error
+                if current_mount != settings.mount_path:
+                    raise ProfileError("Profile mount path changed after it was claimed")
                 _check_mountpoint(settings.mount_path)
                 pyfuse3.init(
                     filesystem,
                     str(settings.mount_path),
-                    set(pyfuse3.default_options) | {"fsname=immich-on-demand", "auto_unmount"},
+                    set(pyfuse3.default_options)
+                    | {f"fsname=immich-on-demand:{profile.id}", "auto_unmount"},
                 )
                 mount_ready.set()
                 try:
                     await nursery.start(
                         serve_control,
-                        runtime_path() / "control.sock",
+                        profile.runtime / "control.sock",
                         {
                             "status": status,
                             "refresh": refresh,

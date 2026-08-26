@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 import base64
 import hashlib
@@ -34,6 +34,7 @@ from immich_on_demand.immich import (
     UPLOAD_PERMISSIONS,
 )
 from immich_on_demand.model import Asset
+from immich_on_demand.profiles import Profile, ProfileError
 from immich_on_demand.service import (
     FULL_REFRESH_SECONDS,
     _RestoreJob,
@@ -63,6 +64,17 @@ OWNER_ID = "87654321-4321-4321-8321-cba987654321"
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 PINNED_ID = "aaaaaaaa-1234-4234-8234-123456789abc"
 OTHER_UPLOAD_ID = "bbbbbbbb-1234-4234-8234-123456789abc"
+
+
+def selected_profile(root: Path, profile_id: str = "home") -> Profile:
+    return Profile(
+        profile_id,
+        root / "selected-config",
+        root / "selected-state",
+        root / "selected-data",
+        root / "selected-cache",
+        root / "selected-runtime",
+    )
 
 
 def trusted_profile(read_key: str = "read") -> TrustedProfile:
@@ -117,6 +129,8 @@ class ServiceFakes:
         trusted_profile: TrustedProfile | None = None,
     ) -> None:
         self.root = root
+        self.profile = selected_profile(root)
+        self.claimed_settings: Settings | None = None
         self.mutation = mutation
         self.block_preview = block_preview
         self.preview_error_call = preview_error_call
@@ -345,6 +359,9 @@ class ServiceFakes:
                 self.quarantined_count = 0
                 outer.upload_queue = self
                 outer.events.append(f"uploads:{path.relative_to(root)}")
+                outer.events.append(
+                    f"upload-parent-mode:{stat.S_IMODE(path.parent.stat().st_mode):o}"
+                )
 
             def __enter__(self):
                 return self
@@ -382,7 +399,9 @@ class ServiceFakes:
         self.Filesystem = Filesystem
         self.Queue = Queue
 
-    def key(self, settings: Settings, purpose: str) -> str:
+    def key(self, settings: Settings, purpose: str, *, profile_id: str) -> str:
+        if profile_id != "home":
+            raise RuntimeError("unexpected Profile")
         if purpose == "read-only":
             return "read"
         if self.mutation:
@@ -519,6 +538,16 @@ class ServiceFakes:
         self.terminated.set()
         self.stop_main.set()
 
+    @contextmanager
+    def claim(self, profile: Profile):
+        if profile != self.profile or self.claimed_settings is None:
+            raise AssertionError("service did not claim the configured Profile")
+        self.events.append("claim")
+        try:
+            yield self.claimed_settings
+        finally:
+            self.events.append("claim-close")
+
     def patches(self, *, real_control: bool = False) -> ExitStack:
         stack = ExitStack()
         replacements = {
@@ -534,10 +563,7 @@ class ServiceFakes:
             "reconcile_album_people": self.reconcile,
             "populate_previews": self.previews,
             "_upload_worker": self.upload_worker,
-            "state_path": lambda: self.root / "state",
-            "data_path": lambda: self.root / "data",
-            "cache_path": lambda: self.root / "cache",
-            "runtime_path": lambda: self.root / "runtime",
+            "claim_service": self.claim,
         }
         if not real_control:
             replacements["serve_control"] = self.control
@@ -552,7 +578,85 @@ class ServiceFakes:
         return stack
 
 
+async def run_fake_service(fakes: ServiceFakes, settings: Settings) -> None:
+    fakes.claimed_settings = settings
+    await run_service(fakes.profile)
+
+
 class ServiceTest(unittest.TestCase):
+    def test_selected_profile_owns_service_paths_and_diagnostic_name(self) -> None:
+        async def scenario(root: Path) -> ServiceFakes:
+            fakes = ServiceFakes(root, block_preview=False)
+            profile = selected_profile(root)
+            settings = Settings(
+                "https://photos.example.test",
+                root / "mount",
+                refresh_seconds=3600,
+            )
+
+            @contextmanager
+            def claim(candidate: Profile):
+                self.assertEqual(candidate, profile)
+                fakes.events.append("claim")
+                try:
+                    yield settings
+                finally:
+                    fakes.events.append("claim-close")
+
+            fakes.stop_main.set()
+            with fakes.patches(), patch(
+                "immich_on_demand.service.claim_service", claim
+            ):
+                await run_service(profile)
+            return fakes
+
+        with tempfile.TemporaryDirectory() as directory:
+            fakes = trio.run(scenario, Path(directory))
+
+        self.assertIn("catalog:selected-state/catalog.db", fakes.events)
+        self.assertIn("uploads:selected-data/uploads", fakes.events)
+        self.assertIn("upload-parent-mode:700", fakes.events)
+        self.assertIn("cache:selected-cache/originals", fakes.events)
+        self.assertIn("control:selected-runtime/control.sock", fakes.events)
+        self.assertIn("fsname=immich-on-demand:home", fakes.fuse_options)
+        self.assertLess(fakes.events.index("claim"), fakes.events.index("validate:read"))
+        self.assertLess(fakes.events.index("close:read"), fakes.events.index("claim-close"))
+
+    def test_mount_path_cannot_change_after_the_service_claim(self) -> None:
+        async def scenario(root: Path) -> None:
+            fakes = ServiceFakes(root, block_preview=False)
+            parent = root / "first"
+            replacement = root / "second"
+            (parent / "mount").mkdir(parents=True)
+            (replacement / "mount").mkdir(parents=True)
+            settings = Settings(
+                "https://photos.example.test",
+                parent / "mount",
+                refresh_seconds=3600,
+            )
+            original_refresh = fakes.refresh
+            changed = False
+
+            async def refresh(*args: object, **kwargs: object) -> CatalogStats:
+                nonlocal changed
+                result = await original_refresh(*args, **kwargs)
+                if not changed:
+                    changed = True
+                    parent.rename(root / "moved")
+                    parent.symlink_to(replacement, target_is_directory=True)
+                return result
+
+            fakes.refresh = refresh  # type: ignore[method-assign]
+            with fakes.patches(), self.assertRaisesRegex(
+                ProfileError, "could not start"
+            ) as caught:
+                await run_fake_service(fakes, settings)
+            self.assertEqual(caught.exception.exit_status, 78)
+            self.assertNotIn("fuse-init", fakes.events)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_blocked_replacement_does_not_freeze_relation_refresh(self) -> None:
         events: list[str] = []
 
@@ -1864,7 +1968,7 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     status = fakes.handlers["status"]
                     self.assertEqual(
@@ -1919,7 +2023,7 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     fakes.read_validation_error = None
                     refresh = fakes.handlers["refresh"]
@@ -1965,7 +2069,7 @@ class ServiceTest(unittest.TestCase):
             )
             settings = Settings("https://photos.example.test", root / "mount")
             with fakes.patches(), self.assertRaises(expected):
-                await run_service(settings)
+                await run_fake_service(fakes, settings)
             return fakes
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2078,9 +2182,9 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches(real_control=True):
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
-                    socket = root / "runtime" / "control.sock"
+                    socket = fakes.profile.runtime / "control.sock"
                     if error is None:
                         self.assertEqual(
                             await send_request(
@@ -2142,9 +2246,9 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches(real_control=True):
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
-                    socket = root / "runtime" / "control.sock"
+                    socket = fakes.profile.runtime / "control.sock"
                     with self.assertRaisesRegex(
                         ControlError, "^control request timed out$"
                     ):
@@ -2213,9 +2317,9 @@ class ServiceTest(unittest.TestCase):
                 "immich_on_demand.service.serve_control", short_control
             ):
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
-                    socket = root / "runtime" / "control.sock"
+                    socket = fakes.profile.runtime / "control.sock"
                     with self.assertRaisesRegex(ControlError, "^request timed out$"):
                         await send_request(
                             socket,
@@ -2308,7 +2412,7 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     pin = fakes.handlers["pin"]
                     with self.assertRaisesRegex(OSError, "private catalog"):
@@ -2392,7 +2496,7 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     callback = fakes.on_uploaded
                     await callback(upload_entry())  # type: ignore[operator]
@@ -2427,7 +2531,7 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     callback = fakes.on_uploaded
                     await callback(upload_entry())  # type: ignore[operator]
@@ -2458,7 +2562,7 @@ class ServiceTest(unittest.TestCase):
             )
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     self.assertLess(fakes.events.index("refresh"), fakes.events.index("suppress"))
                     self.assertLess(
@@ -2732,7 +2836,7 @@ class ServiceTest(unittest.TestCase):
 
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     with trio.fail_after(0.1):
                         await fakes.reconcile_started.wait()
                     self.assertEqual(fakes.events.count("suppress"), 1)
@@ -2761,7 +2865,7 @@ class ServiceTest(unittest.TestCase):
                 OSError,
                 "preview suppression failed",
             ):
-                await run_service(settings)
+                await run_fake_service(fakes, settings)
             return fakes
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2780,7 +2884,7 @@ class ServiceTest(unittest.TestCase):
 
             async def serve() -> None:
                 try:
-                    await run_service(settings)
+                    await run_fake_service(fakes, settings)
                 except RuntimeError as error:
                     failures.append(error)
 
@@ -2819,7 +2923,7 @@ class ServiceTest(unittest.TestCase):
                 "immich_on_demand.service", level="WARNING"
             ) as logs:
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     refresh = fakes.handlers["refresh"]
                     self.assertEqual(await refresh({}), {"scheduled": True})  # type: ignore[operator]
@@ -2850,7 +2954,7 @@ class ServiceTest(unittest.TestCase):
 
             with fakes.patches():
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     nursery.start_soon(observe_commit)
                     await fakes.main_started.wait()
                     refresh = fakes.handlers["refresh"]
@@ -2888,7 +2992,7 @@ class ServiceTest(unittest.TestCase):
 
             async def serve() -> None:
                 try:
-                    await run_service(settings)
+                    await run_fake_service(fakes, settings)
                 except RuntimeError as error:
                     failures.append(error)
 
@@ -2965,7 +3069,7 @@ class ServiceTest(unittest.TestCase):
                 ),
             ):
                 async with trio.open_nursery() as nursery:
-                    nursery.start_soon(run_service, settings)
+                    nursery.start_soon(run_fake_service, fakes, settings)
                     await fakes.main_started.wait()
                     on_uploaded = fakes.on_uploaded
                     assert callable(on_uploaded)
@@ -3002,7 +3106,7 @@ class ServiceTest(unittest.TestCase):
             settings = Settings("https://photos.example.test", root / "mount", refresh_seconds=3600)
             fakes.stop_main.set()
             with fakes.patches():
-                await run_service(settings)
+                await run_fake_service(fakes, settings)
 
             self.assertEqual(len(fakes.clients), 1)
             self.assertEqual(fakes.clients[0].validations, [None])
@@ -3022,7 +3126,7 @@ class ServiceTest(unittest.TestCase):
             )
             fakes.stop_main.set()
             with fakes.patches():
-                await run_service(settings)
+                await run_fake_service(fakes, settings)
 
             self.assertEqual(fakes.clients[1].validations, [MUTATION_PERMISSIONS])
 
@@ -3038,7 +3142,7 @@ class ServiceTest(unittest.TestCase):
             )
             settings = Settings("https://photos.example.test", root / "mount")
             with fakes.patches(), self.assertRaisesRegex(RuntimeError, "different Immich users"):
-                await run_service(settings)
+                await run_fake_service(fakes, settings)
 
             self.assertIn("close:mutation", fakes.events)
             self.assertIn("close:read", fakes.events)
@@ -3048,6 +3152,7 @@ class ServiceTest(unittest.TestCase):
 
     def test_refuses_unsafe_mountpoint_before_credentials(self) -> None:
         async def scenario(root: Path) -> None:
+            profile = selected_profile(root)
             target = root / "target"
             target.mkdir()
             symlink = root / "symlink"
@@ -3056,15 +3161,30 @@ class ServiceTest(unittest.TestCase):
             nonempty.mkdir()
             (nonempty / "keep").touch()
             for mount in (symlink, nonempty):
-                with self.assertRaises((PermissionError, OSError)):
-                    await run_service(Settings("https://photos.example.test", mount))
+                settings = Settings("https://photos.example.test", mount)
+                with (
+                    patch(
+                        "immich_on_demand.service.claim_service",
+                        return_value=nullcontext(settings),
+                    ),
+                    self.assertRaisesRegex(ProfileError, "Profile mount path"),
+                ):
+                    await run_service(profile)
             foreign = root / "foreign"
             foreign.mkdir()
-            with patch(
-                "immich_on_demand.service.os.getuid", return_value=foreign.stat().st_uid + 1
+            settings = Settings("https://photos.example.test", foreign)
+            with (
+                patch(
+                    "immich_on_demand.service.claim_service",
+                    return_value=nullcontext(settings),
+                ),
+                patch(
+                    "immich_on_demand.service.os.getuid",
+                    return_value=foreign.stat().st_uid + 1,
+                ),
+                self.assertRaisesRegex(ProfileError, "Profile mount path"),
             ):
-                with self.assertRaises(PermissionError):
-                    await run_service(Settings("https://photos.example.test", foreign))
+                await run_service(profile)
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
@@ -3073,16 +3193,38 @@ class ServiceTest(unittest.TestCase):
         async def scenario(root: Path) -> None:
             target = root / "cache-target"
             target.mkdir(mode=0o755)
-            (root / "cache").symlink_to(target, target_is_directory=True)
             fakes = ServiceFakes(root, block_preview=False)
+            fakes.profile.cache.symlink_to(target, target_is_directory=True)
+            settings = Settings("https://photos.example.test", root / "mount")
 
-            with fakes.patches(), self.assertRaisesRegex(PermissionError, "cache root"):
-                await run_service(
-                    Settings("https://photos.example.test", root / "mount")
-                )
+            with fakes.patches(), self.assertRaisesRegex(ProfileError, "cache root"):
+                await run_fake_service(fakes, settings)
 
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
             self.assertEqual(fakes.clients, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_unsafe_profile_catalog_is_a_nonrestartable_profile_error(self) -> None:
+        async def scenario(root: Path) -> None:
+            profile = selected_profile(root)
+            profile.state.mkdir(mode=0o700, parents=True)
+            profile.state.chmod(0o700)
+            foreign = root / "foreign.db"
+            foreign.write_bytes(b"foreign")
+            (profile.state / "catalog.db").symlink_to(foreign)
+            settings = Settings("https://photos.example.test", root / "mount")
+            with (
+                patch(
+                    "immich_on_demand.service.claim_service",
+                    return_value=nullcontext(settings),
+                ),
+                patch("immich_on_demand.service.load_api_key", return_value="secret"),
+                self.assertRaisesRegex(ProfileError, "local state is unsafe") as caught,
+            ):
+                await run_service(profile)
+            self.assertEqual(caught.exception.exit_status, 78)
 
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))

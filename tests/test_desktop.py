@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, call, patch
 import trio
 
 from immich_on_demand.desktop import run_action
+from immich_on_demand.profiles import Profile
 
 
 ASSET_ID = "12345678-1234-4234-8234-123456789abc"
@@ -14,50 +15,50 @@ ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 class DesktopTest(unittest.TestCase):
     def test_actions_use_only_the_bounded_local_control_client(self) -> None:
         async def scenario(runtime: Path) -> None:
+            profile = Profile("home", runtime, runtime, runtime, runtime, runtime)
             request = AsyncMock(return_value={"scheduled": True})
             with (
                 patch("immich_on_demand.desktop.send_request", request),
-                patch("immich_on_demand.desktop.runtime_path", return_value=runtime),
                 patch("immich_on_demand.desktop.secrets.randbits", return_value=0),
             ):
                 self.assertEqual(
-                    await run_action("status"),
+                    await run_action(profile, "status"),
                     {"scheduled": True},
                 )
                 self.assertEqual(
-                    await run_action("refresh"),
+                    await run_action(profile, "refresh"),
                     {"scheduled": True},
                 )
                 uri = "file:///home/user/Immich/photo.jpg"
                 self.assertEqual(
-                    await run_action("evict", uri),
+                    await run_action(profile, "evict", uri),
                     {"scheduled": True},
                 )
                 self.assertEqual(
-                    await run_action("describe", [uri]),
+                    await run_action(profile, "describe", [uri]),
                     {"scheduled": True},
                 )
-                self.assertEqual(await run_action("pin", uri), {"scheduled": True})
-                self.assertEqual(await run_action("unpin", uri), {"scheduled": True})
+                self.assertEqual(await run_action(profile, "pin", uri), {"scheduled": True})
+                self.assertEqual(await run_action(profile, "unpin", uri), {"scheduled": True})
                 self.assertEqual(
-                    await run_action("restore", ASSET_ID.upper()),
-                    {"scheduled": True},
-                )
-                self.assertEqual(
-                    await run_action("uploads"),
+                    await run_action(profile, "restore", ASSET_ID.upper()),
                     {"scheduled": True},
                 )
                 self.assertEqual(
-                    await run_action("uploads", ASSET_ID.upper()),
+                    await run_action(profile, "uploads"),
                     {"scheduled": True},
                 )
                 self.assertEqual(
-                    await run_action("retry-upload", ASSET_ID.upper()),
+                    await run_action(profile, "uploads", ASSET_ID.upper()),
+                    {"scheduled": True},
+                )
+                self.assertEqual(
+                    await run_action(profile, "retry-upload", ASSET_ID.upper()),
                     {"scheduled": True},
                 )
                 self.assertEqual(
                     await run_action(
-                        "cancel-upload", ASSET_ID.upper(), 7, "Test image.jpg"
+                        profile, "cancel-upload", ASSET_ID.upper(), 7, "Test image.jpg"
                     ),
                     {"scheduled": True},
                 )
@@ -133,6 +134,7 @@ class DesktopTest(unittest.TestCase):
 
     def test_evict_requires_a_file_uri_and_refresh_rejects_one(self) -> None:
         async def scenario() -> None:
+            profile = Profile("home", Path("/c"), Path("/s"), Path("/d"), Path("/k"), Path("/r"))
             for action, uri in (
                 ("evict", None),
                 ("evict", "https://photos.example.test/photo.jpg"),
@@ -151,12 +153,13 @@ class DesktopTest(unittest.TestCase):
                 ("unknown", None),
             ):
                 with self.subTest(action=action, uri=uri), self.assertRaises(ValueError):
-                    await run_action(action, uri)
+                    await run_action(profile, action, uri)
 
         trio.run(scenario)
 
     def test_cancel_upload_requires_an_exact_nonempty_confirmation_name(self) -> None:
         async def scenario() -> None:
+            profile = Profile("home", Path("/c"), Path("/s"), Path("/d"), Path("/k"), Path("/r"))
             for upload_id, revision, confirmation in (
                 (ASSET_ID, None, "Test image.jpg"),
                 (ASSET_ID, -1, "Test image.jpg"),
@@ -170,16 +173,17 @@ class DesktopTest(unittest.TestCase):
                     confirmation=confirmation,
                 ), self.assertRaises(ValueError):
                     await run_action(
-                        "cancel-upload", upload_id, revision, confirmation
+                        profile, "cancel-upload", upload_id, revision, confirmation
                     )
 
         trio.run(scenario)
 
     def test_describe_request_stays_below_the_desktop_batch_ceiling(self) -> None:
         async def scenario() -> None:
+            profile = Profile("home", Path("/c"), Path("/s"), Path("/d"), Path("/k"), Path("/r"))
             with self.assertRaises(ValueError):
                 # The params fit below 48 KiB, but the complete control frame does not.
-                await run_action("describe", ["file:///" + "a" * 49_074])
+                await run_action(profile, "describe", ["file:///" + "a" * 49_074])
 
         trio.run(scenario)
 

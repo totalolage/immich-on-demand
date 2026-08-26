@@ -11,6 +11,7 @@ import trio
 
 from immich_on_demand.cli import _auth_check, _print_result, main
 from immich_on_demand.immich import ServerSession
+from immich_on_demand.profiles import Profile, ProfileBusyError, ProfileError
 from immich_on_demand.service import run_service
 from immich_on_demand.settings import Settings
 
@@ -19,8 +20,20 @@ ASSET_ID = "12345678-1234-4234-8234-123456789abc"
 NEXT_ID = "87654321-4321-4321-8321-cba987654321"
 
 
+def profile(root: Path, profile_id: str = "home") -> Profile:
+    return Profile(
+        profile_id,
+        root / "config",
+        root / "state",
+        root / "data",
+        root / "cache",
+        root / "runtime",
+    )
+
+
 class CliTest(unittest.TestCase):
     def test_mutation_auth_check_uses_the_upload_only_secret_and_scope(self) -> None:
+        selected = profile(Path("/profile"))
         configured = Settings("https://photos.example.test", Path("/Photos"))
         with (
             patch("immich_on_demand.cli.load_api_key", return_value="secret") as load_key,
@@ -37,9 +50,11 @@ class CliTest(unittest.TestCase):
             ) as validate,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            self.assertEqual(trio.run(_auth_check, configured, True), 0)
+            self.assertEqual(trio.run(_auth_check, selected, configured, True), 0)
 
-        load_key.assert_called_once_with(configured, "mutation")
+        load_key.assert_called_once_with(
+            configured, "mutation", profile_id=selected.id
+        )
         validate.assert_awaited_once_with(configured, "mutation", "secret")
 
     def test_version(self) -> None:
@@ -48,19 +63,78 @@ class CliTest(unittest.TestCase):
             main(["--version"])
 
         self.assertEqual(exit.exception.code, 0)
-        self.assertEqual(output.getvalue(), "1.4.0.dev0\n")
+        self.assertEqual(output.getvalue(), "2.0.0.dev0\n")
+
+    def test_profile_failures_use_sysexits_statuses(self) -> None:
+        for error, expected in (
+            (ProfileBusyError("busy"), 75),
+            (ProfileError("invalid"), 78),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                patch("immich_on_demand.cli.select_profile", side_effect=error),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(
+                    main(["--profile", "home", "status"]), expected
+                )
+
+    def test_strict_profile_config_failures_use_nonrestartable_status(self) -> None:
+        selected = profile(Path("/profile"))
+        with (
+            patch("immich_on_demand.cli.select_profile", return_value=selected),
+            patch("immich_on_demand.cli.load", side_effect=RuntimeError("unsafe")),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(main(["--profile", "home", "auth-check"]), 78)
+
+        configured = Settings("https://photos.example.test", Path("/Photos"))
+        with (
+            patch("immich_on_demand.cli.select_profile", return_value=selected),
+            patch(
+                "immich_on_demand.cli.manage_profile",
+                return_value=contextlib.nullcontext(selected),
+            ),
+            patch("immich_on_demand.cli.Settings", return_value=configured),
+            patch("immich_on_demand.cli.save", side_effect=RuntimeError("unsafe")),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(
+                main(
+                    [
+                        "--profile",
+                        "home",
+                        "configure",
+                        "--server",
+                        configured.server_url,
+                        "--mount",
+                        str(configured.mount_path),
+                    ]
+                ),
+                78,
+            )
 
     def test_configure_writes_only_non_secret_settings(self) -> None:
         import json
 
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "config.json"
-            mount = Path(directory) / "Photos"
-            with contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            selected = profile(root)
+            selected.config.mkdir(mode=0o700)
+            config = selected.config / "config.json"
+            mount = root / "Photos"
+            with (
+                patch("immich_on_demand.cli.select_profile", return_value=selected),
+                patch(
+                    "immich_on_demand.cli.manage_profile",
+                    return_value=contextlib.nullcontext(selected),
+                ) as manage,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
                 result = main(
                     [
-                        "--config",
-                        str(config),
+                        "--profile",
+                        "home",
                         "configure",
                         "--server",
                         "https://photos.example.test",
@@ -77,6 +151,7 @@ class CliTest(unittest.TestCase):
                 )
 
             self.assertEqual(result, 0)
+            manage.assert_called_once_with(selected, mount.resolve())
             value = json.loads(config.read_text())
             self.assertEqual(value["server_url"], "https://photos.example.test")
             self.assertEqual(value["cache_max_bytes"], 20 * 1024**3)
@@ -89,6 +164,8 @@ class CliTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
             main(
                 [
+                    "--profile",
+                    "home",
                     "configure",
                     "--server",
                     "https://photos.example.test",
@@ -126,24 +203,27 @@ class CliTest(unittest.TestCase):
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
-            runtime = Path(directory)
+            selected = profile(Path(directory))
             for arguments, method, params in cases:
                 with self.subTest(command=arguments):
                     request = AsyncMock(return_value={"z": 2, "a": 1})
                     output = io.StringIO()
                     with (
                         patch("immich_on_demand.cli.send_request", request),
-                        patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                        patch(
+                            "immich_on_demand.cli.select_profile",
+                            return_value=selected,
+                        ),
                         patch("immich_on_demand.cli.secrets.randbits", return_value=0),
                         patch("immich_on_demand.cli.load") as load,
                         patch("immich_on_demand.cli.load_api_key") as load_api_key,
                         patch("immich_on_demand.cli.Catalog", create=True) as catalog,
                         contextlib.redirect_stdout(output),
                     ):
-                        self.assertEqual(main(arguments), 0)
+                        self.assertEqual(main(["--profile", "home", *arguments]), 0)
 
                     request.assert_awaited_once_with(
-                        runtime / "control.sock", 1, method, params
+                        selected.runtime / "control.sock", 1, method, params
                     )
                     load.assert_not_called()
                     load_api_key.assert_not_called()
@@ -176,19 +256,22 @@ class CliTest(unittest.TestCase):
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
-            runtime = Path(directory)
+            selected = profile(Path(directory))
             for arguments, method, params in cases:
                 with self.subTest(command=arguments):
                     request = AsyncMock(return_value={"scheduled": True, "id": ASSET_ID})
                     with (
                         patch("immich_on_demand.cli.send_request", request),
-                        patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                        patch(
+                            "immich_on_demand.cli.select_profile",
+                            return_value=selected,
+                        ),
                         patch("immich_on_demand.cli.secrets.randbits", return_value=0),
                         contextlib.redirect_stdout(io.StringIO()),
                     ):
-                        self.assertEqual(main(arguments), 0)
+                        self.assertEqual(main(["--profile", "home", *arguments]), 0)
                     request.assert_awaited_once_with(
-                        runtime / "control.sock", 1, method, params
+                        selected.runtime / "control.sock", 1, method, params
                     )
 
     def test_uploads_prints_valid_pages_as_json_lines(self) -> None:
@@ -222,27 +305,29 @@ class CliTest(unittest.TestCase):
         )
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
-            runtime = Path(directory)
+            selected = profile(Path(directory))
             request = AsyncMock(side_effect=pages)
             with (
                 patch("immich_on_demand.cli.send_request", request),
-                patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                patch(
+                    "immich_on_demand.cli.select_profile", return_value=selected
+                ),
                 patch("immich_on_demand.cli.secrets.randbits", return_value=0),
                 contextlib.redirect_stdout(output),
             ):
-                self.assertEqual(main(["uploads"]), 0)
+                self.assertEqual(main(["--profile", "home", "uploads"]), 0)
 
         self.assertEqual(
             request.await_args_list,
             [
                 unittest.mock.call(
-                    runtime / "control.sock",
+                    selected.runtime / "control.sock",
                     1,
                     "uploads",
                     {"after": None, "limit": 32},
                 ),
                 unittest.mock.call(
-                    runtime / "control.sock",
+                    selected.runtime / "control.sock",
                     1,
                     "uploads",
                     {"after": NEXT_ID, "limit": 32},
@@ -258,11 +343,13 @@ class CliTest(unittest.TestCase):
     def test_uploads_rejects_a_malformed_page_with_a_fixed_error(self) -> None:
         error = io.StringIO()
         request = AsyncMock(return_value={"items": [], "next": "not-a-uuid"})
+        selected = profile(Path("/profile"))
         with (
             patch("immich_on_demand.cli.send_request", request),
+            patch("immich_on_demand.cli.select_profile", return_value=selected),
             contextlib.redirect_stderr(error),
         ):
-            self.assertEqual(main(["uploads"]), 1)
+            self.assertEqual(main(["--profile", "home", "uploads"]), 1)
         self.assertEqual(
             error.getvalue(),
             "immich-on-demand: control returned an invalid uploads page\n",
@@ -297,7 +384,7 @@ class CliTest(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()),
                 self.assertRaises(SystemExit) as exit,
             ):
-                main(arguments)
+                main(["--profile", "home", *arguments])
             self.assertEqual(exit.exception.code, 2)
 
     def test_restore_requires_an_asset_uuid(self) -> None:
@@ -307,28 +394,31 @@ class CliTest(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()),
                 self.assertRaises(SystemExit) as exit,
             ):
-                main(arguments)
+                main(["--profile", "home", *arguments])
             self.assertEqual(exit.exception.code, 2)
 
     def test_status_before_service_start_is_a_concise_unavailable_error(self) -> None:
         error = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
-            runtime = Path(directory) / "secret-runtime"
+            selected = profile(Path(directory) / "secret-runtime")
             with (
-                patch("immich_on_demand.cli.runtime_path", return_value=runtime),
+                patch(
+                    "immich_on_demand.cli.select_profile", return_value=selected
+                ),
                 contextlib.redirect_stderr(error),
             ):
-                self.assertEqual(main(["status"]), 1)
+                self.assertEqual(main(["--profile", "home", "status"]), 1)
 
         self.assertEqual(
             error.getvalue(), "immich-on-demand: control service is unavailable\n"
         )
 
     def test_mount_routes_through_the_service(self) -> None:
-        configured = Settings("https://photos.example.test", Path("/Photos"))
+        selected = profile(Path("/profile"))
         events: list[str] = []
         with (
-            patch("immich_on_demand.cli.load", return_value=configured),
+            patch("immich_on_demand.cli.select_profile", return_value=selected) as select,
+            patch("immich_on_demand.cli.load") as load,
             patch(
                 "immich_on_demand.cli.logging.basicConfig",
                 side_effect=lambda **kwargs: events.append("logging"),
@@ -338,21 +428,23 @@ class CliTest(unittest.TestCase):
                 side_effect=lambda *args: events.append("service"),
             ) as run,
         ):
-            self.assertEqual(main(["mount"]), 0)
+            self.assertEqual(main(["--profile", "home", "mount"]), 0)
+        select.assert_called_once_with("home")
+        load.assert_not_called()
         configure_logging.assert_called_once_with(level=logging.INFO)
-        run.assert_called_once_with(run_service, configured)
+        run.assert_called_once_with(run_service, selected)
         self.assertEqual(events, ["logging", "service"])
 
     def test_network_failure_is_a_concise_cli_error(self) -> None:
-        configured = Settings("https://photos.example.test", Path("/Photos"))
+        selected = profile(Path("/profile"))
         error = io.StringIO()
         with (
-            patch("immich_on_demand.cli.load", return_value=configured),
+            patch("immich_on_demand.cli.select_profile", return_value=selected),
             patch(
                 "immich_on_demand.cli.trio.run",
                 side_effect=httpx.ConnectError("network unavailable"),
             ),
             contextlib.redirect_stderr(error),
         ):
-            self.assertEqual(main(["mount"]), 1)
+            self.assertEqual(main(["--profile", "home", "mount"]), 1)
         self.assertEqual(error.getvalue(), "immich-on-demand: network unavailable\n")
