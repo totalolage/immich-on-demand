@@ -23,3 +23,7 @@ Use Immich's generated `size=preview` derivative for every asset whose original 
 Persist nullable `livePhotoVideoId` through API validation, catalog storage, full and incremental refresh, and every View projection. Treat it as a relation from the visible still to a separate video asset, and suppress the component from every View regardless of its server visibility. Do not expose that video as a neighboring file or model it as an XMP sidecar. This slice previews and opens the still only; composite playback, paired export, and paired upload remain separate work.
 
 The pinned Immich 3.0.3 contracts and acceptance boundary are recorded in `docs/research/immich-3-raw-heif-live-photo-previews.md`. Use the sanitized, read-only Reference capability probe in `docs/research/preview-format-capability-probe.md` before visual acceptance.
+
+## Reference result
+
+The read-only probe passed on August 26, 2026. It found 2,315 declared Live Photo links, all resolved to videos, with 2,314 distinct hidden motion assets and no broken links. One sampled still Preview completed the production decode and resize path. The inventory contained no RAW, HEIC, or HEIF asset, so those format checks and the mounted View persistence check remain pending.

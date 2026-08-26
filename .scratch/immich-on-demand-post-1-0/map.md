@@ -39,7 +39,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 ### 1.4: expand mutation and media behavior
 
 - [Asset replacement](issues/11-add-asset-replacement.md) is implemented. Reference-system acceptance with project-owned Test assets remains.
-- [RAW, HEIF, and Live Photo Previews](issues/12-broaden-preview-support.md) are implemented. Reference-format and visual acceptance remain.
+- [RAW, HEIF, and Live Photo Previews](issues/12-broaden-preview-support.md) are implemented. The Reference Live Photo inventory and one still Preview passed the read-only probe; mounted persistence and representative RAW and HEIF acceptance remain.
 - [Partial Hydration](issues/13-evaluate-partial-hydration.md) was evaluated and deferred. Complete-file Hydration remains until the reopening gates pass.
 
 ### 2.0: support more environments
