@@ -256,6 +256,84 @@ class LibraryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trio.run(scenario, Path(directory))
 
+    def test_remote_restore_rejects_owned_assets_without_a_standalone_alias(
+        self,
+    ) -> None:
+        async def scenario(root: Path) -> None:
+            invalid_assets = (
+                replace(asset(), visibility="hidden", is_trashed=True),
+                replace(asset(), is_offline=True, is_trashed=True),
+                replace(asset(), size=None, is_trashed=True),
+            )
+            for index, invalid in enumerate(invalid_assets):
+                with self.subTest(index=index), Catalog(
+                    root / f"restore-projection-{index}.db"
+                ) as catalog:
+                    catalog.add_uploaded(invalid, invalid.original_name)
+                    valid = catalog.add_uploaded(
+                        replace(asset(OTHER_ID), is_trashed=True), "valid.jpg"
+                    )
+                    mutation = MutationClient()
+                    mounted = library(
+                        catalog,
+                        root,
+                        mutation=mutation,
+                        mutation_session=session(),
+                        remote_delete=True,
+                    )
+
+                    with self.assertRaisesRegex(
+                        LibraryError, "cannot be restored into the mounted library"
+                    ):
+                        await mounted.remote_restore(invalid.id)
+
+                    self.assertEqual(mutation.restores, [])
+                    current = catalog.by_id(invalid.id)
+                    self.assertTrue(current and current.asset.is_trashed)
+                    restored = await mounted.remote_restore(valid.asset.id)
+                    self.assertEqual(mutation.restores, [valid.asset.id])
+                    self.assertTrue(catalog.aliases(restored.asset.id))
+
+            with Catalog(root / "restore-motion.db") as catalog:
+                motion = catalog.add_uploaded(
+                    replace(
+                        asset(OTHER_ID),
+                        mime_type="video/quicktime",
+                        is_trashed=True,
+                    ),
+                    "motion.mov",
+                )
+                catalog.add_uploaded(
+                    replace(asset(), live_photo_video_id=motion.asset.id),
+                    "still.jpg",
+                )
+                valid = catalog.add_uploaded(
+                    replace(asset(THIRD_ID), is_trashed=True), "valid.jpg"
+                )
+                mutation = MutationClient()
+                mounted = library(
+                    catalog,
+                    root,
+                    mutation=mutation,
+                    mutation_session=session(),
+                    remote_delete=True,
+                )
+
+                with self.assertRaisesRegex(
+                    LibraryError, "cannot be restored into the mounted library"
+                ):
+                    await mounted.remote_restore(motion.asset.id)
+
+                self.assertEqual(mutation.restores, [])
+                current = catalog.by_id(motion.asset.id)
+                self.assertTrue(current and current.asset.is_trashed)
+                restored = await mounted.remote_restore(valid.asset.id)
+                self.assertEqual(mutation.restores, [valid.asset.id])
+                self.assertTrue(catalog.aliases(restored.asset.id))
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_remote_restore_commits_locally_only_after_remote_success(self) -> None:
         async def scenario(root: Path) -> None:
             with Catalog(root / "restore-success.db") as catalog:

@@ -858,18 +858,8 @@ class Catalog:
         self._connection.execute(
             "DELETE FROM namespace_links WHERE asset_id = ?", (asset_id,)
         )
-        row = self._connection.execute(
-            """
-            SELECT * FROM assets
-             WHERE id = ? AND size IS NOT NULL AND is_trashed = 0
-               AND is_offline = 0 AND visibility != 'hidden'
-            """,
-            (asset_id,),
-        ).fetchone()
-        if row is None or self._connection.execute(
-            "SELECT 1 FROM assets WHERE live_photo_video_id = ? LIMIT 1",
-            (asset_id,),
-        ).fetchone() is not None:
+        row = self._standalone_row(asset_id, trashed=False)
+        if row is None:
             return
         if type(row["is_favorite"]) is not int or row["is_favorite"] not in {0, 1}:
             raise ValueError("catalog asset favorite state is invalid")
@@ -907,6 +897,27 @@ class Catalog:
             "INSERT INTO namespace_links VALUES (?, ?)",
             ((inode, asset_id) for inode in directory_inodes),
         )
+
+    def _standalone_row(
+        self, asset_id: str, *, trashed: bool
+    ) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """
+            SELECT asset.* FROM assets AS asset
+             WHERE asset.id = ? AND asset.size IS NOT NULL
+               AND asset.is_trashed = ? AND asset.is_offline = 0
+               AND asset.visibility != 'hidden'
+               AND NOT EXISTS (
+                   SELECT 1 FROM assets AS still
+                    WHERE still.live_photo_video_id = asset.id
+               )
+            """,
+            (asset_id, int(trashed)),
+        ).fetchone()
+
+    def restore_projects_standalone(self, asset_id: str) -> bool:
+        asset_id = self._canonical_id(asset_id, "asset id")
+        return self._standalone_row(asset_id, trashed=True) is not None
 
     def _replace_namespace(self) -> None:
         self._connection.execute("DELETE FROM namespace_links")

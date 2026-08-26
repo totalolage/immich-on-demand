@@ -38,6 +38,7 @@ from immich_on_demand.service import (
     FULL_REFRESH_SECONDS,
     _RestoreJob,
     _catalog_file_from_uri,
+    _full_refresh,
     _periodic_refresh,
     _pin_worker,
     _next_upload_delay,
@@ -552,6 +553,45 @@ class ServiceFakes:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_blocked_replacement_does_not_freeze_relation_refresh(self) -> None:
+        events: list[str] = []
+
+        async def assets(*_args: object, **_kwargs: object) -> None:
+            events.append("assets")
+
+        async def previews(*_args: object, **_kwargs: object) -> None:
+            events.append("previews")
+
+        async def relations(*_args: object, **_kwargs: object) -> None:
+            events.append("relations")
+
+        async def scenario() -> None:
+            job = SimpleNamespace(
+                size=1,
+                sha1="00",
+                state=UploadState.BLOCKED,
+            )
+            with (
+                patch("immich_on_demand.service.refresh_catalog", assets),
+                patch("immich_on_demand.service.populate_previews", previews),
+                patch(
+                    "immich_on_demand.service.reconcile_album_people",
+                    relations,
+                ),
+            ):
+                await _full_refresh(
+                    object(),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                    trio.Lock(),
+                    Path("/mount"),
+                    (job,),  # type: ignore[arg-type]
+                )
+
+        trio.run(scenario)
+        self.assertEqual(events, ["assets", "previews", "relations"])
+
     def test_mounted_uri_resolves_any_asset_alias_and_rejects_nonfiles(self) -> None:
         asset = upload_entry().asset
         file = CatalogFile(asset, 42, "new.jpg", 2)
@@ -1150,14 +1190,19 @@ class ServiceTest(unittest.TestCase):
         class ReadClient:
             def __init__(self) -> None:
                 self.old = old
+                self.candidate_override: Asset | None = None
                 self.calls: list[tuple[str, str]] = []
                 self.source_drift = True
+                self.fail_next_source_read = False
                 self.old_album_reads = 0
 
             async def asset(self, asset_id: str) -> Asset:
                 self.calls.append(("asset", asset_id))
                 if asset_id == candidate.id:
-                    return candidate
+                    return self.candidate_override or candidate
+                if self.fail_next_source_read:
+                    self.fail_next_source_read = False
+                    raise ImmichUnavailableError("lost trash response")
                 if self.source_drift:
                     self.source_drift = False
                     return replace(
@@ -1202,12 +1247,12 @@ class ServiceTest(unittest.TestCase):
 
             async def trash(self, asset_id: str) -> None:
                 self.trashed.append(asset_id)
-                if len(self.trashed) > 1:
-                    self.read_client.old = replace(
-                        self.read_client.old,
-                        is_trashed=True,
-                        updated_at="2026-08-26T00:03:00Z",
-                    )
+                self.read_client.old = replace(
+                    self.read_client.old,
+                    is_trashed=True,
+                    updated_at="2026-08-26T00:03:00Z",
+                )
+                self.read_client.fail_next_source_read = True
                 raise ImmichResponseError("lost trash response")
 
         class Mounted:
@@ -1346,7 +1391,7 @@ class ServiceTest(unittest.TestCase):
                 assert retrying is not None
                 self.assertEqual(retrying.state, UploadState.REPLACING)
                 self.assertEqual(
-                    retrying.error, UploadErrorCode.AMBIGUOUS_RESPONSE
+                    retrying.error, UploadErrorCode.UPLOAD_UNAVAILABLE
                 )
                 self.assertIsNotNone(_next_upload_delay(queue))
                 self.assertEqual(mutation.upload_sources, [old])
@@ -1381,9 +1426,9 @@ class ServiceTest(unittest.TestCase):
                 self.assertEqual(mutation.upload_sources, [old])
                 self.assertEqual(
                     mutation.copies,
-                    [(old.id, candidate.id), (old.id, candidate.id)],
+                    [(old.id, candidate.id)],
                 )
-                self.assertEqual(mutation.trashed, [old.id, old.id])
+                self.assertEqual(mutation.trashed, [old.id])
                 self.assertEqual(finished, [job.id])
 
                 network_calls = (
@@ -1432,23 +1477,32 @@ class ServiceTest(unittest.TestCase):
                 )
                 self.assertIsNone(queue.status(unchanged.id))
                 self.assertEqual(
+                    tuple(read_client.calls),
+                    network_calls[0] + (("asset", candidate.id),),
+                )
+                self.assertEqual(
                     (
-                        tuple(read_client.calls),
                         tuple(mutation.upload_sources),
                         tuple(mutation.copies),
                         tuple(mutation.trashed),
                     ),
-                    network_calls,
+                    network_calls[1:],
                 )
                 self.assertEqual(callbacks[-1], published_candidate)
                 self.assertEqual(finished, [job.id, unchanged.id])
+                network_calls = (
+                    tuple(read_client.calls),
+                    tuple(mutation.upload_sources),
+                    tuple(mutation.copies),
+                    tuple(mutation.trashed),
+                )
 
                 draft = queue.begin(
                     published_candidate.name,
                     "https://photos.example.test",
                     OWNER_ID,
                 )
-                queue.write(draft, 0, b"drifted replacement")
+                queue.write(draft, 0, replacement_content)
                 drifted = queue.seal(draft)
                 os.close(draft.descriptor)
                 drifted = queue.mark_replacement(
@@ -1460,11 +1514,16 @@ class ServiceTest(unittest.TestCase):
                     source_owner_id=candidate.owner_id,
                     source_library_id=candidate.library_id,
                     source_checksum=candidate.checksum,
-                    source_updated_at="2026-08-26T00:02:00Z",
+                    source_updated_at=candidate.updated_at,
                     source_created_ns=candidate.created_ns,
                     source_is_favorite=candidate.is_favorite,
                     source_visibility=candidate.visibility,
                     source_album_ids=(),
+                )
+                read_client.candidate_override = replace(
+                    candidate,
+                    is_trashed=True,
+                    updated_at="2026-08-26T00:02:00Z",
                 )
                 await _process_upload(
                     queue,
@@ -1487,14 +1546,25 @@ class ServiceTest(unittest.TestCase):
                 self.assertEqual(
                     blocked.error, UploadErrorCode.CANDIDATE_MISMATCH
                 )
+                descriptor = queue.open_local(drifted.id)
+                try:
+                    self.assertEqual(
+                        os.read(descriptor, len(replacement_content)),
+                        replacement_content,
+                    )
+                finally:
+                    os.close(descriptor)
+                self.assertEqual(
+                    tuple(read_client.calls),
+                    network_calls[0] + (("asset", candidate.id),),
+                )
                 self.assertEqual(
                     (
-                        tuple(read_client.calls),
                         tuple(mutation.upload_sources),
                         tuple(mutation.copies),
                         tuple(mutation.trashed),
                     ),
-                    network_calls,
+                    network_calls[1:],
                 )
 
         job = None  # type: ignore[assignment]

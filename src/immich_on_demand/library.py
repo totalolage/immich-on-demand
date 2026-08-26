@@ -91,6 +91,8 @@ class Library:
                 raise LibraryError("asset is not trashed")
             if current.asset.owner_id != session.owner_id:
                 raise PermissionError("only owned assets can be remotely restored")
+            if not self._catalog.restore_projects_standalone(current.asset.id):
+                raise LibraryError("asset cannot be restored into the mounted library")
 
             await mutation.restore(current.asset.id)
             self._catalog.mark_restored(current.asset.id)

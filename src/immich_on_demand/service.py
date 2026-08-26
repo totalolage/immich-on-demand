@@ -215,7 +215,15 @@ async def _full_refresh(
         )
     except Exception as error:
         raise _PreviewSuppressionError("preview suppression failed") from error
-    if not replacement_jobs:
+    if not any(
+        job.state
+        in {
+            UploadState.PENDING,
+            UploadState.ATTEMPTING,
+            UploadState.REPLACING,
+        }
+        for job in replacement_jobs
+    ):
         await reconcile_album_people(
             catalog,
             read_client,
@@ -643,6 +651,19 @@ async def _process_upload(
                         queue, current.id, UploadErrorCode.CANDIDATE_MISMATCH
                     )
                     return
+                remote_source = await read_client.asset(source_entry.asset.id)
+                if not _replacement_source_matches(
+                    current,
+                    remote_source,
+                    allow_trashed=(
+                        current.state is UploadState.REPLACING
+                        and current.candidate_verified
+                    ),
+                ):
+                    await _block_upload(
+                        queue, current.id, UploadErrorCode.CANDIDATE_MISMATCH
+                    )
+                    return
                 if (
                     current.state is UploadState.PENDING
                     and current.candidate_asset_id is None
@@ -656,12 +677,6 @@ async def _process_upload(
                         revision=current.revision,
                     )
                     await _notify_upload_finished(on_upload_finished, current.id)
-                    return
-                remote_source = await read_client.asset(source_entry.asset.id)
-                if not _replacement_source_matches(current, remote_source):
-                    await _block_upload(
-                        queue, current.id, UploadErrorCode.CANDIDATE_MISMATCH
-                    )
                     return
 
             if current.state is not UploadState.REPLACING:
