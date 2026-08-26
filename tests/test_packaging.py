@@ -11,6 +11,7 @@ class PackagingTests(unittest.TestCase):
     def test_pkgbuild_uses_distribution_dependencies_and_pep517_wheel(self) -> None:
         package = PKGBUILD.read_text(encoding="utf-8")
 
+        self.assertIn("pkgver=1.0.0", package)
         for dependency in (
             "libsecret",
             "org.freedesktop.secrets",

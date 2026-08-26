@@ -172,11 +172,27 @@ systemctl --user restart immich-on-demand.service
 
 The development tree contains a GTK 4 and libadwaita settings application plus a Nautilus 50 extension. The settings application edits the single configured server, mount, cache policy, refresh interval, and remote-delete policy. Nonblank API key fields replace the matching Secret Service item. Saving settings does not restart the service.
 
+On Arch Linux, build the VCS package from the current `main` branch:
+
+```bash
+cd packaging/development
+makepkg -si
+```
+
+This installs `immich-on-demand-git`, including the desktop entry, Nautilus loader, icons, emblems, and user service. It conflicts with the released `immich-on-demand` package but preserves per-user configuration, Secret Service items, catalog, cache, and Pending uploads during replacement.
+
+Before uninstalling it, stop the per-user service and remove its enablement link:
+
+```bash
+systemctl --user disable --now immich-on-demand.service
+sudo pacman -Rns immich-on-demand-git
+```
+
 The GUI Restore control accepts one asset UUID. The UUID is transient and is not saved in configuration. The GUI also lists Pending uploads and exposes Retry and confirmed Cancel. These operations use the private control socket from its bounded worker and display only fixed success or failure text.
 
 Inside the configured mount, Nautilus adds folder actions for Refresh, Settings, and Manage Pending Uploads. A one-file selection can Pin, Unpin, retry a failed pinned download, or Evict its local copy. Emblems report cached, pinned, and busy state. The extension returns no actions or emblems outside the configured mount.
 
-The released version 1.0 Arch recipe does not install this desktop entry, the Nautilus loader, or the emblem icons. The following target-system checks remain open:
+The released version 1.0 Arch recipe does not install this desktop entry, the Nautilus loader, or the emblem icons. The following development-package checks remain open on the target system:
 
 - Build, install, upgrade, restart, and uninstall a package that contains the desktop files.
 - Load the extension in Nautilus 50 and verify mount scoping, menus, emblem changes, and failure behavior.

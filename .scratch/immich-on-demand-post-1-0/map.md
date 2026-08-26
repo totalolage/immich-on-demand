@@ -22,7 +22,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 
 ### 1.1: control local residency
 
-- [Nautilus actions and a settings GUI](issues/05-add-desktop-controls.md) are implemented in the source tree. Package integration and target acceptance remain.
+- [Nautilus actions and a settings GUI](issues/05-add-desktop-controls.md) are implemented with a development Arch recipe. Target acceptance remains.
 - [Pinning](issues/04-add-pinning.md), including CLI `pin-status`, is implemented. Target acceptance remains.
 - [Explicit trash Restore](issues/06-add-trash-restore.md) is implemented. Target Test-asset acceptance remains.
 

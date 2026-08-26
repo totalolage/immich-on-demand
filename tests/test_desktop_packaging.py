@@ -13,7 +13,7 @@ from zipfile import ZipFile
 
 
 ROOT = Path(__file__).parents[1]
-DESKTOP_FILE = ROOT / "packaging" / "immich-on-demand.desktop"
+DESKTOP_FILE = ROOT / "packaging" / "net.kalny.ImmichOnDemand.desktop"
 ICON_DIRECTORY = ROOT / "packaging" / "icons"
 ICON_NAMES = {
     "immich-on-demand",
@@ -100,6 +100,7 @@ class DesktopPackagingTests(unittest.TestCase):
         self.assertEqual(entry["Terminal"], "false")
         self.assertNotIn("%", entry["Exec"])
         self.assertIn("Settings", entry["Categories"].split(";"))
+        self.assertEqual(_load_desktop_module()._APPLICATION_ID, DESKTOP_FILE.stem)
 
     def test_icons_are_small_self_contained_scalable_svgs(self) -> None:
         icons = {path.stem: path for path in ICON_DIRECTORY.glob("*.svg")}

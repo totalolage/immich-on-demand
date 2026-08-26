@@ -1,0 +1,72 @@
+pkgname=immich-on-demand-git
+_project=immich-on-demand
+pkgver=1.2.0.dev0.r82.gd6a2ed2
+pkgrel=1
+pkgdesc='Expose an Immich library as a Linux filesystem with files on demand'
+arch=('any')
+url='https://github.com/totalolage/immich-on-demand'
+license=('GPL-3.0-or-later')
+provides=("immich-on-demand=$pkgver")
+conflicts=('immich-on-demand')
+depends=(
+  'gtk4'
+  'hicolor-icon-theme'
+  'libadwaita'
+  'libsecret'
+  'nautilus-python'
+  'org.freedesktop.secrets'
+  'python'
+  'python-httpx'
+  'python-pillow'
+  'python-gobject'
+  'python-pyfuse3'
+  'python-secretstorage'
+  'python-trio'
+)
+makedepends=('git' 'python-build' 'python-flit-core' 'python-installer')
+checkdepends=('desktop-file-utils')
+source=("$_project::git+https://github.com/totalolage/immich-on-demand.git#branch=main")
+b2sums=('SKIP')
+
+pkgver() {
+  cd "$_project"
+  local version
+  version=$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$_project"
+  git clean -dfx
+}
+
+build() {
+  cd "$_project"
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd "$_project"
+  PYTHONPATH="$PWD/src" python -m unittest discover -s tests
+  desktop-file-validate packaging/net.kalny.ImmichOnDemand.desktop
+}
+
+package() {
+  cd "$_project"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 packaging/immich-on-demand.service \
+    "$pkgdir/usr/lib/systemd/user/immich-on-demand.service"
+  install -Dm644 packaging/net.kalny.ImmichOnDemand.desktop \
+    "$pkgdir/usr/share/applications/net.kalny.ImmichOnDemand.desktop"
+  install -Dm644 packaging/immich-on-demand-nautilus.py \
+    "$pkgdir/usr/share/nautilus-python/extensions/immich-on-demand.py"
+  install -Dm644 packaging/icons/immich-on-demand.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/immich-on-demand.svg"
+  local emblem
+  for emblem in busy cached pinned recoverable; do
+    install -Dm644 "packaging/icons/immich-on-demand-$emblem.svg" \
+      "$pkgdir/usr/share/icons/hicolor/scalable/emblems/immich-on-demand-$emblem.svg"
+  done
+  install -Dm644 README.md \
+    "$pkgdir/usr/share/doc/immich-on-demand/README.md"
+}
