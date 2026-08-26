@@ -1,0 +1,45 @@
+#!/bin/sh
+set -e
+
+restart=0
+case "$1" in
+    configure) test -n "$2" && restart=1 ;;
+    abort-upgrade|abort-deconfigure|abort-remove) restart=1 ;;
+esac
+
+if test "$restart" = 1 && test -z "${DPKG_ROOT:-}" \
+        && test -d /run/systemd/system; then
+    deb-systemd-invoke --user daemon-reload >/dev/null || true
+    restart_template=1
+    restart_singleton=1
+    if test -x /usr/sbin/policy-rc.d; then
+        status=0
+        /usr/sbin/policy-rc.d 'immich-on-demand@*.service' restart || status=$?
+        test "$status" = 101 && restart_template=0
+        status=0
+        /usr/sbin/policy-rc.d immich-on-demand.service restart || status=$?
+        test "$status" = 101 && restart_singleton=0
+    fi
+    if test "$restart_template" = 1 || test "$restart_singleton" = 1; then
+        systemctl --no-legend --plain --quiet list-units 'user@*.service' |
+        while read -r manager _; do
+            uid=${manager#user@}
+            uid=${uid%.service}
+            case "$uid" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            if test "$restart_template" = 1; then
+                systemctl --quiet --user --machine "$uid@" try-restart -- \
+                    'immich-on-demand@*.service' >/dev/null || true
+            fi
+            if test "$restart_singleton" = 1; then
+                systemctl --quiet --user --machine "$uid@" try-restart -- \
+                    immich-on-demand.service >/dev/null || true
+            fi
+        done
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

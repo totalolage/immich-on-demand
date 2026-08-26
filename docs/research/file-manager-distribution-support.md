@@ -106,23 +106,35 @@ the path reported by `pkg-config systemd --variable=systemduserunitdir`.
 The [systemd daemon packaging guidance](https://manpages.debian.org/trixie/systemd/daemon.7.en.html)
 defines that location, and
 [`dh_installsystemduser`](https://manpages.debian.org/trixie/debhelper/dh_installsystemduser.1.en.html)
-generates the install, upgrade, and removal maintainer-script integration for
-user units. Its generated removal snippet invokes `deb-systemd-invoke --user
-stop`; that helper enumerates active `user@<uid>.service` managers and addresses
-each with `systemctl --user --machine`. The exact behavior is visible in the
+manages user-unit installation and enablement metadata. The target package's
+bounded scripts invoke `deb-systemd-invoke --user`; that helper enumerates
+active `user@<uid>.service` managers and addresses each with
+`systemctl --user --machine`. The exact behavior is visible in the
 [Ubuntu 1.69 source archive](https://archive.ubuntu.com/ubuntu/pool/main/i/init-system-helpers/init-system-helpers_1.69.tar.xz).
 
-Build with `debhelper-compat (= 14)` and
-`dh_installsystemduser --no-enable`. Compatibility level 13 omits the required
-user-unit lifecycle snippets. At level 14, `deb-systemd-invoke --user restart`
-checks enablement and activity, so a clean disabled and inactive install stays
-inert while an enabled or already-active unit can restart on upgrade. The user
-configures the server and stores the key before enabling the unit. The generated
-removal snippet must stop and unmount every active user instance before package
-files disappear. A user's enable choice may remain as user-owned configuration.
-Remove must retain all user-owned XDG config, state, data, cache, upload recovery,
-and Secret Service items. Purge semantics for user-owned state are not part of
-the first package.
+Ubuntu 26.04 ships [debhelper 13.31ubuntu1](https://manpages.ubuntu.com/manpages/resolute/man1/dh_installsystemduser.1.html),
+so its native package must build with `debhelper-compat (= 13)`. In that mode,
+the [helper source](https://sources.debian.org/src/debhelper/13.31~bpo13%2B1/dh_installsystemduser/)
+deliberately omits restart and stop snippets, and it skips template units. Use
+`dh_installsystemduser --no-enable` for installation and purge-time disablement,
+plus three minimal maintainer scripts: upgrade-only `postinst` restart, removal
+`prerm` stop, and removal `postrm` reload. Each calls
+`deb-systemd-invoke --user` for reload or stop. The upgrade path lists active
+user managers and calls `systemctl --user --machine` with `try-restart`, the
+quoted `immich-on-demand@*.service` pattern, and the compatibility singleton.
+`try-restart` cannot start an inactive Profile. This narrow exception is needed
+because `deb-systemd-invoke` 1.69 treats a wildcard as one aggregate and may
+restart inactive matches. It still honors `policy-rc.d` separately for the
+template and compatibility unit. Never enumerate home directories. A clean
+install stays inert because the restart runs only when a prior package version
+exists.
+
+The user configures the server and stores the key before enabling the unit. The
+removal script stops and unmounts every active instance before package files
+disappear. A user's enable choice may remain as user-owned configuration. Remove
+must retain all user-owned XDG config, state, data, cache, upload recovery, and
+Secret Service items. Purge semantics for user-owned state are not part of the
+first package.
 
 ## Distribution snapshot
 
@@ -262,13 +274,13 @@ ready for its support decision.
 
 | Lifecycle | Required observation |
 | --- | --- |
-| Native install | Install locally built `.deb` files with APT. APT resolves every runtime dependency from Ubuntu packages. There is no pip invocation, venv, vendored Python runtime, or local pyfuse3 build. Package-file ownership and the user-unit location are correct. The package uses `debhelper-compat (= 14)` and `dh_installsystemduser --no-enable`; a disabled, inactive unit stays inert and no unconfigured daemon starts. |
+| Native install | Install locally built `.deb` files with APT. APT resolves every runtime dependency from Ubuntu packages. There is no pip invocation, venv, vendored Python runtime, or local pyfuse3 build. Package-file ownership and the user-unit location are correct. The package uses Ubuntu's `debhelper-compat (= 13)`, `dh_installsystemduser --no-enable`, and the bounded maintainer scripts above; a disabled, inactive unit stays inert and no unconfigured daemon starts. |
 | Configure | In a logged-in graphical session, configure one explicit Profile and store its Profile-tagged read-only and mutation keys through Secret Service. No key appears in process arguments, the unit, environment files, logs, or package-owned files. |
 | First enable | Enabling and starting `immich-on-demand@ID.service` after configuration produces one active FUSE mount and that Profile's valid control socket under `XDG_RUNTIME_DIR`. Starting before configuration exits nonzero with a configuration error and leaves no stale mount or socket. |
 | File-manager behavior | Every applicable row in the file-manager matrix passes with the exact package versions in the distribution table. |
 | Service restart | Restarting one Profile instance cleanly unmounts and remounts only its configured path. Catalog, cache, pending uploads, and secrets remain intact. No second daemon or duplicate mount survives. |
 | Package upgrade | Seed a catalog, one content-cache object, one pinned object, one valid thumbnail, and one resumable pending upload. Upgrade through APT. An enabled or active unit restarts at most once; a disabled and inactive unit does not start. All hashes and user-owned state remain intact, and the pending upload resumes according to its existing recovery contract. |
-| Package removal | `apt remove` exercises the generated `deb-systemd-invoke --user stop` path for every active user manager, removes each active mount, then removes the unit, executable, desktop files, and provider installed by the package. XDG config, state, data, cache, upload recovery, Secret Service items, and any user-owned enable choice remain unchanged. Reinstall can use them. |
+| Package removal | `apt remove` exercises the package's `deb-systemd-invoke --user stop` path for every active user manager, removes each active mount, then removes the unit, executable, desktop files, and provider installed by the package. XDG config, state, data, cache, upload recovery, Secret Service items, and any user-owned enable choice remain unchanged. Reinstall can use them. |
 | Offline restart | With a previously synchronized catalog, restart while Immich is unreachable. The mount behavior matches the project's documented offline guarantees; no package helper substitutes a different policy. |
 
 The first `.deb` can remain one core package plus the already supported

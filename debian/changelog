@@ -1,0 +1,5 @@
+immich-on-demand (2.0.0~dev0-1) UNRELEASED; urgency=medium
+
+  * Add the Ubuntu Desktop 26.04 native package candidate.
+
+ -- Filip Kalný <filip@kalny.net>  Wed, 26 Aug 2026 00:00:00 +0000

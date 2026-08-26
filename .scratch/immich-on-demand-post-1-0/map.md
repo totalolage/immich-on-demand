@@ -45,7 +45,7 @@ Extend the released Flat library without weakening its safety rules. Incremental
 ### 2.0: support more environments
 
 - [Support multiple Profiles](issues/14-support-multiple-profiles.md) has implemented isolation, routing, and reversible retirement in source. Concurrent target acceptance remains.
-- [Support more file managers and Linux distributions](issues/15-support-more-platforms.md) selected Ubuntu Desktop 26.04 with Nautilus 50 as the next acceptance target; support remains unclaimed until the runtime and package matrices pass.
+- [Support more file managers and Linux distributions](issues/15-support-more-platforms.md) selected Ubuntu Desktop 26.04 with Nautilus 50 as the next acceptance target and now has a native `.deb` source recipe. Support remains unclaimed until the runtime and package matrices pass.
 
 ## Deferred until evidence exists
 

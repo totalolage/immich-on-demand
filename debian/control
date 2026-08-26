@@ -1,0 +1,49 @@
+Source: immich-on-demand
+Section: utils
+Priority: optional
+Maintainer: Filip Kalný <filip@kalny.net>
+Build-Depends:
+ debhelper-compat (= 13),
+ desktop-file-utils,
+ dh-python,
+ flit (>= 3.11),
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-gi (>= 3.50),
+ python3-httpx (>= 0.28),
+ python3-pil (>= 11),
+ python3-pyfuse3 (>= 3.4),
+ python3-secretstorage (>= 3.3),
+ python3-trio (>= 0.30)
+Standards-Version: 4.7.2
+Homepage: https://github.com/totalolage/immich-on-demand
+Rules-Requires-Root: no
+
+Package: immich-on-demand
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+ gir1.2-adw-1,
+ gir1.2-gtk-4.0,
+ gir1.2-nautilus-4.1,
+ fuse3,
+ gnome-keyring,
+ hicolor-icon-theme,
+ init-system-helpers (>= 1.69),
+ nautilus (>= 1:50),
+ nautilus (<< 1:51),
+ python3 (>= 3.12),
+ python3-gi (<< 4),
+ python3-httpx (<< 1),
+ python3-nautilus (>= 4.1),
+ python3-nautilus (<< 4.2),
+ python3-pil (<< 13),
+ python3-pyfuse3 (<< 4),
+ python3-secretstorage (<< 4),
+ python3-trio (<< 1),
+ systemd (>= 249)
+Description: expose an Immich library as a filesystem
+ Immich On-Demand presents one user's Immich assets through a local FUSE
+ filesystem. It includes a GTK settings application, Nautilus integration,
+ generated previews, and complete-file caching on demand.

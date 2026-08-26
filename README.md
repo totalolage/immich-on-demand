@@ -225,6 +225,8 @@ systemctl --user restart immich-on-demand@home.service
 
 The development tree contains a GTK 4 and libadwaita settings application plus a Nautilus 50 extension. Create a Profile with the CLI `configure` command; the settings application then selects one configured Profile at a time and edits its server, mount, cache policy, refresh interval, remote-delete policy, and Profile-tagged keys. Each background operation retains the Profile selected when it began. Saving settings does not restart a service.
 
+The `debian/` directory is a native-package candidate for Ubuntu Desktop 26.04 LTS amd64. It builds with Ubuntu's packaged PEP 517 tools, installs the same desktop and user-service files, and depends only on named Ubuntu packages. It never uses pip, a private virtual environment, or a local pyfuse3 build. This recipe is not an Ubuntu support claim until the documented install, upgrade, removal, and Nautilus matrices pass on that release.
+
 On Arch Linux, build the VCS package from the current `main` branch:
 
 ```bash

@@ -1,0 +1,9 @@
+packaging/immich-on-demand.service usr/lib/systemd/user/
+packaging/immich-on-demand@.service usr/lib/systemd/user/
+packaging/net.kalny.ImmichOnDemand.desktop usr/share/applications/
+packaging/immich-on-demand-nautilus.py usr/share/nautilus-python/extensions/
+packaging/icons/immich-on-demand.svg usr/share/icons/hicolor/scalable/apps/
+packaging/icons/immich-on-demand-busy.svg usr/share/icons/hicolor/scalable/emblems/
+packaging/icons/immich-on-demand-cached.svg usr/share/icons/hicolor/scalable/emblems/
+packaging/icons/immich-on-demand-pinned.svg usr/share/icons/hicolor/scalable/emblems/
+packaging/icons/immich-on-demand-recoverable.svg usr/share/icons/hicolor/scalable/emblems/

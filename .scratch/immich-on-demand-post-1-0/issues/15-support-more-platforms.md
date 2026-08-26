@@ -20,6 +20,11 @@ Linux support. The exact contracts, version snapshot, blockers, acceptance
 matrix, and unsupported limits are in
 [`docs/research/file-manager-distribution-support.md`](../../../docs/research/file-manager-distribution-support.md).
 
+The source tree now includes an Ubuntu 26.04 native `.deb` candidate under
+`debian/`. It uses only named Ubuntu dependencies and bounded user-unit
+maintainer scripts; Ubuntu runtime and package-lifecycle acceptance remain
+pending, so this is not yet a support claim.
+
 ## Scope
 
 Test the FUSE contract and Preview path against named file managers before claiming support. Add distribution packages only where maintained system dependencies cover pyfuse3, PyGObject, Secret Service, and the user-service lifecycle.
