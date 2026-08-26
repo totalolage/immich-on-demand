@@ -73,7 +73,7 @@ Capability detection must target the configured public HTTPS origin, not contain
 
 ## Smallest safe Reference probe
 
-Paste this block into a terminal on the configured Reference machine after installing the current development package and exporting the read-only API key as `IMMICH_KEY`. It requires the key's permissions to match `READ_PERMISSIONS` exactly. It lists metadata, chooses the smallest active managed video with a known size of at least two bytes, and probes both its original and playback representations. Each endpoint receives a two-byte range, an overlapping one-byte range, a final-byte range, and a stale `If-Range` request. Including overflow detection and the optional strong-validator check, the probe retains at most nine response bytes per endpoint and never reads an unexpected `200` body.
+Paste this block into a terminal on the configured Reference machine after installing the current development package and exporting the read-only API key as `IMMICH_KEY`. It selects Profile `default`; set `PROFILE` to choose another Profile. It requires the key's permissions to match `READ_PERMISSIONS` exactly. It lists metadata, chooses the smallest active managed video with a known size of at least two bytes, and probes both its original and playback representations. Each endpoint receives a two-byte range, an overlapping one-byte range, a final-byte range, and a stale `If-Range` request. Including overflow detection and the optional strong-validator check, the probe retains at most nine response bytes per endpoint and never reads an unexpected `200` body.
 
 The output is one compact JSON object. It contains aggregate counts and booleans only. It prints no URL, path, filename, UUID, header value, media byte, exception, or API key. The block has no shell `exit`, so a failed probe does not close the calling terminal.
 
@@ -82,7 +82,7 @@ This is deliberately a throwaway probe pinned to the installed development clien
 ```bash
 app="$(readlink -f "${APP:-$(command -v immich-on-demand)}")"
 py="${app%/*}/python"
-"$py" - <<'PY'
+PROFILE="${PROFILE:-default}" "$py" - <<'PY'
 from __future__ import annotations
 
 import json
@@ -93,6 +93,7 @@ from urllib.parse import urljoin
 import trio
 
 from immich_on_demand.immich import ImmichClient, READ_PERMISSIONS
+from immich_on_demand.profiles import select_profile
 from immich_on_demand.settings import load
 
 
@@ -320,7 +321,8 @@ async def main() -> None:
     try:
         await self_test()
         stage = "settings"
-        settings = load()
+        profile = select_profile(os.environ["PROFILE"])
+        settings = load(profile.config / "config.json")
         stage = "environment"
         key = os.environ["IMMICH_KEY"]
         stage = "key_validation"

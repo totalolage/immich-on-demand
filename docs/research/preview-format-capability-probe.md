@@ -4,17 +4,18 @@ Paste this probe into a terminal on the configured Reference system after you in
 
 The probe calls no original-download, playback, upload, trash, restore, or other mutation route. It fetches at most two RAW Previews, two HEIF or HEIC Previews, and one Live Photo still Preview. It prints one JSON line with aggregate counts. It prints no UUID, filename, URL, path, exception, API key, or media bytes.
 
-The `APP` override is optional. Without it, the wrapper resolves `immich-on-demand` from `PATH`. The Python child returns status 1 on failure. The block contains no shell `exit`, so it does not terminate the calling terminal.
+The `APP` and `PROFILE` overrides are optional. Without them, the wrapper resolves `immich-on-demand` from `PATH` and selects Profile `default`. The Python child returns status 1 on failure. The block contains no shell `exit`, so it does not terminate the calling terminal.
 
 ```bash
 app="$(readlink -f "${APP:-$(command -v immich-on-demand)}")"
 py="${app%/*}/python"
-"$py" - <<'PY'
+PROFILE="${PROFILE:-default}" "$py" - <<'PY'
 from __future__ import annotations
 
 from collections import Counter
 from io import BytesIO
 import json
+import os
 from pathlib import PurePath
 import warnings
 
@@ -22,6 +23,7 @@ from PIL import Image, ImageOps
 import trio
 
 from immich_on_demand.immich import ImmichClient, READ_PERMISSIONS
+from immich_on_demand.profiles import select_profile
 from immich_on_demand.settings import load, load_api_key
 from immich_on_demand.thumbnails import THUMBNAIL_SIZES
 
@@ -62,8 +64,9 @@ async def check_previews(client: ImmichClient, asset_ids: list[str], limit: int)
 async def main() -> None:
     stage = "settings"
     try:
-        settings = load()
-        key = load_api_key(settings, "read-only")
+        profile = select_profile(os.environ["PROFILE"])
+        settings = load(profile.config / "config.json")
+        key = load_api_key(settings, "read-only", profile_id=profile.id)
         stage = "key_validation"
         async with ImmichClient(settings.server_url, key) as client:
             session = await client.validate(READ_PERMISSIONS, exact_permissions=True)
