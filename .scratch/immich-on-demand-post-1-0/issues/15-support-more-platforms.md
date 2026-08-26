@@ -1,9 +1,24 @@
 # Support more file managers and Linux distributions
 
 Type: research
-Status: open
+Status: resolved
 Target: 2.0
 Blocked by: 05, 09
+
+## Answer
+
+Keep support claims exact and versioned. The next distribution target is Ubuntu
+Desktop 26.04 LTS amd64 with Nautilus 50.0 because its native packages satisfy
+all current dependency bounds and expose the Nautilus 4.1 GI API used by the
+existing extension. Ubuntu Cinnamon 26.04 LTS amd64 with Nemo 6.4.5 is the only
+next file-manager candidate: its source uses the compatible GIO and GNOME
+thumbnail route, but support waits for the complete browsing, sort, controls,
+package, upgrade, and removal matrix.
+
+Do not claim Debian 13, Fedora 44, Thunar, Dolphin, headless sessions, or broad
+Linux support. The exact contracts, version snapshot, blockers, acceptance
+matrix, and unsupported limits are in
+[`docs/research/file-manager-distribution-support.md`](../../../docs/research/file-manager-distribution-support.md).
 
 ## Scope
 
