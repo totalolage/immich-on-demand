@@ -443,6 +443,7 @@ def _replacement_source_matches(
         asset.id == job.old_asset_id
         and asset.owner_id == job.source_owner_id == job.owner_id
         and asset.library_id == job.source_library_id is None
+        and asset.live_photo_video_id is None
         and asset.checksum == job.source_checksum
         and (
             asset.updated_at == job.source_updated_at
@@ -464,6 +465,7 @@ def _replacement_candidate_matches(source: Asset, candidate: Asset) -> bool:
         and candidate.local_date == source.local_date
         and candidate.is_favorite == source.is_favorite
         and candidate.visibility == source.visibility
+        and candidate.live_photo_video_id == source.live_photo_video_id
     )
 
 
@@ -654,6 +656,12 @@ async def _process_upload(
                         revision=current.revision,
                     )
                     await _notify_upload_finished(on_upload_finished, current.id)
+                    return
+                remote_source = await read_client.asset(source_entry.asset.id)
+                if not _replacement_source_matches(current, remote_source):
+                    await _block_upload(
+                        queue, current.id, UploadErrorCode.CANDIDATE_MISMATCH
+                    )
                     return
 
             if current.state is not UploadState.REPLACING:

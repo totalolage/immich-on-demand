@@ -646,6 +646,22 @@ class CatalogTest(unittest.TestCase):
                 assert migrated is not None
                 self.assertIsNone(migrated.asset.local_date)
                 self.assertFalse(migrated.asset.is_favorite)
+                self.assertIsNone(migrated.asset.live_photo_video_id)
+                for table in ("assets", "incoming_assets"):
+                    columns = {
+                        row["name"]
+                        for row in catalog._connection.execute(
+                            f"PRAGMA table_info({table})"
+                        )
+                    }
+                    self.assertIn("live_photo_video_id", columns)
+                indexes = {
+                    row["name"]
+                    for row in catalog._connection.execute(
+                        "PRAGMA index_list(assets)"
+                    )
+                }
+                self.assertIn("assets_live_photo_video", indexes)
 
     def test_failed_namespace_migration_stays_unpublished_and_can_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1147,6 +1163,79 @@ class CatalogTest(unittest.TestCase):
                 r"^catalog is not trusted for offline use$",
             ):
                 catalog.require_offline_profile(profile)
+
+    def test_offline_profile_rejects_invalid_live_photo_relationships(self) -> None:
+        profile = trusted_profile()
+        corruptions = (
+            "noncanonical",
+            "self_link",
+            "missing_target",
+            "wrong_owner",
+            "non_video_target",
+            "aliased_target",
+        )
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "catalog.db"
+                still = replace(asset(), live_photo_video_id=OTHER_ID)
+                motion = replace(
+                    asset(OTHER_ID, "motion.mov"),
+                    mime_type="video/quicktime",
+                    visibility="hidden",
+                )
+                with Catalog(database) as catalog:
+                    catalog.begin_refresh()
+                    catalog.stage([still, motion])
+                    catalog.finish_refresh(
+                        high_water_ms=1,
+                        page_count=1,
+                        trusted_profile=profile,
+                    )
+                connection = sqlite3.connect(database)
+                try:
+                    if corruption == "noncanonical":
+                        connection.execute(
+                            "UPDATE assets SET live_photo_video_id = ? WHERE id = ?",
+                            (OTHER_ID.upper(), ASSET_ID),
+                        )
+                    elif corruption == "self_link":
+                        connection.execute(
+                            "UPDATE assets SET live_photo_video_id = id WHERE id = ?",
+                            (ASSET_ID,),
+                        )
+                    elif corruption == "missing_target":
+                        connection.execute(
+                            "UPDATE assets SET live_photo_video_id = ? WHERE id = ?",
+                            (LITERAL_ID, ASSET_ID),
+                        )
+                    elif corruption == "wrong_owner":
+                        connection.execute(
+                            "UPDATE assets SET owner_id = ? WHERE id = ?",
+                            (LITERAL_ID, OTHER_ID),
+                        )
+                    elif corruption == "non_video_target":
+                        connection.execute(
+                            "UPDATE assets SET mime_type = 'image/jpeg' WHERE id = ?",
+                            (OTHER_ID,),
+                        )
+                    else:
+                        all_inode = connection.execute(
+                            "SELECT inode FROM namespace_directories "
+                            "WHERE identity = 'view:all'"
+                        ).fetchone()[0]
+                        connection.execute(
+                            "INSERT INTO namespace_links VALUES (?, ?)",
+                            (all_inode, OTHER_ID),
+                        )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                with Catalog(database) as catalog, self.assertRaisesRegex(
+                    ValueError,
+                    r"^catalog is not trusted for offline use$",
+                ):
+                    catalog.require_offline_profile(profile)
 
     def test_trusted_profile_schema_migrates_an_existing_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1768,6 +1857,202 @@ class CatalogTest(unittest.TestCase):
                 self.assertIsNotNone(catalog.by_id(OTHER_ID))
                 self.assertEqual(catalog.refresh_state(), (2000, 2))
 
+    def test_full_refresh_keeps_live_photo_link_and_hides_its_motion_asset(self) -> None:
+        still = replace(
+            viewed_asset(is_favorite=True),
+            live_photo_video_id=OTHER_ID,
+        )
+        motion = replace(
+            asset(OTHER_ID, "motion.mov"),
+            mime_type="video/quicktime",
+            visibility="hidden",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([still, motion])
+                catalog.finish_refresh(high_water_ms=1000, page_count=1)
+
+                stored = catalog.by_id(ASSET_ID)
+                assert stored is not None
+                self.assertEqual(stored.asset.live_photo_video_id, OTHER_ID)
+                self.assertEqual(catalog.aliases(OTHER_ID), ())
+                self.assertEqual(
+                    [entry.asset.id for entry in catalog.list_visible()],
+                    [ASSET_ID],
+                )
+                aliases = catalog.aliases(ASSET_ID)
+                self.assertGreater(len(aliases), 1)
+                for path in aliases:
+                    parent_inode = ROOT_INODE
+                    node = None
+                    for name in path.parts:
+                        node = catalog.lookup(parent_inode, name)
+                        assert node is not None
+                        parent_inode = node.inode
+                    self.assertEqual(getattr(node, "asset", None), stored.asset)
+
+    def test_live_photo_target_has_no_alias_even_when_archived(self) -> None:
+        still = replace(asset(), live_photo_video_id=OTHER_ID)
+        motion = replace(
+            asset(OTHER_ID, "motion.mov"),
+            mime_type="video/quicktime",
+            visibility="archive",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([still, motion])
+                catalog.finish_refresh(
+                    high_water_ms=1000,
+                    page_count=1,
+                    trusted_profile=trusted_profile(),
+                )
+                catalog.replace_album_people(
+                    albums=(),
+                    album_memberships=(),
+                    people=(),
+                    person_memberships=(),
+                    trusted_profile=rich_profile(),
+                )
+
+                self.assertEqual(catalog.aliases(OTHER_ID), ())
+                self.assertEqual(
+                    [entry.asset.id for entry in catalog.list_visible()],
+                    [ASSET_ID],
+                )
+                self.assertEqual(catalog.stats().visible, 1)
+                self.assertEqual(catalog.stats().hidden, 0)
+                catalog.require_offline_profile(rich_profile())
+
+    def test_refresh_rolls_back_missing_and_non_video_live_photo_links(self) -> None:
+        for refresh_kind in ("full", "incremental"):
+            for invalid_target in ("missing", "non_video"):
+                with (
+                    self.subTest(
+                        refresh_kind=refresh_kind,
+                        invalid_target=invalid_target,
+                    ),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    target = asset(OTHER_ID, "not-motion.jpg")
+                    initial = [asset()]
+                    if invalid_target == "non_video":
+                        initial.append(target)
+                    with Catalog(Path(directory) / "catalog.db") as catalog:
+                        catalog.begin_refresh()
+                        catalog.stage(initial)
+                        catalog.finish_refresh(high_water_ms=1000, page_count=1)
+                        before = catalog.stats()
+
+                        linked = replace(
+                            asset(),
+                            live_photo_video_id=(
+                                OTHER_ID
+                                if invalid_target == "non_video"
+                                else LITERAL_ID
+                            ),
+                        )
+                        catalog.begin_refresh()
+                        catalog.stage(
+                            [linked, target]
+                            if refresh_kind == "full"
+                            and invalid_target == "non_video"
+                            else [linked]
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            r"^catalog contains an invalid Live Photo relationship$",
+                        ):
+                            if refresh_kind == "full":
+                                catalog.finish_refresh(
+                                    high_water_ms=2000,
+                                    page_count=1,
+                                )
+                            else:
+                                catalog.finish_incremental(high_water_ms=2000)
+
+                        stored = catalog.by_id(ASSET_ID)
+                        assert stored is not None
+                        self.assertIsNone(stored.asset.live_photo_video_id)
+                        self.assertEqual(catalog.stats(), before)
+                        self.assertEqual(catalog.refresh_state(), (1000, 1))
+
+    def test_incremental_refresh_updates_live_photo_link(self) -> None:
+        motion = replace(
+            asset(OTHER_ID, "motion.mov"),
+            mime_type="video/quicktime",
+            visibility="hidden",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([asset(), motion])
+                catalog.finish_refresh(high_water_ms=1000, page_count=1)
+
+                catalog.begin_refresh()
+                catalog.stage(
+                    [replace(asset(), live_photo_video_id=OTHER_ID)]
+                )
+                catalog.finish_incremental(high_water_ms=2000)
+
+                stored = catalog.by_id(ASSET_ID)
+                self.assertEqual(
+                    stored and stored.asset.live_photo_video_id,
+                    OTHER_ID,
+                )
+                self.assertEqual(catalog.aliases(OTHER_ID), ())
+
+    def test_incremental_live_photo_link_relink_and_unlink_reproject_targets(self) -> None:
+        still = asset()
+        first_motion = replace(
+            asset(OTHER_ID, "first.mov"),
+            mime_type="video/quicktime",
+            visibility="archive",
+        )
+        second_motion = replace(
+            asset(LITERAL_ID, "second.mp4"),
+            mime_type="video/mp4",
+            visibility="archive",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.begin_refresh()
+                catalog.stage([still, first_motion, second_motion])
+                catalog.finish_refresh(high_water_ms=1000, page_count=1)
+
+                self.assertTrue(catalog.aliases(OTHER_ID))
+                self.assertTrue(catalog.aliases(LITERAL_ID))
+                self.assertEqual(catalog.stats().visible, 3)
+
+                for high_water_ms, motion_id, expected_visible in (
+                    (2000, OTHER_ID, {ASSET_ID, LITERAL_ID}),
+                    (3000, LITERAL_ID, {ASSET_ID, OTHER_ID}),
+                    (4000, None, {ASSET_ID, OTHER_ID, LITERAL_ID}),
+                ):
+                    catalog.begin_refresh()
+                    catalog.stage(
+                        [replace(still, live_photo_video_id=motion_id)]
+                    )
+                    catalog.finish_incremental(high_water_ms=high_water_ms)
+
+                    stored = catalog.by_id(ASSET_ID)
+                    assert stored is not None
+                    self.assertEqual(stored.asset.live_photo_video_id, motion_id)
+                    self.assertEqual(
+                        {entry.asset.id for entry in catalog.list_visible()},
+                        expected_visible,
+                    )
+                    self.assertEqual(catalog.stats().visible, len(expected_visible))
+                    self.assertEqual(
+                        bool(catalog.aliases(OTHER_ID)),
+                        OTHER_ID in expected_visible,
+                    )
+                    self.assertEqual(
+                        bool(catalog.aliases(LITERAL_ID)),
+                        LITERAL_ID in expected_visible,
+                    )
+
     def test_complete_refresh_replaces_a_newer_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with Catalog(Path(directory) / "catalog.db") as catalog:
@@ -1833,6 +2118,36 @@ class CatalogTest(unittest.TestCase):
                 added = catalog.add_uploaded(asset(OTHER_ID), "photo.jpg")
 
                 self.assertEqual(added.name, f"photo__{OTHER_ID}__2.jpg")
+
+    def test_uploaded_and_replacement_assets_keep_live_photo_link(self) -> None:
+        motion = replace(
+            asset(LITERAL_ID, "motion.mov"),
+            mime_type="video/quicktime",
+            visibility="archive",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with Catalog(Path(directory) / "catalog.db") as catalog:
+                catalog.add_uploaded(motion, "motion.mov")
+                uploaded = catalog.add_uploaded(
+                    replace(asset(), live_photo_video_id=LITERAL_ID),
+                    "photo.jpg",
+                )
+
+                self.assertEqual(uploaded.asset.live_photo_video_id, LITERAL_ID)
+                replacement = catalog.publish_replacement(
+                    old_asset_id=ASSET_ID,
+                    candidate=replace(
+                        asset(OTHER_ID),
+                        live_photo_video_id=LITERAL_ID,
+                    ),
+                )
+
+                self.assertEqual(replacement.asset.live_photo_video_id, LITERAL_ID)
+                self.assertEqual(
+                    catalog.by_id(OTHER_ID),
+                    replacement,
+                )
+                self.assertEqual(catalog.aliases(LITERAL_ID), ())
 
     def test_replacement_atomically_moves_identity_name_pin_and_every_view(self) -> None:
         occupied_old_name = f"photo__{ASSET_ID}.jpg"
@@ -1916,6 +2231,7 @@ class CatalogTest(unittest.TestCase):
             replace(asset(OTHER_ID), library_id=LITERAL_ID),
             replace(asset(OTHER_ID), local_date="2026-08-26"),
             replace(asset(OTHER_ID), is_favorite=True),
+            replace(asset(OTHER_ID), live_photo_video_id=LITERAL_ID),
         )
         for candidate in invalid_candidates:
             with self.subTest(candidate=candidate):

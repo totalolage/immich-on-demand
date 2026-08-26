@@ -22,8 +22,8 @@ from .thumbnails import (
 )
 
 
-PREVIEW_MIME_TYPES = frozenset(
-    {"image/jpeg", "image/png", "image/gif", "video/mp4", "video/quicktime", "video/x-m4v"}
+VIDEO_PREVIEW_MIME_TYPES = frozenset(
+    {"video/mp4", "video/quicktime", "video/x-m4v"}
 )
 LOGGER = logging.getLogger(__name__)
 _SORT_BY = "metadata::nautilus-icon-view-sort-by"
@@ -108,7 +108,8 @@ async def populate_previews(
         mtime = entry.asset.modified_ns // 1_000_000_000
         original_size = entry.asset.size
         assert original_size is not None
-        supported = entry.asset.mime_type.lower() in PREVIEW_MIME_TYPES
+        mime_type = entry.asset.mime_type.lower()
+        supported = mime_type.startswith("image/") or mime_type in VIDEO_PREVIEW_MIME_TYPES
         current_thumbnails = tuple(
             prepare_thumbnail_cache(
                 source_path,

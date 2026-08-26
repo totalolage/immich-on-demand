@@ -32,6 +32,7 @@ def api_asset() -> dict[str, object]:
         "isTrashed": False,
         "isOffline": False,
         "isFavorite": True,
+        "livePhotoVideoId": None,
         "localDateTime": "2026-08-25T23:59:58.123",
         "libraryId": None,
         "exifInfo": {"fileSizeInByte": 123},
@@ -140,6 +141,26 @@ class ModelTest(unittest.TestCase):
 
         self.assertEqual(Asset.from_api(value).person_ids, (ASSET_ID, OTHER_ID))
 
+    def test_parses_nullable_canonical_live_photo_video_id(self) -> None:
+        value = api_asset()
+        value["livePhotoVideoId"] = OTHER_ID
+
+        self.assertEqual(Asset.from_api(value).live_photo_video_id, OTHER_ID)
+
+        value["livePhotoVideoId"] = None
+        self.assertIsNone(Asset.from_api(value).live_photo_video_id)
+
+        del value["livePhotoVideoId"]
+        self.assertIsNone(Asset.from_api(value).live_photo_video_id)
+
+    def test_rejects_malformed_or_noncanonical_live_photo_video_id(self) -> None:
+        for malformed in (True, 123, "not-a-uuid", OTHER_ID.upper(), ASSET_ID):
+            with self.subTest(live_photo_video_id=malformed):
+                value = api_asset()
+                value["livePhotoVideoId"] = malformed
+                with self.assertRaises(ValueError):
+                    Asset.from_api(value)
+
     def test_rejects_malformed_or_noncanonical_asset_people(self) -> None:
         cases: tuple[object, ...] = (
             None,
@@ -207,6 +228,7 @@ class ModelTest(unittest.TestCase):
         self.assertIsNone(value.local_date)
         self.assertFalse(value.is_favorite)
         self.assertEqual(value.person_ids, ())
+        self.assertIsNone(value.live_photo_video_id)
 
     def test_rejects_malformed_asset_fields_without_coercion(self) -> None:
         cases = (

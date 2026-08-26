@@ -136,6 +136,52 @@ class PreviewerTest(unittest.TestCase):
 
         trio.run(scenario)
 
+    def test_fetches_canonical_raw_and_heif_previews_and_isolates_invalid_bytes(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entries = [
+                    entry(1, "image/heic"),
+                    entry(2, "image/dng"),
+                    entry(3, "image/heif"),
+                ]
+                invalid = entries[-1]
+                fetched: list[str] = []
+
+                class Client:
+                    async def thumbnail(self, asset_id: str) -> tuple[bytes, str]:
+                        fetched.append(asset_id)
+                        if asset_id == invalid.asset.id:
+                            return b"not an image", "application/octet-stream"
+                        return preview_bytes(), "image/jpeg"
+
+                stats = await populate_previews(
+                    PreviewCatalog(entries),  # type: ignore[arg-type]
+                    Client(),  # type: ignore[arg-type]
+                    root / "mount",
+                    cache_home=root / "cache",
+                    concurrency=1,
+                )
+
+                self.assertEqual(fetched, [item.asset.id for item in entries])
+                self.assertEqual(stats, PreviewStats(3, 2, 1, 0))
+                for item in entries[:-1]:
+                    source = root / "mount" / item.name
+                    self.assertTrue(
+                        thumbnail_cache_path(source, root / "cache").exists()
+                    )
+                invalid_source = root / "mount" / invalid.name
+                self.assertFalse(
+                    thumbnail_cache_path(invalid_source, root / "cache").exists()
+                )
+                self.assertTrue(
+                    failed_thumbnail_path(invalid_source, root / "cache").exists()
+                )
+
+        trio.run(scenario)
+
     def test_offline_reconciles_every_alias_without_sort_or_network(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:

@@ -41,6 +41,7 @@ from immich_on_demand.service import (
     _periodic_refresh,
     _pin_worker,
     _next_upload_delay,
+    _replacement_candidate_matches,
     _replacement_refresh_policy,
     _upload_matches,
     _process_upload,
@@ -625,6 +626,143 @@ class ServiceTest(unittest.TestCase):
         ):
             self.assertFalse(_upload_matches(job, unsafe, PINNED_ID))  # type: ignore[arg-type]
 
+    def test_replacement_candidate_cannot_change_live_photo_relation(self) -> None:
+        source = replace(upload_entry().asset, live_photo_video_id=PINNED_ID)
+        matching = replace(
+            source,
+            id=OTHER_UPLOAD_ID,
+            original_name="replacement.jpg",
+        )
+
+        self.assertTrue(_replacement_candidate_matches(source, matching))
+        self.assertFalse(
+            _replacement_candidate_matches(
+                source,
+                replace(matching, live_photo_video_id=None),
+            )
+        )
+
+    def test_legacy_replacement_blocks_a_remote_live_photo_before_mutation(
+        self,
+    ) -> None:
+        old_content = b"old original"
+        replacement_content = b"replacement original"
+        old = replace(
+            upload_entry().asset,
+            original_name="photo.jpg",
+            size=len(old_content),
+            checksum=base64.b64encode(
+                hashlib.sha1(old_content, usedforsecurity=False).digest()
+            ).decode(),
+        )
+        linked = replace(old, live_photo_video_id=PINNED_ID)
+
+        class ReadClient:
+            calls: list[str] = []
+
+            async def asset(self, asset_id: str) -> Asset:
+                self.calls.append(asset_id)
+                return linked
+
+            async def asset_metadata(self, asset_id: str) -> str:
+                raise AssertionError("linked replacement fetched candidate metadata")
+
+            async def albums(self, *, asset_id: str | None = None) -> list[object]:
+                raise AssertionError("linked replacement fetched albums")
+
+        class Mutation:
+            uploads = 0
+            copies = 0
+            trashes = 0
+
+            async def upload(self, *_args: object, **_kwargs: object) -> UploadResult:
+                self.uploads += 1
+                raise AssertionError("linked replacement uploaded a candidate")
+
+            async def copy_albums(self, source: str, target: str) -> None:
+                self.copies += 1
+
+            async def trash(self, asset_id: str) -> None:
+                self.trashes += 1
+
+        class Mounted:
+            mutation_enabled = True
+
+            def __init__(self, mutation: Mutation) -> None:
+                self.mutation = mutation
+
+            def upload_access(self):
+                return self.mutation, ServerSession(
+                    OWNER_ID, "3.0.3", frozenset({".jpg"}), True
+                )
+
+        async def scenario(root: Path) -> None:
+            uploads = root / "uploads"
+            mutation = Mutation()
+            read_client = ReadClient()
+            with Catalog(root / "catalog.db") as catalog, UploadQueue(uploads) as queue:
+                catalog.begin_refresh()
+                catalog.stage([old])
+                catalog.finish_refresh(high_water_ms=1, page_count=1)
+                source = catalog.by_id(old.id)
+                assert source is not None
+
+                draft = queue.begin(
+                    source.name, "https://photos.example.test", OWNER_ID
+                )
+                queue.write(draft, 0, replacement_content)
+                job = queue.seal(draft)
+                os.close(draft.descriptor)
+                job = queue.mark_replacement(
+                    job.id,
+                    revision=job.revision,
+                    old_asset_id=old.id,
+                    old_inode=source.inode,
+                    old_name=source.name,
+                    source_owner_id=old.owner_id,
+                    source_library_id=old.library_id,
+                    source_checksum=old.checksum,
+                    source_updated_at=old.updated_at,
+                    source_created_ns=old.created_ns,
+                    source_is_favorite=old.is_favorite,
+                    source_visibility=old.visibility,
+                    source_album_ids=(),
+                )
+
+                await _process_upload(
+                    queue,
+                    catalog,
+                    trio.Lock(),
+                    Mounted(mutation),  # type: ignore[arg-type]
+                    read_client,  # type: ignore[arg-type]
+                    Settings(
+                        "https://photos.example.test",
+                        root / "mount",
+                        remote_delete=True,
+                    ),
+                    job,
+                    lambda _entry: trio.lowlevel.checkpoint(),
+                )
+
+                blocked = queue.status(job.id)
+                assert blocked is not None
+                self.assertEqual(blocked.state, UploadState.BLOCKED)
+                self.assertEqual(blocked.error, UploadErrorCode.CANDIDATE_MISMATCH)
+                self.assertEqual(read_client.calls, [old.id])
+                self.assertEqual(
+                    (mutation.uploads, mutation.copies, mutation.trashes),
+                    (0, 0, 0),
+                )
+
+            with UploadQueue(uploads) as recovered:
+                blocked = recovered.status(job.id)
+                assert blocked is not None
+                self.assertEqual(blocked.state, UploadState.BLOCKED)
+                self.assertEqual(blocked.error, UploadErrorCode.CANDIDATE_MISMATCH)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
     def test_queue_block_failure_does_not_escape_upload_processing(self) -> None:
         class Queue:
             def block(self, *_args: object) -> None:
@@ -1151,7 +1289,7 @@ class ServiceTest(unittest.TestCase):
                 )
                 self.assertIsNone(catalog.by_id(candidate.id))
                 self.assertEqual(callbacks, [])
-                self.assertEqual(mutation.upload_sources, [old])
+                self.assertEqual(mutation.upload_sources, [])
                 self.assertEqual(mutation.copies, [])
                 self.assertEqual(mutation.trashed, [])
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 import errno
 import os
 from pathlib import Path
@@ -626,6 +627,42 @@ class FilesystemTest(unittest.TestCase):
                     None,  # type: ignore[arg-type]
                 )
             self.assertEqual(denied.exception.errno, errno.EROFS)
+            self.assertEqual(queue.list()[0].operation, UploadOperation.ORDINARY)
+            await filesystem.release(handle.fh)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trio.run(scenario, Path(directory))
+
+    def test_rename_over_rejects_live_photo_before_queue_mutation(self) -> None:
+        async def scenario(root: Path) -> None:
+            filesystem, queue = self.filesystem(FakeLibrary(), root / "recovery")
+            all_inode = view_inode(filesystem, "All")
+            source = filesystem.catalog.by_id(ASSET_ID)
+            assert source is not None
+            filesystem.catalog.add_uploaded(
+                replace(source.asset, live_photo_video_id=OWNER_ID),
+                source.name,
+            )
+            handle, _ = await filesystem.create(
+                all_inode,
+                b"temp.jpg",
+                0o600,
+                os.O_WRONLY,
+                None,  # type: ignore[arg-type]
+            )
+            await filesystem.write(handle.fh, 0, b"replacement")
+
+            with self.assertRaises(pyfuse3.FUSEError) as denied:
+                await filesystem.rename(
+                    all_inode,
+                    b"temp.jpg",
+                    all_inode,
+                    b"photo.jpg",
+                    0,
+                    None,  # type: ignore[arg-type]
+                )
+
+            self.assertEqual(denied.exception.errno, errno.EOPNOTSUPP)
             self.assertEqual(queue.list()[0].operation, UploadOperation.ORDINARY)
             await filesystem.release(handle.fh)
 

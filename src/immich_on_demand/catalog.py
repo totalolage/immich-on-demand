@@ -277,7 +277,8 @@ class Catalog:
                 is_offline INTEGER NOT NULL,
                 library_id TEXT,
                 local_date TEXT,
-                is_favorite INTEGER NOT NULL DEFAULT 0
+                is_favorite INTEGER NOT NULL DEFAULT 0,
+                live_photo_video_id TEXT
             );
             CREATE INDEX IF NOT EXISTS assets_visible_name
                 ON assets(is_trashed, is_offline, visibility, name);
@@ -296,7 +297,8 @@ class Catalog:
                 is_offline INTEGER NOT NULL,
                 library_id TEXT,
                 local_date TEXT,
-                is_favorite INTEGER NOT NULL DEFAULT 0
+                is_favorite INTEGER NOT NULL DEFAULT 0,
+                live_photo_video_id TEXT
             );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -346,10 +348,16 @@ class Catalog:
         self._ensure_column(
             "assets", "is_favorite", "INTEGER NOT NULL DEFAULT 0"
         )
+        self._ensure_column("assets", "live_photo_video_id", "TEXT")
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS assets_live_photo_video "
+            "ON assets(live_photo_video_id)"
+        )
         self._ensure_column("incoming_assets", "local_date", "TEXT")
         self._ensure_column(
             "incoming_assets", "is_favorite", "INTEGER NOT NULL DEFAULT 0"
         )
+        self._ensure_column("incoming_assets", "live_photo_video_id", "TEXT")
         version = self._connection.execute(
             "SELECT value FROM metadata WHERE key = 'namespace_format'"
         ).fetchone()
@@ -393,8 +401,9 @@ class Catalog:
             INSERT OR REPLACE INTO incoming_assets (
                 id, owner_id, original_name, mime_type, size, created_ns,
                 modified_ns, updated_at, checksum, visibility, is_trashed,
-                is_offline, library_id, local_date, is_favorite
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_offline, library_id, local_date, is_favorite,
+                live_photo_video_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -413,6 +422,7 @@ class Catalog:
                     asset.library_id,
                     asset.local_date,
                     int(asset.is_favorite),
+                    asset.live_photo_video_id,
                 )
                 for asset in assets
             ),
@@ -492,6 +502,23 @@ class Catalog:
                 "SELECT * FROM incoming_assets ORDER BY created_ns, id"
             ).fetchall()
             changed_ids = [row["id"] for row in rows]
+            changed_relation_ids = {
+                row["live_photo_video_id"]
+                for row in rows
+                if row["live_photo_video_id"] is not None
+            }
+            if not delete_missing:
+                changed_relation_ids.update(
+                    row["live_photo_video_id"]
+                    for row in self._connection.execute(
+                        """
+                        SELECT assets.live_photo_video_id
+                          FROM assets
+                          JOIN incoming_assets ON incoming_assets.id = assets.id
+                         WHERE assets.live_photo_video_id IS NOT NULL
+                        """
+                    )
+                )
             for row in rows:
                 identity = existing.get(row["id"])
                 if identity:
@@ -506,11 +533,13 @@ class Catalog:
                     INSERT INTO assets (
                         id, inode, name, owner_id, original_name, mime_type, size,
                         created_ns, modified_ns, updated_at, checksum, visibility,
-                        is_trashed, is_offline, library_id, local_date, is_favorite
+                        is_trashed, is_offline, library_id, local_date, is_favorite,
+                        live_photo_video_id
                     )
                     SELECT id, ?, ?, owner_id, original_name, mime_type, size,
                            created_ns, modified_ns, updated_at, checksum, visibility,
-                           is_trashed, is_offline, library_id, local_date, is_favorite
+                           is_trashed, is_offline, library_id, local_date, is_favorite,
+                           live_photo_video_id
                       FROM incoming_assets WHERE id = ?
                     ON CONFLICT(id) DO UPDATE SET
                         owner_id = excluded.owner_id,
@@ -526,7 +555,8 @@ class Catalog:
                         is_offline = excluded.is_offline,
                         library_id = excluded.library_id,
                         local_date = excluded.local_date,
-                        is_favorite = excluded.is_favorite
+                        is_favorite = excluded.is_favorite,
+                        live_photo_video_id = excluded.live_photo_video_id
                     """,
                     (inode, name, row["id"]),
                 )
@@ -552,9 +582,11 @@ class Catalog:
             if delete_missing:
                 self._replace_namespace()
             else:
-                for asset_id in changed_ids:
+                for asset_id in {*changed_ids, *changed_relation_ids}:
                     self._project_asset(asset_id)
                 self._refresh_date_activity()
+            if not self._live_photo_relationships_are_valid():
+                raise ValueError("catalog contains an invalid Live Photo relationship")
             self._connection.execute("DELETE FROM incoming_assets")
         return self.stats()
 
@@ -834,7 +866,10 @@ class Catalog:
             """,
             (asset_id,),
         ).fetchone()
-        if row is None:
+        if row is None or self._connection.execute(
+            "SELECT 1 FROM assets WHERE live_photo_video_id = ? LIMIT 1",
+            (asset_id,),
+        ).fetchone() is not None:
             return
         if type(row["is_favorite"]) is not int or row["is_favorite"] not in {0, 1}:
             raise ValueError("catalog asset favorite state is invalid")
@@ -1158,6 +1193,9 @@ class Catalog:
                 expected.server_version,
                 expected.read_permissions,
             )
+            live_photo_relationships_valid = (
+                self._live_photo_relationships_are_valid()
+            )
             namespace_valid = self._namespace_is_valid()
             valid = (
                 len(quick_check) == 1
@@ -1168,12 +1206,43 @@ class Catalog:
                 and wrong_owner is None
                 and fingerprint_matches
                 and profile_matches
+                and live_photo_relationships_valid
                 and namespace_valid
             )
         except Exception:
             raise ValueError(failure) from None
         if not valid:
             raise ValueError(failure) from None
+
+    def _live_photo_relationships_are_valid(self) -> bool:
+        for row in self._connection.execute(
+            "SELECT id, owner_id, live_photo_video_id FROM assets "
+            "WHERE live_photo_video_id IS NOT NULL"
+        ):
+            motion_id = row["live_photo_video_id"]
+            if not isinstance(motion_id, str):
+                return False
+            try:
+                canonical_motion_id = str(UUID(motion_id))
+            except ValueError:
+                return False
+            if canonical_motion_id != motion_id or motion_id == row["id"]:
+                return False
+            motion = self._connection.execute(
+                "SELECT owner_id, mime_type FROM assets WHERE id = ?",
+                (motion_id,),
+            ).fetchone()
+            if (
+                motion is None
+                or motion["owner_id"] != row["owner_id"]
+                or not isinstance(motion["mime_type"], str)
+                or not (
+                    motion["mime_type"].startswith("video/")
+                    or motion["mime_type"] == "application/mxf"
+                )
+            ):
+                return False
+        return True
 
     def _namespace_is_valid(self) -> bool:
         version = self._connection.execute(
@@ -1204,6 +1273,10 @@ class Catalog:
              WHERE directories.inode IS NULL OR directories.active != 1
                 OR assets.id IS NULL OR assets.size IS NULL OR assets.is_trashed != 0
                 OR assets.is_offline != 0 OR assets.visibility = 'hidden'
+                OR EXISTS (
+                    SELECT 1 FROM assets AS still
+                     WHERE still.live_photo_video_id = assets.id
+                )
                 OR (directories.identity NOT IN ('view:all', 'view:favorites')
                     AND directories.identity NOT LIKE 'date:%-%-%'
                     AND directories.identity NOT LIKE 'album:%'
@@ -1232,6 +1305,11 @@ class Catalog:
                 and row["is_trashed"] == 0
                 and row["is_offline"] == 0
                 and row["visibility"] != "hidden"
+                and self._connection.execute(
+                    "SELECT 1 FROM assets WHERE live_photo_video_id = ? LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                is None
             )
             identities = {
                 item["identity"]
@@ -1382,12 +1460,17 @@ class Catalog:
         row = self._connection.execute(
             """
             SELECT count(*) AS total,
-                   sum(size IS NOT NULL AND is_trashed = 0 AND is_offline = 0 AND visibility != 'hidden') AS visible,
-                   sum(size IS NULL) AS missing_size,
-                   sum(is_trashed) AS trashed,
-                   sum(visibility = 'hidden') AS hidden,
-                   sum(is_offline) AS offline
-              FROM assets
+                   sum(asset.size IS NOT NULL AND asset.is_trashed = 0
+                       AND asset.is_offline = 0 AND asset.visibility != 'hidden'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM assets AS still
+                            WHERE still.live_photo_video_id = asset.id
+                       )) AS visible,
+                   sum(asset.size IS NULL) AS missing_size,
+                   sum(asset.is_trashed) AS trashed,
+                   sum(asset.visibility = 'hidden') AS hidden,
+                   sum(asset.is_offline) AS offline
+              FROM assets AS asset
             """
         ).fetchone()
         return CatalogStats(*(int(row[name] or 0) for name in CatalogStats.__dataclass_fields__))
@@ -1397,9 +1480,14 @@ class Catalog:
             self._catalog_asset(row)
             for row in self._connection.execute(
                 """
-                SELECT * FROM assets
-                 WHERE size IS NOT NULL AND is_trashed = 0 AND is_offline = 0 AND visibility != 'hidden'
-                 ORDER BY name
+                SELECT asset.* FROM assets AS asset
+                 WHERE asset.size IS NOT NULL AND asset.is_trashed = 0
+                   AND asset.is_offline = 0 AND asset.visibility != 'hidden'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM assets AS still
+                        WHERE still.live_photo_video_id = asset.id
+                   )
+                 ORDER BY asset.name
                 """
             )
         ]
@@ -1417,8 +1505,17 @@ class Catalog:
     def add_uploaded(self, asset: Asset, requested_name: str) -> CatalogAsset:
         with self._connection:
             row = self._connection.execute(
-                "SELECT inode, name FROM assets WHERE id = ?", (asset.id,)
+                "SELECT inode, name, live_photo_video_id FROM assets WHERE id = ?",
+                (asset.id,),
             ).fetchone()
+            relationship_ids = {
+                target_id
+                for target_id in (
+                    row["live_photo_video_id"] if row else None,
+                    asset.live_photo_video_id,
+                )
+                if target_id is not None
+            }
             if row:
                 inode, name = row["inode"], row["name"]
             else:
@@ -1438,8 +1535,9 @@ class Catalog:
                 INSERT INTO assets (
                     id, inode, name, owner_id, original_name, mime_type, size,
                     created_ns, modified_ns, updated_at, checksum, visibility,
-                    is_trashed, is_offline, library_id, local_date, is_favorite
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_trashed, is_offline, library_id, local_date, is_favorite,
+                    live_photo_video_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     owner_id = excluded.owner_id,
                     original_name = excluded.original_name,
@@ -1454,7 +1552,8 @@ class Catalog:
                     is_offline = excluded.is_offline,
                     library_id = excluded.library_id,
                     local_date = excluded.local_date,
-                    is_favorite = excluded.is_favorite
+                    is_favorite = excluded.is_favorite,
+                    live_photo_video_id = excluded.live_photo_video_id
                 """,
                 (
                     asset.id,
@@ -1474,9 +1573,11 @@ class Catalog:
                     asset.library_id,
                     asset.local_date,
                     int(asset.is_favorite),
+                    asset.live_photo_video_id,
                 ),
             )
-            self._project_asset(asset.id)
+            for asset_id in {asset.id, *relationship_ids}:
+                self._project_asset(asset_id)
             self._refresh_date_activity()
             inserted = self._connection.execute(
                 "SELECT * FROM assets WHERE id = ?", (asset.id,)
@@ -1540,6 +1641,7 @@ class Catalog:
                 or candidate.local_date != old["local_date"]
                 or type(candidate.is_favorite) is not bool
                 or candidate.is_favorite != bool(old["is_favorite"])
+                or candidate.live_photo_video_id != old["live_photo_video_id"]
             ):
                 raise ValueError("replacement candidate changed mounted View state")
             self._date_parts(candidate.local_date)
@@ -1619,8 +1721,9 @@ class Catalog:
                 INSERT INTO assets (
                     id, inode, name, owner_id, original_name, mime_type, size,
                     created_ns, modified_ns, updated_at, checksum, visibility,
-                    is_trashed, is_offline, library_id, local_date, is_favorite
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_trashed, is_offline, library_id, local_date, is_favorite,
+                    live_photo_video_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate.id,
@@ -1640,6 +1743,7 @@ class Catalog:
                     candidate.library_id,
                     candidate.local_date,
                     int(candidate.is_favorite),
+                    candidate.live_photo_video_id,
                 ),
             )
             self._connection.execute(
@@ -1702,6 +1806,7 @@ class Catalog:
             library_id=row["library_id"],
             local_date=row["local_date"],
             is_favorite=bool(row["is_favorite"]),
+            live_photo_video_id=row["live_photo_video_id"],
         )
         return CatalogAsset(asset, row["inode"], row["name"])
 

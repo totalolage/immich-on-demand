@@ -68,6 +68,10 @@ _Avoid_: Free up space, eviction
 An Immich-generated thumbnail displayed without Hydrating the asset. Version 1.0 promises Previews only for its small common-media allowlist.
 _Avoid_: Original, hydration
 
+**Live Photo**:
+One visible still asset whose `livePhotoVideoId` identifies a separate motion asset. The motion asset remains cataloged but is not exposed as a View alias, regardless of its server visibility.
+_Avoid_: Sidecar, duplicate file
+
 **Pin**:
 A local instruction to keep an asset's original Hydrated and exempt from Eviction. A Pin does not change Immich metadata.
 _Avoid_: Favorite, download

@@ -159,6 +159,7 @@ class Asset:
     local_date: str | None = None
     is_favorite: bool = False
     person_ids: tuple[str, ...] = ()
+    live_photo_video_id: str | None = None
 
     @classmethod
     def from_api(cls, value: dict[str, object]) -> Asset:
@@ -186,6 +187,19 @@ class Asset:
             if not isinstance(library_id, str):
                 raise ValueError("asset libraryId is not a string")
             UUID(library_id)
+        live_photo_video_id = value.get("livePhotoVideoId")
+        if live_photo_video_id is not None:
+            if not isinstance(live_photo_video_id, str):
+                raise ValueError("asset livePhotoVideoId is not a string")
+            try:
+                canonical_live_photo_video_id = str(UUID(live_photo_video_id))
+            except ValueError as error:
+                raise ValueError("asset livePhotoVideoId is not a UUID") from error
+            if (
+                canonical_live_photo_video_id != live_photo_video_id
+                or live_photo_video_id == asset_id
+            ):
+                raise ValueError("asset livePhotoVideoId is not a related canonical UUID")
 
         return cls(
             id=asset_id,
@@ -204,6 +218,7 @@ class Asset:
             local_date=_local_date(value),
             is_favorite=_boolean(value, "isFavorite"),
             person_ids=_person_ids(value),
+            live_photo_video_id=live_photo_video_id,
         )
 
     @property

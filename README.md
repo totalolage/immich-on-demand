@@ -121,13 +121,15 @@ The released 1.0 service requires Immich to be online at startup. If Immich beco
 
 The development tree can start from trusted cached state after one successful online run. If Immich is unreachable, it mounts a safe, nonempty catalog in degraded mode. Cached originals remain readable, but uncached reads, Preview downloads, automatic Eviction, and every remote mutation stay disabled. The service retries validation and a stable full refresh in the background before it resumes network access. TLS, authentication, schema, identity, version, scope, and local trust failures still prevent the mount.
 
+Development 1.4 uses Immich's bounded generated Preview for every image MIME type, including RAW and HEIF originals. Live Photo stills retain their explicit motion-video relationship across refreshes and Views, but the mount exposes and previews only the still. Composite playback, paired export/upload, and Asset replacement of Live Photos are not implemented.
+
 Trusted Profile format v1 remains valid for offline startup after namespace migration. The service writes format v2 only after an online refresh validates and publishes both Album and People relations with the rich six-scope read key.
 
 In the development tree, routine background refreshes request only assets updated within an overlapping time window. These refreshes never remove an absent catalog row. Startup, explicit `refresh`, daily repair, and an over-budget delta use paired complete asset sweeps before removing rows.
 
 Album and People relations refresh as one pair after a complete asset sweep. The catalog publishes the pair only after both server inventories validate. Incremental asset refreshes update View aliases from current asset facts but never infer Album or People relation removal.
 
-The 1.4 implementation has automated coverage. Read-only rich-View acceptance, Asset-replacement acceptance with project-owned Test assets, and package lifecycle acceptance remain pending on the Reference system.
+The 1.4 implementation has automated coverage. Read-only rich-View acceptance, RAW/HEIF/Live Photo acceptance, Asset-replacement acceptance with project-owned Test assets, and package lifecycle acceptance remain pending on the Reference system.
 
 To enable remote deletion and queued asset replacement, rerun `configure` with the same server and mount arguments plus `--enable-remote-delete`. The mutation key must then include `asset.copy` and `asset.delete`. The service fails closed if either key has unexpected permissions.
 

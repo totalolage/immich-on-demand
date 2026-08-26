@@ -810,6 +810,8 @@ class ImmichFilesystem(pyfuse3.Operations):
                 or asset.library_id is not None
             ):
                 raise pyfuse3.FUSEError(errno.EPERM)
+            if asset.live_photo_video_id is not None:
+                raise pyfuse3.FUSEError(errno.EOPNOTSUPP)
             try:
                 album_ids = self.catalog.album_ids(asset.id)
             except Exception as error:
